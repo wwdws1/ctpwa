@@ -12,8 +12,25 @@ log = logging.getLogger("pwa-fit")
 # ============================================================
 # 初始化分析对象
 # ============================================================
+def _config_path_from_argv(default="config.yml"):
+    """在 argparse 之前取出 --config 的值。
+
+    ⚠ 分析对象在**模块导入期**构建（早于 main() 解析参数），因此必须在这里就
+    取出 --config，否则 ctpwa 只会读 cwd 下的 config.yml，
+    `--config /path/to/other.yml` 会静默失效（只影响 chdir）。
+    见 doc/optimizer-attribution.md §13。
+    """
+    argv = sys.argv[1:]
+    for i, a in enumerate(argv):
+        if a == "--config" and i + 1 < len(argv):
+            return os.path.abspath(argv[i + 1])
+        if a.startswith("--config="):
+            return os.path.abspath(a.split("=", 1)[1])
+    return os.path.abspath(default)
+
+
 int_time1 = int(time.time())
-ana = ctpwa.analysis()
+ana = ctpwa.analysis(_config_path_from_argv())
 int_time2 = int(time.time())
 print(f"振幅初始化耗时: {int_time2 - int_time1} 秒")
 
@@ -82,7 +99,8 @@ def generate_initial_params(n_coupling_free, free_res_info,
 # ============================================================
 def projected_lbfgs(f_grad, x0, lo, hi, m=20, max_iter=500,
                     gtol=1e-8, ftol=1e-12, max_ls=25, record=None,
-                    verbose=False):
+                    verbose=False, profile=False, twoloop="batched",
+                    names=None):
     """盒约束 [lo, hi] 上的 L-BFGS：投影梯度活跃集 + 可行 Armijo 线搜索。
 
     与 `torch.optim.LBFGS + clamp + 梯度清零` 的四点本质区别：
@@ -105,13 +123,51 @@ def projected_lbfgs(f_grad, x0, lo, hi, m=20, max_iter=500,
       'no-descent'          找不到下降方向（可能落在鞍点 → 该上二阶 polish）
       'ftol'                函数值相对下降小于 ftol
       'max-iter'            到达迭代上限
+
+    性能（本版）:
+      * 曲率历史常驻 (m, n) 缓冲 + 有效长度 k_hist（替代 [(s,y,rho)] 列表）；
+      * two-loop 用**闭式三角求解**（第一/第二循环分别是严格上/下三角系统），
+        two-loop 本身 ~110 op/次且与 m 无关；逐对 torch.dot 在 m=50 时 ≈760 op
+        （GPU 上每个 op ≈ 一次 kernel launch，是主要固定开销）。整迭代
+        850 → 373 ATen op（m=50），即 ≈2.3x，且不再随 m 增长；
+      * 非 verbose 时不算 n_active、用浮点掩码替代布尔索引散播 + 去掉
+        blocked.any()（实测 device sync 7.16 → 6.14 次/迭代）；
+      * profile=True 打印 eval/house 耗时占比（env: FIT_OPT_PROF=1）。
     """
     dev, dt = x0.device, x0.dtype
     x = torch.clamp(x0.clone(), lo, hi)
-    hist = []                                   # [(s, y, 1/(yᵀs))]
+    # 曲率历史: 常驻 (m, n) 缓冲（等价原 [(s, y, rho)] 列表）
+    n_dim = x.numel()
+    S_buf = torch.empty((m, n_dim), device=dev, dtype=dt)
+    Y_buf = torch.empty_like(S_buf)
+    R_buf = torch.empty((m,), device=dev, dtype=dt)
+    # 滚动用的第二组缓冲（history 满时把 S[1:] 拷进 S2[:-1] 后交换，避免
+    # 同张量重叠切片 copy_ 触发 "single memory location" 报错）
+    S_buf2 = torch.empty_like(S_buf)
+    Y_buf2 = torch.empty_like(S_buf)
+    R_buf2 = torch.empty_like(R_buf)
+    k_hist = 0
+    I_buf = torch.eye(m, device=dev, dtype=dt)   # 闭式 two-loop 的三角求解用
+    mask_f = torch.empty_like(x)                 # 自由分量浮点掩码（免布尔散播/同步）
+    ratio = torch.empty_like(x)                  # 撞界拐点缓冲（每轮只 fill_）
+
+    t_eval = 0.0        # f_grad 累计耗时（profile=True）
+    n_eval = 0
+    t_loop = time.perf_counter() if profile else 0.0
+    diag = {"trials": {}, "fallback": 0, "restart_ls": 0, "restart_nod": 0,
+            "restart_step0": 0, "restart_stall": 0, "capped": 0, "max_ls_hit": 0,
+            }
+    slow_log = []       # profile=True 时记录"多试探迭代"的方向结构（只读诊断）
+    gam_val = float("nan")
 
     def call(z):
+        nonlocal t_eval, n_eval
+        if profile:
+            _t0 = time.perf_counter()
         fv, gv = f_grad(z)
+        if profile:
+            t_eval += time.perf_counter() - _t0
+            n_eval += 1
         if record is not None:
             record.append(fv)
         return fv, gv
@@ -123,6 +179,8 @@ def projected_lbfgs(f_grad, x0, lo, hi, m=20, max_iter=500,
     tiny_streak = 0     # 连续"ΔNLL≈0"的迭代数（不当作收敛）
     n_ls_fallback = 0   # 靠"回溯最优点"接受（而非 Armijo）的次数
     w = hi - lo
+    thr_edge = 1e-8 * w                          # 贴边判定阈值（与 x 无关，循环外算一次）
+    fixed = lo >= hi                             # 固定参数（lo == hi），循环不变量
 
     if (not torch.isfinite(g).all().item()) or not (f == f and abs(f) != float("inf")):
         # 随机初值发散（梯度/目标非有限）—— 直接判该 run 失败，不要白烧 25 次线搜索
@@ -139,58 +197,85 @@ def projected_lbfgs(f_grad, x0, lo, hi, m=20, max_iter=500,
             break
 
         # ---- ② 活跃集: 贴边且下降方向 (−g) 朝外 ----
-        w = hi - lo
-        at_lo = (x - lo) <= 1e-8 * w
-        at_hi = (hi - x) <= 1e-8 * w
-        fixed = lo >= hi
+        at_lo = (x - lo) <= thr_edge
+        at_hi = (hi - x) <= thr_edge
         active = ((at_lo & (g > 0)) | (at_hi & (g < 0))) & (~fixed)
         free = ~(active | fixed)
-        n_active = int(active.sum().item())
+        # n_active 只服务于 verbose 日志 —— 非 verbose 时不付这次 device sync
+        n_active = int(active.sum().item()) if verbose else 0
         if not bool(free.any()):
             status = "projected-gradient"       # 全部是活跃约束 → 已是 KKT
             break
 
         # ---- ③ 方向: two-loop recursion（冻结分量方向置零） ----
-        q = g.clone()
-        alphas = []
-        for s, y, rho in reversed(hist):
-            a = rho * torch.dot(s, q)
-            alphas.append(a)
-            q -= a * y
-        if hist:
-            s_l, y_l, _ = hist[-1]
-            q *= torch.dot(s_l, y_l) / torch.dot(y_l, y_l)
-        r = q
-        for (s, y, rho), a in zip(hist, reversed(alphas)):
-            r = r + s * (a - rho * torch.dot(y, r))
-        d = -r
-        d[~free] = 0.0
+        # 闭式解: 第一循环 (I + R·U)a = R·b、第二循环 (I + R·V)β = R(γc + V a)
+        # 都是单位对角三角系统，用两次 solve_triangular + 几个 matmul 完成，
+        # 与逐对 torch.dot 的顺序循环**逐元素等价**（实测相对差 ~5e-16）。
+        # op 数从 O(m)（m=50 时 ≈760）降到常数 ≈110，且与 m 无关。
+        if k_hist == 0:
+            d = -g
+        elif twoloop == "legacy":
+            # A/B 对照用: 逐对 torch.dot 的原始顺序循环（m=50 时 ≈760 op/次）。
+            # rho 取回 Python float，保持与原实现算子数一致（多一次同步可忽略）。
+            rho_l = R_buf[:k_hist].tolist()
+            q = g.clone()
+            alphas = []
+            for i in range(k_hist - 1, -1, -1):
+                a = rho_l[i] * torch.dot(S_buf[i], q)
+                alphas.append(a)
+                q = q - a * Y_buf[i]
+            s_l, y_l = S_buf[k_hist - 1], Y_buf[k_hist - 1]
+            gam_val = float(torch.dot(s_l, y_l) / torch.dot(y_l, y_l))
+            q = q * gam_val
+            r = q
+            for i in range(k_hist):
+                a = alphas[k_hist - 1 - i]
+                b = rho_l[i] * torch.dot(Y_buf[i], r)
+                r = r + S_buf[i] * (a - b)
+            d = -r
+        else:
+            S = S_buf[:k_hist]
+            Y = Y_buf[:k_hist]
+            R = R_buf[:k_hist]
+            M = S @ Y.t()                       # M_ij = s_i·y_j
+            I = I_buf[:k_hist, :k_hist]
+            a = torch.linalg.solve_triangular(
+                I + R[:, None] * torch.triu(M, 1),
+                (R * (S @ g)).unsqueeze(1), upper=True).squeeze(1)
+            q = g - Y.t() @ a
+            gam = (torch.dot(S[k_hist - 1], Y[k_hist - 1])
+                   / torch.dot(Y[k_hist - 1], Y[k_hist - 1]))
+            gam_val = float(gam)
+            V = torch.tril(M.t(), -1)           # V_ij = y_i·s_j (j<i)
+            be = torch.linalg.solve_triangular(
+                I + R[:, None] * V,
+                (R * (gam * (Y @ q) + V @ a)).unsqueeze(1), upper=False).squeeze(1)
+            d = -(gam * q + S.t() @ (a - be))
+        # 非自由分量置零：乘法掩码替代 d[~free]=0.0（1 op、无散播、无 any() 同步）
         # ⚠ 关键: 拟牛顿方向 d 在贴界坐标上可能指向盒外（虽然梯度指向盒内），
         #   这时 ratio=(界−x)/d=0/负 → t_break=0 → **整步被算成 0** → ΔNLL=0
         #   → 被 ftol 误判成收敛（实测: 9 次求值、|pg| 还剩 300 就"收敛"）。
         #   处理: 贴界且方向朝外的分量直接置零（这一步它本来也动不了）。
         blocked = ((at_lo & (d < 0)) | (at_hi & (d > 0))) & free
-        if bool(blocked.any()):
-            d = d.clone()
-            d[blocked] = 0.0
-            free = free & (~blocked)
+        free = free & (~blocked)                # 等价原来的 if any(): 置零 + 收窄 free
+        mask_f.copy_(free)
+        d = d * mask_f
         gtd = torch.dot(g, d)
         if (not bool(torch.isfinite(gtd))) or gtd >= 0:
-            d = -pg.clone()                     # 退化 → 投影最速下降（在界上恒可行）
-            d[~free] = 0.0
+            d = -pg * mask_f                    # 退化 → 投影最速下降（在界上恒可行）
             gtd = torch.dot(g, d)
             if (not bool(torch.isfinite(gtd))) or gtd >= 0:
                 # 曲线历史被污染 → 清空重来（最多 8 次）后再判定失败
                 if restarts < 8 and pg_inf > gtol * 1e3:
-                    hist.clear()
+                    k_hist = 0
                     restarts += 1
+                    diag["restart_nod"] += 1
                     continue
                 status = "no-descent"
                 break
         if not bool(free.any()):
             # 其余方向都在界外 → 用投影最速下降/或已到 KKT
-            d = -pg.clone()
-            d[~free] = 0.0
+            d = -pg * mask_f
             if float(d.abs().max().item()) <= 0.0:
                 status = "projected-gradient"
                 break
@@ -202,14 +287,14 @@ def projected_lbfgs(f_grad, x0, lo, hi, m=20, max_iter=500,
         # ---- ④ 初始步长 + 可行步长上限 ----
         # 首轮 d=−g、|g| 可达 1e3~1e6；t0=min(1, 1/|g|_∞) 保证单个坐标首步移动
         # 不超过 1 个单位（量纲合理），避免 t=1 把线搜索炸掉回溯 20+ 次。
-        if hist:
+        if k_hist > 0:
             t = torch.ones((), device=dev, dtype=dt)
         else:
             t = torch.tensor(min(1.0, 1.0 / max(float(g.abs().max().item()), 1e-30)),
                              device=dev, dtype=dt)
         # 撞界拐点: t_break 会**正好**把那个坐标放到界上（下一步它就变成活跃约束）。
         # 注意不要因为 t_break 极小就去"冻结"该坐标 —— 那会让它永远到不了界。
-        ratio = torch.full_like(x, float("inf"))
+        ratio.fill_(float("inf"))               # 复用缓冲（原来每轮 full_like 分配）
         pos = free & (d > 0)
         neg = free & (d < 0)
         ratio[pos] = (hi - x)[pos] / d[pos]
@@ -219,6 +304,7 @@ def projected_lbfgs(f_grad, x0, lo, hi, m=20, max_iter=500,
         if t_break < 1.0:
             t = torch.minimum(t, torch.tensor(max(t_break, 0.0), device=dev, dtype=dt))
             capped = True
+            diag["capped"] += 1
         t = t.clamp(min=0.0, max=1.0)
 
         # ---- ⑤ Armijo 回溯（试试点一律 clamp 回盒内） ----
@@ -227,15 +313,35 @@ def projected_lbfgs(f_grad, x0, lo, hi, m=20, max_iter=500,
         fn = f
         gn = g
         best_trial = None            # (fn, xn, gn, t) —— 回溯中目标最低的点
+        n_trials = 0
         for _ in range(max_ls):
             xn = torch.clamp(x + t * d, lo, hi)
             fn, gn = call(xn)
+            n_trials += 1
             if best_trial is None or fn < best_trial[0]:
                 best_trial = (fn, xn, gn, t)
             if fn <= f + 1e-4 * t.item() * gtd.item():
                 accepted = True
                 break
             t = t * 0.5
+        diag["trials"][n_trials] = diag["trials"].get(n_trials, 0) + 1
+        if n_trials == max_ls:
+            diag["max_ls_hit"] += 1
+        if profile and n_trials >= 8:
+            # 只读诊断: 多试探迭代的方向结构（哪几个坐标把 |d|∞ 顶起来了）
+            absd = d.abs()
+            top = torch.topk(absd, k=min(3, absd.numel()))
+            slow_log.append({
+                "it": it, "trials": n_trials,
+                "d_inf": float(top.values[0].item()),
+                "t_acc": float(t.item()),
+                "gtd": float(gtd.item()),
+                "gam": gam_val,
+                "top": [(int(i), float(v), float(g[i].item()),
+                         bool((x[i] <= lo[i] + thr_edge[i])
+                              or (x[i] >= hi[i] - thr_edge[i])))
+                        for v, i in zip(top.values, top.indices)],
+            })
         if not accepted:
             # 数值噪声底上 Armijo 可能永远无法满足（真下降被噪声掩盖）——
             # 标准做法是取回溯中"最好的点"，而不是判失败（torch 的
@@ -244,9 +350,11 @@ def projected_lbfgs(f_grad, x0, lo, hi, m=20, max_iter=500,
                 fn, xn, gn, t = best_trial
                 accepted = True
                 n_ls_fallback += 1
+                diag["fallback"] += 1
             elif restarts < 8 and pg_inf > gtol * 1e3:
-                hist.clear()
+                k_hist = 0
                 restarts += 1
+                diag["restart_ls"] += 1
                 if verbose:
                     print(f"    [pLBFGS] it{it}: 线搜索无下降 → 清空曲率历史重启 "
                           f"({restarts}/8)")
@@ -260,9 +368,22 @@ def projected_lbfgs(f_grad, x0, lo, hi, m=20, max_iter=500,
         y = gn - g
         ys = torch.dot(y, s)
         if ys > 1e-8 * s.norm() * y.norm():
-            hist.append((s.detach(), y.detach(), 1.0 / ys.item()))
-            if len(hist) > m:
-                hist.pop(0)
+            if k_hist < m:
+                S_buf[k_hist] = s.detach()
+                Y_buf[k_hist] = y.detach()
+                R_buf[k_hist] = 1.0 / ys.item()
+                k_hist += 1
+            elif m > 0:
+                # 滚动: 丢掉最旧一对（等价 hist.pop(0)），尾部写入新对
+                S_buf2[:-1].copy_(S_buf[1:])
+                Y_buf2[:-1].copy_(Y_buf[1:])
+                R_buf2[:-1].copy_(R_buf[1:])
+                S_buf2[m - 1] = s.detach()
+                Y_buf2[m - 1] = y.detach()
+                R_buf2[m - 1] = 1.0 / ys.item()
+                S_buf, S_buf2 = S_buf2, S_buf
+                Y_buf, Y_buf2 = Y_buf2, Y_buf
+                R_buf, R_buf2 = R_buf2, R_buf
 
         df = f - fn
         step_inf = float((t * d).abs().max().item())
@@ -277,16 +398,18 @@ def projected_lbfgs(f_grad, x0, lo, hi, m=20, max_iter=500,
         # 清空曲率历史重启；连续 stall 很多次才以 'stalled' 退出（明确不是收敛）。
         if step_inf <= 0.0:
             if restarts < 8:
-                hist.clear()
+                k_hist = 0
                 restarts += 1
+                diag["restart_step0"] += 1
                 continue
             status = "stalled"
             break
         if df <= ftol * max(1.0, abs(f)):
             tiny_streak += 1
             if tiny_streak % 3 == 0 and restarts < 8:
-                hist.clear()            # 停滞 → 换个 H 近似再试
+                k_hist = 0              # 停滞 → 换个 H 近似再试
                 restarts += 1
+                diag["restart_stall"] += 1
                 continue
             if tiny_streak >= 30:
                 status = "stalled"      # 明确不是"收敛"
@@ -297,6 +420,34 @@ def projected_lbfgs(f_grad, x0, lo, hi, m=20, max_iter=500,
     if verbose:
         print(f"    [pLBFGS] stop: status={status}, NLL={f:.6f}, "
               f"active={n_active}, iter={it + 1}, evals={len(record) if record is not None else -1}")
+    if profile:
+        n_it = it + 1 if max_iter > 0 else 0
+        t_house = time.perf_counter() - t_loop - t_eval
+        tot = max(t_eval + t_house, 1e-9)
+        print(f"    [pLBFGS-prof] iters={n_it} evals={n_eval}  "
+              f"eval={t_eval:.3f}s ({t_eval / max(n_eval, 1) * 1e3:.3f} ms/eval, "
+              f"{100 * t_eval / tot:.1f}%)  "
+              f"house={t_house:.3f}s ({t_house / max(n_it, 1) * 1e3:.3f} ms/iter, "
+              f"{100 * t_house / tot:.1f}%)  "
+              f"{n_eval / max(n_it, 1):.2f} eval/iter")
+        tr = diag["trials"]
+        hist = " ".join(f"{k}次×{tr[k]}" for k in sorted(tr))
+        print(f"    [pLBFGS-diag] 线搜索试探分布: {hist}")
+        print(f"    [pLBFGS-diag] fallback={diag['fallback']} "
+              f"max_ls 打满={diag['max_ls_hit']} 撞界cap={diag['capped']} "
+              f"重启(线搜索)={diag['restart_ls']} 重启(无下降)={diag['restart_nod']} "
+              f"重启(步长为0)={diag['restart_step0']} 重启(停滞)={diag['restart_stall']}")
+        if slow_log:
+            print(f"    [pLBFGS-slow] 多试探迭代 {len(slow_log)} 次（≥8 次试探），"
+                  f"方向由哪些坐标顶起：")
+            for r in slow_log[:30]:
+                tops = "  ".join(
+                    f"{(names[i] if names and i < len(names) else i)}"
+                    f"(|d|={v:.2e},|g|={gv:.2e}{',贴边' if bnd else ''})"
+                    for i, v, gv, bnd in r["top"])
+                print(f"      it={r['it']:4d} trials={r['trials']:2d} "
+                      f"t_acc={r['t_acc']:.2e} γ={r['gam']:.3e} "
+                      f"gtd={r['gtd']:.3e} | {tops}")
     return x, f, status
 
 
@@ -340,6 +491,23 @@ class UnifiedPWAOptimizer:
         ).lower()
         # 每轮打印 projected L-BFGS 的 |pg|/active/ΔNLL（env FIT_OPT_VERBOSE=1）
         self.optimizer_verbose = _env_bool("FIT_OPT_VERBOSE", False)
+        # 打印每次 run 的 eval / housekeeping 耗时占比（env FIT_OPT_PROF=1）
+        self.optimizer_prof = _env_bool("FIT_OPT_PROF", False)
+        # 曲率历史上限（env FIT_OPT_M，默认 50 = 旧行为）。闭式 two-loop 后
+        # 每迭代 op 数与 m 几乎无关（实测 m=15/50 都是 ≈376 op/iter），而 m 越大
+        # 收敛越快（well-cond: m=15 需 167 轮, m=50 只需 118 轮）→ 不砍 m。
+        self.optimizer_m = _env_int("FIT_OPT_M", 50)
+        # ---- 归因实验开关（默认 = 当前行为，仅用于 A/B；见 doc/optimizer-ablation-plan.md）----
+        # two-loop 实现: batched(默认, 闭式三角求解) / legacy(逐对 torch.dot)
+        self.optimizer_twoloop = str(os.environ.get("FIT_OPT_TWOLOOP", "batched")).lower()
+        # honest=0: 投影路径也用 clamp + 投影清零梯度（隔离"真实梯度"这一项）
+        self.optimizer_honest = _env_bool("FIT_OPT_HONEST", True)
+        # legacy_sign=1: legacy 路径恢复旧的（写反的）投影符号，用于精确复现历史行为
+        self.optimizer_legacy_sign = _env_bool("FIT_OPT_LEGACY_SIGN", False)
+        # polish 步数上限（默认 200；969ad28 基线是 40）
+        self.optimizer_polish_steps = _env_int("FIT_OPT_POLISH_STEPS", 200)
+        # polish 统计（步数 / Hessian 次数 / 求值次数），供归因日志读取
+        self._polish_stats = {}
         # 统一 Hessian 缓存: 同参数点只在第一次真正计算一步 getHessian，
         # 后续（正定性判定/参数误差/分支比误差）直接复用。
         self._hess_cache = None  # (params.clone(), hessian_full)
@@ -444,10 +612,24 @@ class UnifiedPWAOptimizer:
             if not honest and self.project_grad:
                 g_c = grad[1:nc]
                 c = params[1:nc]
-                g_c[(c <= -self.v_max) & (g_c > 0)] = 0.0
-                g_c[(c >= self.v_max) & (g_c < 0)] = 0.0
                 g_i = grad[nc + 1:2 * nc]
                 ci = params[nc + 1:2 * nc]
+                if self.optimizer_legacy_sign:
+                    # FIT_OPT_LEGACY_SIGN=1: 精确复现 969ad28 的历史行为（符号写反，
+                    # 冻结了"从墙上回到盒内"的合法下降方向）——仅用于归因对照。
+                    g_c[(c <= -self.v_max) & (g_c < 0)] = 0.0
+                    g_c[(c >= self.v_max) & (g_c > 0)] = 0.0
+                    g_i[(ci <= -self.v_max) & (g_i < 0)] = 0.0
+                    g_i[(ci >= self.v_max) & (g_i > 0)] = 0.0
+                    if self.has_free_res:
+                        res_start = 2 * nc
+                        g_r = grad[res_start:]
+                        phys = params[res_start:]
+                        g_r[(phys <= self._lower) & (g_r < 0)] = 0.0
+                        g_r[(phys >= self._upper) & (g_r > 0)] = 0.0
+                    return nll, grad
+                g_c[(c <= -self.v_max) & (g_c > 0)] = 0.0
+                g_c[(c >= self.v_max) & (g_c < 0)] = 0.0
                 g_i[(ci <= -self.v_max) & (g_i > 0)] = 0.0
                 g_i[(ci >= self.v_max) & (g_i < 0)] = 0.0
                 if self.has_free_res:
@@ -502,14 +684,16 @@ class UnifiedPWAOptimizer:
                 #   是普通张量（无 grad_fn），直接送进 autograd.grad 会报
                 #   "element 0 of tensors does not require grad"。
                 q = z.detach().clone().requires_grad_(True)
-                nll, grad = self.compute_loss_and_grad(q, honest=True)
+                nll, grad = self.compute_loss_and_grad(q, honest=self.optimizer_honest)
                 return nll.item(), grad.detach()
 
             x, final_nll, opt_status = projected_lbfgs(
                 f_grad, params.detach(), lo, hi,
-                m=min(int(history_size), 50), max_iter=max_iter,
+                m=min(int(history_size), int(self.optimizer_m)), max_iter=max_iter,
                 gtol=max(tolerance_grad, 1e-10), ftol=1e-12,
                 record=nll_history, verbose=(self.optimizer_verbose),
+                profile=self.optimizer_prof, twoloop=self.optimizer_twoloop,
+                names=self.params_names,
             )
             params = x.detach().requires_grad_(False)
         else:
@@ -679,8 +863,11 @@ class UnifiedPWAOptimizer:
         self._project_params_(x)
         lo, hi = self.bounds(x)
         w = (hi - lo).clamp(min=1e-30)
+        n_evals = [0]           # 归因用: polish 内部求值次数
+        n_hess = [0]            # 归因用: 精确 Hessian 次数
 
         def fg(p):
+            n_evals[0] += 1
             q = p.detach().clone().requires_grad_(True)
             n = self.analysis.getNLL(q)
             return n.item(), torch.autograd.grad(n, q, retain_graph=False)[0].detach()
@@ -709,6 +896,7 @@ class UnifiedPWAOptimizer:
             pg_inf = pg[free].abs().max().item()
 
             H = self.analysis.getHessian(x)[free][:, free].double()
+            n_hess[0] += 1
             gf = g[free].double()
             ev_all, Q_all = torch.linalg.eigh(H)
             lmax_all = ev_all[-1].abs().clamp(min=1e-30)
@@ -798,6 +986,10 @@ class UnifiedPWAOptimizer:
         pg = pg_of(x, g)
         pg_inf = pg[free].abs().max().item() if bool(free.any()) else 0.0
         H_final = self.analysis.getHessian(x)
+        n_hess[0] += 1
+        # 归因统计（供 fit.py 汇总/日志读取；不改变行为）
+        self._polish_stats = {"steps": n_step, "n_hess": n_hess[0],
+                              "n_evals": n_evals[0]}
         if bool(free.any()):
             eig_f = torch.linalg.eigvalsh(H_final[free][:, free].double())
             lmax = eig_f[-1].abs().clamp(min=1e-30)
@@ -1701,7 +1893,15 @@ def main():
     # ---- 精确 Hessian 抛光 ----
     if cfg["polish"]:
         try:
-            p2, nll2, pd2 = optimizer.polish_damped_newton(best_res["final_params"])
+            _tp0 = time.time()
+            p2, nll2, pd2 = optimizer.polish_damped_newton(
+                best_res["final_params"],
+                max_steps=int(optimizer.optimizer_polish_steps))
+            _t_polish = time.time() - _tp0
+            _ps = getattr(optimizer, "_polish_stats", {}) or {}
+            print(f"抛光耗时 = {_t_polish:.2f}s, steps = {_ps.get('steps', '?')}, "
+                  f"Hessian 次数 = {_ps.get('n_hess', '?')}, "
+                  f"polish 内求值 = {_ps.get('n_evals', '?')}")
             if nll2 < best_res["final_nll"]:
                 print(f"抛光: NLL {best_res['final_nll']:.6f} → {nll2:.6f} "
                       f"(Δ={nll2 - best_res['final_nll']:.3f}), 正定={pd2}")
