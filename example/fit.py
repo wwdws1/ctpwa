@@ -818,8 +818,11 @@ class UnifiedPWAOptimizer:
                           .get(0, {}).get("n_iter", 0))
             except Exception:
                 n_iter = 0
+            # ⚠ torch LBFGS 的容差停机 ≠ 物理空间 KKT 收敛：本模型实测约半数
+            # 起点会在坏盆地"容差停机"（NLL 可比正常解差 100~700）。多起点流程
+            # 请以 best-of-N 为准，勿据 status 判定单次结果成功。
             opt_status = ("reparam-max-iter" if n_iter >= max_iter
-                          else "reparam-converged")
+                          else "reparam-tol-stop")
         else:
             # ---- legacy: torch LBFGS + clamp + 投影梯度清零（A/B 对照用） ----
             optimizer = torch.optim.LBFGS(
@@ -1073,6 +1076,9 @@ class UnifiedPWAOptimizer:
                     fn, gn = fg(cand)
                     if cand_best is None or fn < cand_best[0]:
                         cand_best = (fn, cand, gn)
+                if cand_best is None:
+                    # 两个方向的逃逸点都被 amp_cap 拒绝 → 无法逃逸，保留当前点
+                    break
                 if cand_best[0] < f - max(tol, 0.0):
                     f, x, g = cand_best[0], cand_best[1], cand_best[2]
                     if verbose:
@@ -1533,6 +1539,12 @@ class UnifiedPWAOptimizer:
                 print(f"  NLL = {result['final_nll']:.6f}")
                 print(f"  正定性 = {result['is_positive_definite']}")
                 print(f"  优化器状态 = {result.get('optimizer_status', '?')}")
+                if (str(result.get("optimizer_status", "")).endswith("tol-stop")
+                        and not getattr(self, "_warned_tol_stop", False)):
+                    self._warned_tol_stop = True
+                    print("    ⚠ reparam 由 torch LBFGS 容差停机（≠ 物理空间 KKT 收敛）:"
+                          " 实测约半数起点会停在坏盆地。多起点请以 best-of-N 为准；"
+                          "需要保守复核时用 --optimizer projected。")
                 print(f"  耗时 = {result['time']:.2f}s, Hessian = {result['hessian_time']:.2f}s")
                 print(f"  迭代次数 = {result['iterations']}")
 

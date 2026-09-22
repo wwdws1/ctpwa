@@ -99,7 +99,7 @@ python -u fit.py --runs 20 --niter 3000 --resume
 |---|---|---|---|
 | 边界处理 | 重参数化软墙 | 投影梯度 + 活跃集（盒约束） | clamp + 边界梯度清零 |
 | 停机判据 | 无约束梯度/变化量（u 空间） | 投影梯度 KKT | 无约束梯度/变化量 |
-| 典型停机状态 | `reparam-converged` | 多为 `max-iter` | 伪收敛 |
+| 典型停机状态 | `reparam-max-iter` / `reparam-tol-stop`※ | 多为 `max-iter` | 伪收敛 |
 | 每次求值次数（中位）* | ~1400 | ~3300 | ~2600 |
 | 每次耗时（中位）* | ~400 s | ~900 s | ~780 s |
 | 20-run best NLL* | **-59190.17** | -58940.34 | — |
@@ -107,9 +107,63 @@ python -u fit.py --runs 20 --niter 3000 --resume
 \* 实测自 `--niter 3000`：reparam/projected 数据来自 20/5 个 run，lbfgs 来自 2 个 run；
 具体数据集为 `jlsp` 的 `single` 配置，仅供相对比较。
 
+※ `reparam-tol-stop` = torch LBFGS 自身的容差（`--tol-grad/--tol-change`）停机，
+**不等于**物理空间 KKT 收敛：实测约半数随机起点会停在坏盆地（NLL 可比正常解差
+100~700）。多起点流程（best-of-N）下这没问题；**单次结果不要只看 status 判定成功**。
+
 **如何选**：默认用 `reparam`。做 A/B 或复现历史行为时用 `--optimizer projected` 或
 `--optimizer lbfgs`。若 reparam 偶发振幅偏大，可调大 `--amp-lambda`（如 1e-3）或调小
 `--amp-max`。
+
+### 3.5 推荐工作流（随机多起点 → 取最优 → polish）
+
+本分析场景是"随机初值跑很多次、取最优、再对最优做 polish"，此时判据是
+**单位时间内的 best-of-N**，不是单起点可靠性：
+
+```bash
+# 推荐：12 个随机起点（默认优化器已是 reparam、默认 niter=500）
+# main() 会自动对 best 做 polish_damped_newton → 给出 PD 与参数误差
+python fit.py --runs 12
+
+# 兜底/复核：参数最优普遍贴 free_range 边界、或要与历史结果对齐时
+python fit.py --optimizer projected --runs 5
+```
+
+**默认 niter 保持 500 不动**——不同分波分析的收敛需求不同（本仓库不止一个分波）。
+对本分析（`Jpsi2KKeta`）实测 `--niter 300` 已足够，可作为加速选项：`polish_damped_newton`
+（最多 200 步缩放阻尼 LM + 精确 Hessian）是很强的局部精修器，L-BFGS 只需把起点送进
+正确盆地，收尾交给 polish。两组独立 6-run 系综中，`--niter 300` 的 pre-polish best 只有
+−3443 / −3413，**polish 后都收敛到 −3463.9027（四位小数一致）、PD=True**，单组拟合
+190~204 s（+36 s polish + 33 s init ≈ **4 分钟**）。对照：
+
+| 工作流 | 总耗时 | polish 后 best | PD |
+|---|---|---|---|
+| **reparam `--niter 300 --runs 6`** | **≈4 分钟** | **−3463.90** | **True** |
+| reparam `--niter 1000 --runs 6` | ≈7 分钟 | −3463.81 | True |
+| projected `--niter 1000 --runs 6` | ≈30 分钟 | −3464.87 | False |
+
+后两者与第一行的差异（0.09 / 0.97 NLL）都远小于系综混沌（σ≈9）与显著性阈值 3，
+即 **4 分钟的 reparam 短跑 + polish 与 30 分钟的 projected 结果统计等价**。
+
+实测（`Jpsi2KKeta` 29 分波 / 19 耦合 / 10 自由共振参数，同 6 起点、`--niter 1000`）：
+
+| | reparam | projected |
+|---|---|---|
+| 单起点耗时（中位） | **69 s** | 281 s |
+| 单起点求值数（中位） | **578** | 3193 |
+| 好起点产出率（距最好值 <10 NLL） | **0.0082 /s** | 0.0022 /s |
+| 每个好起点平均耗时 | **122 s** | 452 s |
+| best-of-6 | −3463.81 | −3464.87（差 1.06，在系综混沌 σ≈9 内） |
+| best polish 后 | **PD=True**（可出参数误差） | PD=False |
+
+要点：
+1. **多起点会饱和**：约 5~8 个起点就摸到最好的盆地，`--runs 12` 足够，不需要几百次。
+2. **不要把 reparam 的最优解再交给 projected 精修**：实测无效（`no-descent`，0 改进）
+   或更差（中段交接在 3/3 起点上差 12~373 NLL）——两者停在不同局部极小。
+   polish 本来就是两条路共用的同一个 `polish_damped_newton`。
+3. **`--amp-max`（默认 1000）**要确认大于该分析的最大 `\|A\|`，否则会撞软墙；
+   `--amp-lambda`（默认 1e-4）是只进优化目标的幅度罚项，报告 NLL 仍为真实值，
+   设 0 可关闭。
 
 ---
 
