@@ -408,7 +408,7 @@ class UnifiedPWAOptimizer:
         params_names,
         v_max=None,
         project_grad=None,
-        optimizer_kind="reparam",
+        optimizer_kind="projected",
         amp_max=None,
         amp_lambda=None,
         err_mode=None,
@@ -457,32 +457,35 @@ class UnifiedPWAOptimizer:
             if amp_lambda is not None
             else float(os.environ.get("FIT_AMP_LAMBDA", "1e-4"))
         )
-        # 参数误差模式（Hessian 非正定时的回退）:
-        #   auto(默认): PD → 直接求逆；非 PD → 自动退化 pinv
-        #   strict    : 原行为（非 PD 就不给误差）
-        #   pinv      : 强制伪逆（丢掉 λ<τλmax 的方向）
-        #   psd       : 强制把 λ 截到 τλmax 后求逆（更保守）
-        _em = (
-            err_mode if err_mode is not None else os.environ.get("FIT_ERR_MODE", "auto")
-        ).lower()
-        self.err_mode = _em if _em in ("auto", "strict", "pinv", "psd") else "auto"
-        self.err_tau = (
-            err_tau
-            if err_tau is not None
-            else float(os.environ.get("FIT_ERR_TAU", "1e-6"))
-        )
-        # 优化器种类（默认 "reparam"）:
-        #   "reparam" (默认)   = 重参数化软墙（耦合 sigmoid 幅度极坐标 + 共振态
-        #                        sigmoid）+ torch LBFGS(strong_wolfe)，无投影/活跃集
-        #   "projected"        = projected_lbfgs —— 盒约束优化，状态全在 GPU；
+        # 优化器种类（默认 "projected"，与上游一致）:
+        #   "projected" (默认) = projected_lbfgs —— 盒约束优化，状态全在 GPU；
         #                        KKT 判据 gtol=1e-5 本模型达不到 → 常跑到 max-iter
+        #   "reparam"          = 重参数化软墙（耦合 sigmoid 幅度极坐标 + 共振态
+        #                        sigmoid）+ torch LBFGS(strong_wolfe)，无投影/活跃集
+        #                        （推荐；配 amp_max/amp_lambda，见 README）
         #   "lbfgs"            = 旧路径 torch.optim.LBFGS + clamp + 投影梯度清零，
         #                        仅用于 A/B 对照（在边界处会静默伪收敛）
         self.optimizer_kind = str(
             optimizer_kind
             if optimizer_kind is not None
-            else os.environ.get("FIT_OPTIMIZER", "reparam")
+            else os.environ.get("FIT_OPTIMIZER", "projected")
         ).lower()
+        # 参数误差模式（Hessian 非正定时的回退）:
+        #   auto  : PD → 直接求逆；非 PD → 自动退化 pinv
+        #   strict: 原行为（非 PD 就不给误差）
+        #   pinv  : 强制伪逆（丢掉 λ<τλmax 的方向）
+        #   psd   : 强制把 λ 截到 τλmax 后求逆（更保守）
+        # 默认策略（C）: 显式值 > FIT_ERR_MODE > (reparam→auto, 其它→strict)
+        _em = err_mode if err_mode is not None else os.environ.get("FIT_ERR_MODE")
+        if _em is None:
+            _em = "auto" if self.optimizer_kind == "reparam" else "strict"
+        _em = _em.lower()
+        self.err_mode = _em if _em in ("auto", "strict", "pinv", "psd") else "strict"
+        self.err_tau = (
+            err_tau
+            if err_tau is not None
+            else float(os.environ.get("FIT_ERR_TAU", "1e-6"))
+        )
         # 每轮打印 projected L-BFGS 的 |pg|/active/ΔNLL（env FIT_OPT_VERBOSE=1）
         self.optimizer_verbose = _env_bool("FIT_OPT_VERBOSE", False)
         # 统一 Hessian 缓存: 同参数点只在第一次真正计算一步 getHessian，
@@ -1967,9 +1970,10 @@ def build_parser():
         type=str,
         default=None,
         choices=["auto", "strict", "pinv", "psd"],
-        help="Hessian 非正定时的参数误差回退: auto=PD 直接求逆, 否则 pinv"
-        "（默认）; strict=原行为(非PD不给); pinv=伪逆(丢 λ<τλmax 方向);"
-        " psd=把 λ 截到 τλmax 后求逆(更保守) (env: FIT_ERR_MODE)",
+        help="Hessian 非正定时的参数误差回退: auto=PD 直接求逆, 否则 pinv; "
+        "strict=原行为(非PD不给); pinv=伪逆(丢 λ<τλmax 方向); "
+        "psd=把 λ 截到 τλmax 后求逆(更保守)。默认: reparam→auto, 其它→strict"
+        " (env: FIT_ERR_MODE)",
     )
     p.add_argument(
         "--err-tau",
@@ -1989,11 +1993,10 @@ def build_parser():
         type=str,
         default=None,
         choices=["reparam", "projected", "lbfgs"],
-        help="优化器: reparam=重参数化软墙（默认；耦合 sigmoid 幅度极坐标"
-        " + 共振态 sigmoid）+ torch LBFGS(strong_wolfe); "
-        "projected=有界 L-BFGS（投影梯度停机+活跃集+可行线搜索，"
-        "本模型常跑到 max-iter）; lbfgs=旧路径 torch LBFGS+clamp"
-        "（A/B 对照用） (env: FIT_OPTIMIZER)",
+        help="优化器: projected=有界 L-BFGS（默认；投影梯度停机+活跃集+可行线搜索，"
+        "本模型常跑到 max-iter）; reparam=重参数化软墙（推荐；耦合 sigmoid 幅度"
+        "极坐标 + 共振态 sigmoid）+ torch LBFGS(strong_wolfe); "
+        "lbfgs=旧路径 torch LBFGS+clamp（A/B 对照用） (env: FIT_OPTIMIZER)",
     )
     p.add_argument(
         "--opt-verbose",
@@ -2095,14 +2098,12 @@ def resolve_args(args):
         if args.amp_lambda is not None
         else _env_float("FIT_AMP_LAMBDA", 1e-4)
     )
-    cfg["err_mode"] = (
-        args.err_mode
-        if args.err_mode is not None
-        else os.environ.get("FIT_ERR_MODE", "auto")
+    # optimizer: CLI --optimizer > FIT_OPTIMIZER > 默认 projected（与上游一致）
+    cfg["optimizer_kind"] = (
+        args.optimizer
+        if args.optimizer is not None
+        else os.environ.get("FIT_OPTIMIZER", "projected")
     ).lower()
-    cfg["err_tau"] = (
-        args.err_tau if args.err_tau is not None else _env_float("FIT_ERR_TAU", 1e-6)
-    )
 
     # project_grad: CLI --no-project → False; 否则看 FIT_PROJECT
     if args.no_project is True:
@@ -2110,12 +2111,16 @@ def resolve_args(args):
     else:
         cfg["project_grad"] = _env_bool("FIT_PROJECT", True)
 
-    # optimizer: CLI --optimizer > FIT_OPTIMIZER > 默认 reparam
-    cfg["optimizer_kind"] = (
-        args.optimizer
-        if args.optimizer is not None
-        else os.environ.get("FIT_OPTIMIZER", "reparam")
-    ).lower()
+    # err_mode（策略 C）: 显式 > FIT_ERR_MODE > (reparam→auto, 其它→strict)
+    if args.err_mode is not None:
+        cfg["err_mode"] = args.err_mode.lower()
+    elif os.environ.get("FIT_ERR_MODE") is not None:
+        cfg["err_mode"] = os.environ["FIT_ERR_MODE"].lower()
+    else:
+        cfg["err_mode"] = "auto" if cfg["optimizer_kind"] == "reparam" else "strict"
+    cfg["err_tau"] = (
+        args.err_tau if args.err_tau is not None else _env_float("FIT_ERR_TAU", 1e-6)
+    )
     if args.opt_verbose is True:
         os.environ["FIT_OPT_VERBOSE"] = "1"
 
