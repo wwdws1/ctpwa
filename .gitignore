@@ -32,5 +32,9 @@ tests/.pytest_cache/
 example/__pycache__/
 *.pyc
 
+# 本地维护文件（并行 fork，不上传）
+example/AGENT.md
+example/tests/
+
 # 本地备份文件不入库
 *.bak

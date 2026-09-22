@@ -683,6 +683,12 @@ class UnifiedPWAOptimizer:
 
         final_params = params.clone().detach()
 
+        # 报告 NLL 用**最终接受点**的真实值：
+        # nll_history[-1] 可能是 strong-Wolfe 最后一次被拒绝的试探点（实测 niter=1
+        # 时会偏），所以这里在 clamp 后的 final_params 上重算一次（~0.3s/run）。
+        with torch.no_grad():
+            final_nll = float(self.analysis.getNLL(final_params).item())
+
         # Hessian
         hessian_start = time.time()
         hessian_full = self.analysis.getHessian(final_params)
@@ -1230,11 +1236,20 @@ class UnifiedPWAOptimizer:
                 for fi in range(self.n_coupling_free):
                     name = self.params_names[fi]
                     value = params_np[fi]
-                    re_err = real_err_np[fi]
-                    im_err = imag_err_np[fi]
                     magnitude = np.abs(value)
                     phase_rad = np.angle(value)
                     phase_deg = np.degrees(phase_rad)
+                    if fi == 0:
+                        # 固定参考振幅 (Re=1, Im=0)：无统计误差，统一标 (fixed)
+                        f.write(
+                            f"{fi:4d}  {name:50s}  "
+                            f"{value.real:12.8f}  {'(fixed)':>13}  "
+                            f"{value.imag:12.8f}  {'(fixed)':>13}  "
+                            f"{magnitude:12.8f}  {phase_rad:12.8f}  {phase_deg:12.8f}\n"
+                        )
+                        continue
+                    re_err = real_err_np[fi]
+                    im_err = imag_err_np[fi]
                     f.write(
                         f"{fi:4d}  {name:50s}  "
                         f"{value.real:12.8f} ± {re_err:12.8f}  "
