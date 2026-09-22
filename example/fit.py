@@ -301,11 +301,75 @@ def projected_lbfgs(f_grad, x0, lo, hi, m=20, max_iter=500,
 
 
 # ============================================================
+# 重参数化（reparam）：把有界/半有界参数映射到无约束 u 空间
+#   - 耦合: 极坐标 amp = amp_max·sigmoid(u_amp) (>0, 小幅度区≈对数幅度,
+#           接近 amp_max 时自限幅), phi = u_phi (自由无界)
+#   - 共振态: theta = lo + (hi-lo) * sigmoid(u_theta)
+#   固定参考 re_0=1, im_0=0 不进入 u。u 布局 (长度 2*(nc-1)+n_res):
+#   [u_amp_1..u_amp_{nc-1} | u_phi_1..u_phi_{nc-1} | u_theta_0..u_theta_{n_res-1}]
+#   与 ptc-mle 的 sigmoid 重参数化、tf-pwa 的 Bound 软墙同源；区别是这里靠
+#   autograd 自动传链式法则（无需手写 dy/dx）。
+# ============================================================
+_REPARAM_EPS = 1e-12
+
+
+def _reparam_pack(params, nc, n_res, lower, upper, amp_max, eps=_REPARAM_EPS):
+    """物理参数 -> 无约束 u。params: [re(nc) | im(nc) | theta(n_res)]。
+
+    nc 为耦合复数个数（index 0 是固定参考）；n_res 为自由共振态参数个数。
+    lower/upper 为共振态参数上下界（n_res>0 时必须给出）。
+    耦合用极坐标 + sigmoid 软墙 amp=amp_max·sigmoid(u_amp)（S1）：
+    小幅度区 ≈ exp(u_amp)（尺度不变），接近 amp_max 时 dρ/du→0 自限幅。
+    """
+    dtype, device = params.dtype, params.device
+    re = params[1:nc]
+    im = params[nc + 1:2 * nc]
+    amp = torch.sqrt(re * re + im * im)
+    phi = torch.atan2(im, re)
+    s = (amp / amp_max).clamp(min=eps, max=1.0 - eps)
+    u = [torch.log(s / (1.0 - s)), phi]
+    if n_res > 0:
+        lower = lower.to(dtype=dtype, device=device)
+        upper = upper.to(dtype=dtype, device=device)
+        span = (upper - lower).clamp(min=eps)
+        sres = ((params[2 * nc:] - lower) / span).clamp(min=eps, max=1.0 - eps)
+        u.append(torch.log(sres / (1.0 - sres)))
+    return torch.cat(u)
+
+
+def _reparam_unpack(u, nc, n_res, lower, upper, amp_max,
+                    dtype=torch.float64, device="cpu"):
+    """无约束 u -> 物理参数（对 u 可微，供 autograd 链式法则）。
+
+    amp = amp_max·sigmoid(u_amp) ∈ (0, amp_max)：小幅度区 ≈ exp(u_amp)，
+    接近上限时梯度→0（自限幅，防对数幅度自加速失控，S1）；theta 用
+    sigmoid 落在 (lo, hi) 内。
+    """
+    k = nc - 1
+    if amp_max and amp_max > 0:
+        amp = amp_max * torch.sigmoid(u[:k])
+    else:
+        amp = torch.exp(u[:k])
+    phi = u[k:2 * k]
+    re = amp * torch.cos(phi)
+    im = amp * torch.sin(phi)
+    parts = [torch.ones(1, dtype=dtype, device=device), re,
+             torch.zeros(1, dtype=dtype, device=device), im]
+    if n_res > 0:
+        lower = lower.to(dtype=dtype, device=device)
+        upper = upper.to(dtype=dtype, device=device)
+        theta = lower + (upper - lower) * torch.sigmoid(u[2 * k:])
+        parts.append(theta)
+    return torch.cat(parts)
+
+
+# ============================================================
 # 优化器
 # ============================================================
 class UnifiedPWAOptimizer:
     def __init__(self, ana, free_res_info, params_names,
-                 v_max=None, project_grad=None, optimizer_kind="projected"):
+                 v_max=None, project_grad=None, optimizer_kind="reparam",
+                 amp_max=None, amp_lambda=None):
         self.analysis = ana
         self.params_names = params_names
         self.device = "cuda"
@@ -329,14 +393,24 @@ class UnifiedPWAOptimizer:
         self.v_max = v_max if v_max is not None else float(os.environ.get("FIT_VMAX", "10000.0"))
         _pg = project_grad if project_grad is not None else os.environ.get("FIT_PROJECT", "1")
         self.project_grad = _pg if isinstance(_pg, bool) else str(_pg) == "1"
-        # 优化器种类:
-        #   "projected" (默认) = projected_lbfgs —— 真正的盒约束优化，状态全在 GPU；
-        #                        compute_loss_and_grad(honest=True)，无 clamp/无投影清零
-        #   "lbfgs"             = 旧路径 torch.optim.LBFGS + clamp + 投影梯度清零，
+        # reparam 幅度软墙上限（S1）: amp = amp_max·sigmoid(u_amp)，防对数幅度
+        # 沿简并方向自加速失控；小幅度区仍≈exp。默认 1000（实测最佳 |A|≈297）。
+        self.amp_max = (amp_max if amp_max is not None
+                        else float(os.environ.get("FIT_AMP_MAX", "1000.0")))
+        # reparam 幅度罚项（S2）: loss = NLL + λ·Σ|A_i|²，只进优化 loss，
+        # 报告 NLL/Hessian 仍用真实 NLL。默认 1e-4（防简并方向漂移到软墙帽）。
+        self.amp_lambda = (amp_lambda if amp_lambda is not None
+                           else float(os.environ.get("FIT_AMP_LAMBDA", "1e-4")))
+        # 优化器种类（默认 "reparam"）:
+        #   "reparam" (默认)   = 重参数化软墙（耦合 sigmoid 幅度极坐标 + 共振态
+        #                        sigmoid）+ torch LBFGS(strong_wolfe)，无投影/活跃集
+        #   "projected"        = projected_lbfgs —— 盒约束优化，状态全在 GPU；
+        #                        KKT 判据 gtol=1e-5 本模型达不到 → 常跑到 max-iter
+        #   "lbfgs"            = 旧路径 torch.optim.LBFGS + clamp + 投影梯度清零，
         #                        仅用于 A/B 对照（在边界处会静默伪收敛）
         self.optimizer_kind = str(
             optimizer_kind if optimizer_kind is not None
-            else os.environ.get("FIT_OPTIMIZER", "projected")
+            else os.environ.get("FIT_OPTIMIZER", "reparam")
         ).lower()
         # 每轮打印 projected L-BFGS 的 |pg|/active/ΔNLL（env FIT_OPT_VERBOSE=1）
         self.optimizer_verbose = _env_bool("FIT_OPT_VERBOSE", False)
@@ -512,6 +586,56 @@ class UnifiedPWAOptimizer:
                 record=nll_history, verbose=(self.optimizer_verbose),
             )
             params = x.detach().requires_grad_(False)
+        elif self.optimizer_kind == "reparam":
+            # ---- 重参数化 + torch LBFGS(strong_wolfe)：软墙，无投影/活跃集 ----
+            nc = self.n_coupling_free
+            n_res = self.n_res_free
+            if self.has_free_res:
+                lower, upper = self._lower, self._upper
+            else:
+                lower = upper = torch.empty(0, dtype=torch.float64,
+                                            device=self.device)
+
+            u = _reparam_pack(params.detach(), nc, n_res, lower, upper,
+                              self.amp_max).requires_grad_(True)
+            optimizer = torch.optim.LBFGS(
+                [u],
+                lr=lr,
+                max_iter=max_iter,
+                tolerance_grad=tolerance_grad,
+                tolerance_change=tolerance_change,
+                history_size=history_size,
+                line_search_fn="strong_wolfe",
+            )
+
+            def closure():
+                optimizer.zero_grad()
+                p = _reparam_unpack(u, nc, n_res, lower, upper, self.amp_max,
+                                    dtype=params.dtype, device=params.device)
+                nll = self.analysis.getNLL(p)
+                loss = nll
+                if self.amp_lambda > 0:
+                    # S2: 幅度罚项只进优化 loss（参考波 idx0 不计），报告仍用真实 NLL
+                    re_c = p[1:nc]
+                    im_c = p[nc + 1:2 * nc]
+                    loss = nll + self.amp_lambda * (re_c * re_c + im_c * im_c).sum()
+                loss.backward()
+                nll_history.append(nll.item())        # 记录真实 NLL
+                return loss
+
+            optimizer.step(closure)
+            final_nll = nll_history[-1] if nll_history else float("inf")
+            params = _reparam_unpack(
+                u.detach(), nc, n_res, lower, upper, self.amp_max,
+                dtype=params.dtype, device=params.device,
+            ).detach().requires_grad_(False)
+            try:
+                n_iter = (optimizer.state_dict().get("state", {})
+                          .get(0, {}).get("n_iter", 0))
+            except Exception:
+                n_iter = 0
+            opt_status = ("reparam-max-iter" if n_iter >= max_iter
+                          else "reparam-converged")
         else:
             # ---- legacy: torch LBFGS + clamp + 投影梯度清零（A/B 对照用） ----
             optimizer = torch.optim.LBFGS(
@@ -648,7 +772,8 @@ class UnifiedPWAOptimizer:
 
     # --------------------------------------------------------
     def polish_damped_newton(self, params_phys, max_steps=200, tol=1e-6, lam0=1e-2,
-                             tau=1e-8, step_cap=0.5, gtol=1e-6, verbose=True):
+                             tau=1e-8, step_cap=0.5, gtol=1e-6, verbose=True,
+                             coup_step_cap=0.1, floor_tol=1e-3, patience=5):
         """二阶 polish: active-set + 缩放阻尼 LM + gain-ratio + Armijo 线搜索。
 
         tau: 「正定」判定用的**相对噪声底** λ_min > tau·λ_max。
@@ -668,9 +793,25 @@ class UnifiedPWAOptimizer:
           4. 终止判据用**投影梯度** |P(x-g)-x|_∞ < gtol（真 KKT），而不是 eig_min；
              PD 只在**非活跃子空间**上判（盒约束的正确二阶条件）。
 
+        S4（reparam 防幅度放飞）: 耦合步长/负曲率逃逸步按当前 |A| 夹
+        （coup_step_cap），候选点硬帽 amp_cap，连续 patience 步 ΔNLL<floor_tol
+        即停（噪声底漂移）。
+
         返回 (params, nll, is_pos_def)。
         """
         dev, nc = self.device, self.n_coupling_free
+        # S4: reparam 下按「幅度」而非 v_max(=20000) 限制耦合步长/逃逸步，
+        # 并对候选点做 amp_max 硬帽；非 reparam 保持原行为（amp_cap=v_max 等价）。
+        amp_cap = self.amp_max if self.optimizer_kind == "reparam" else self.v_max
+        use_amp_cap = (self.optimizer_kind == "reparam" and nc > 1)
+
+        def _max_amp(p):
+            if nc <= 1:
+                return 0.0
+            r = p[1:nc]
+            i = p[nc + 1:2 * nc]
+            return float(torch.sqrt(r * r + i * i).max().item())
+
         mask = torch.ones(self.n_params, dtype=torch.bool, device=dev)
         mask[0] = False
         mask[nc] = False
@@ -696,6 +837,7 @@ class UnifiedPWAOptimizer:
         f, g = fg(x)
         lam = lam0
         n_step = 0
+        tiny_streak = 0
 
         for step in range(max_steps):
             n_step = step + 1
@@ -725,11 +867,21 @@ class UnifiedPWAOptimizer:
                 # 必须显式沿负曲率方向逃逸，否则会原地判"收敛"）
                 v = Q_all[:, 0]
                 base = max((0.1 * w[free] / v.abs().clamp(min=1e-30)).min().item(), 1e-12)
+                if use_amp_cap:
+                    # 逃逸步也按幅度夹：v 在 free 子空间，映射回全向量取耦合分量
+                    v_full = torch.zeros_like(x)
+                    v_full[free] = v
+                    v_coup = max(v_full[1:nc].abs().max().item(),
+                                 v_full[nc + 1:2 * nc].abs().max().item())
+                    if v_coup > 0:
+                        base = min(base, coup_step_cap * max(_max_amp(x), 1.0) / v_coup)
                 cand_best = None
                 for sgn in (1.0, -1.0):
                     cand = x.clone()
                     cand[free] = x[free] + sgn * base * v
                     self._project_params_(cand)
+                    if use_amp_cap and _max_amp(cand) > amp_cap:
+                        continue
                     fn, gn = fg(cand)
                     if cand_best is None or fn < cand_best[0]:
                         cand_best = (fn, cand, gn)
@@ -760,10 +912,21 @@ class UnifiedPWAOptimizer:
                     continue
                 # 物理步长帽（相对 free_range 宽度），避免巨步
                 t = min(1.0, (step_cap * w[free] / d.abs().clamp(min=1e-30)).min().item())
+                if use_amp_cap:
+                    # S4: 耦合步长按「当前幅度」夹，单步最多涨 coup_step_cap 比例
+                    d_full = torch.zeros_like(x)
+                    d_full[free] = d
+                    d_coup = max(d_full[1:nc].abs().max().item(),
+                                 d_full[nc + 1:2 * nc].abs().max().item())
+                    if d_coup > 0:
+                        t = min(t, coup_step_cap * max(_max_amp(x), 1.0) / d_coup)
                 for _ in range(30):                         # Armijo 回溯
                     cand = x.clone()
                     cand[free] = x[free] + t * d
                     self._project_params_(cand)
+                    if use_amp_cap and _max_amp(cand) > amp_cap:
+                        t *= 0.5
+                        continue
                     fn, gn = fg(cand)
                     if fn <= f - 1e-4 * abs(t * gd.item()):
                         pred = -(t * gd.item() + 0.5 * t * t * torch.dot(d, H @ d).item())
@@ -788,9 +951,18 @@ class UnifiedPWAOptimizer:
             x, f, g = cand, fn, gn
             if verbose:
                 print(f"[polish] step{step}: λ={lam:.2e} α={t:.2e} ΔNLL={-df:+.4f} "
-                      f"|pg|={pg_inf:.2e} active={int(act.sum())}")
+                      f"|pg|={pg_inf:.2e} active={int(act.sum())} maxA={_max_amp(x):.3e}")
             if df <= 1e-9 * max(1.0, abs(f)):
                 break
+            # S4: 连续处于数值噪声底 → 停机，避免沿简并方向做微小累积漂移
+            if df < floor_tol:
+                tiny_streak += 1
+                if tiny_streak >= patience:
+                    if verbose:
+                        print(f"[polish] stop: 噪声底 (连续 {tiny_streak} 步 ΔNLL<{floor_tol})")
+                    break
+            else:
+                tiny_streak = 0
 
         # ---- 终态: 重算活跃集, 只在非活跃子空间判 PD ----
         act = active_of(x, g)
@@ -1388,7 +1560,8 @@ def build_parser():
   每个 CLI 参数都有对应的 FIT_* 环境变量，优先级: CLI > 环境变量 > 默认值。
   FIT_RUNS, FIT_NITER, FIT_LR, FIT_TOL_GRAD, FIT_TOL_CHANGE,
   FIT_HISTORY_SIZE, FIT_VMAX, FIT_PROJECT, FIT_WAVES, FIT_EVENT_DATA,
-  FIT_WARM, FIT_POLISH, FIT_CHECKPOINT_INTERVAL
+  FIT_WARM, FIT_POLISH, FIT_CHECKPOINT_INTERVAL,
+  FIT_OPTIMIZER, FIT_AMP_MAX, FIT_AMP_LAMBDA, FIT_OPT_VERBOSE
 
 示例:
   # 快速扫描（早期调试）
@@ -1428,24 +1601,32 @@ def build_parser():
     p.add_argument("--niter", type=int, default=None,
                    help="LBFGS 最大迭代次数 (env: FIT_NITER, 默认: 500)")
     p.add_argument("--lr", type=float, default=None,
-                   help="LBFGS 学习率 (env: FIT_LR, 默认: 0.9)")
+                   help="LBFGS 初始步长 (env: FIT_LR, 默认: 0.3；reparam/lbfgs 用)")
     p.add_argument("--tol-grad", type=float, default=None,
-                   help="LBFGS 梯度收敛阈值 (env: FIT_TOL_GRAD, 默认: 1e-7)")
+                   help="梯度收敛阈值 (env: FIT_TOL_GRAD, 默认: 1e-5)")
     p.add_argument("--tol-change", type=float, default=None,
-                   help="LBFGS 参数变化收敛阈值 (env: FIT_TOL_CHANGE, 默认: 1e-9)")
+                   help="参数变化收敛阈值 (env: FIT_TOL_CHANGE, 默认: 1e-5)")
     p.add_argument("--history-size", type=int, default=None,
-                   help="LBFGS history 大小 (env: FIT_HISTORY_SIZE, 默认: 100)")
+                   help="LBFGS history 大小 (env: FIT_HISTORY_SIZE, 默认: 200)")
 
     # --- 约束 / 数值稳定 ---
     p.add_argument("--vmax", type=float, default=None,
                    help="耦合幅度上界 |v| <= vmax (env: FIT_VMAX, 默认: 10000)")
+    p.add_argument("--amp-max", type=float, default=None,
+                   help="reparam 耦合幅度软墙上限 amp=amp_max·sigmoid(u) "
+                        "(env: FIT_AMP_MAX, 默认: 1000)")
+    p.add_argument("--amp-lambda", type=float, default=None,
+                   help="reparam 幅度罚项 λ·Σ|A|²（只进优化 loss，不进报告 NLL；"
+                        "env: FIT_AMP_LAMBDA, 默认: 1e-4；设 0 关闭）")
     p.add_argument("--no-project", action="store_true", default=None,
                    help="关闭投影梯度 (env: FIT_PROJECT=0)；只影响 legacy lbfgs 路径")
     p.add_argument("--optimizer", type=str, default=None,
-                   choices=["projected", "lbfgs"],
-                   help="优化器: projected=有界 L-BFGS（默认，状态全在 GPU，"
-                        "投影梯度停机+活跃集+可行线搜索）; lbfgs=旧路径 "
-                        "torch LBFGS+clamp（A/B 对照用） (env: FIT_OPTIMIZER)")
+                   choices=["reparam", "projected", "lbfgs"],
+                   help="优化器: reparam=重参数化软墙（默认；耦合 sigmoid 幅度极坐标"
+                        " + 共振态 sigmoid）+ torch LBFGS(strong_wolfe); "
+                        "projected=有界 L-BFGS（投影梯度停机+活跃集+可行线搜索，"
+                        "本模型常跑到 max-iter）; lbfgs=旧路径 torch LBFGS+clamp"
+                        "（A/B 对照用） (env: FIT_OPTIMIZER)")
     p.add_argument("--opt-verbose", action="store_true", default=None,
                    help="每轮打印 projected L-BFGS 的 |pg|/active/ΔNLL "
                         "(env: FIT_OPT_VERBOSE=1)")
@@ -1501,6 +1682,10 @@ def resolve_args(args):
 
     cfg["v_max"] = (args.vmax if args.vmax is not None
                     else _env_float("FIT_VMAX", 10000.0))
+    cfg["amp_max"] = (args.amp_max if args.amp_max is not None
+                      else _env_float("FIT_AMP_MAX", 1000.0))
+    cfg["amp_lambda"] = (args.amp_lambda if args.amp_lambda is not None
+                         else _env_float("FIT_AMP_LAMBDA", 1e-4))
 
     # project_grad: CLI --no-project → False; 否则看 FIT_PROJECT
     if args.no_project is True:
@@ -1508,9 +1693,9 @@ def resolve_args(args):
     else:
         cfg["project_grad"] = _env_bool("FIT_PROJECT", True)
 
-    # optimizer: CLI --optimizer > FIT_OPTIMIZER > 默认 projected
+    # optimizer: CLI --optimizer > FIT_OPTIMIZER > 默认 reparam
     cfg["optimizer_kind"] = (args.optimizer if args.optimizer is not None
-                             else os.environ.get("FIT_OPTIMIZER", "projected")).lower()
+                             else os.environ.get("FIT_OPTIMIZER", "reparam")).lower()
     if args.opt_verbose is True:
         os.environ["FIT_OPT_VERBOSE"] = "1"
 
@@ -1617,6 +1802,10 @@ def main():
           f"history_size={cfg['history_size']}")
     print(f"  vmax={cfg['v_max']}, project_grad={cfg['project_grad']}")
     print(f"  optimizer={cfg['optimizer_kind']}")
+    if cfg["optimizer_kind"] == "reparam":
+        print(f"  reparam: coupling=polar(amp=sigmoid, amp_max={cfg['amp_max']}, "
+              f"lambda={cfg['amp_lambda']}), res=sigmoid, "
+              f"line_search=strong_wolfe")
     print(f"  polish={cfg['polish']}")
     print(f"  warm_start={cfg['warm_start_path']}")
     print(f"  waves={cfg['waves'] if cfg['waves'] else '(all)'}")
@@ -1637,6 +1826,8 @@ def main():
         v_max=cfg["v_max"],
         project_grad=cfg["project_grad"],
         optimizer_kind=cfg["optimizer_kind"],
+        amp_max=cfg["amp_max"],
+        amp_lambda=cfg["amp_lambda"],
     )
 
     # ---- P4.4: Resume ----
