@@ -1,0 +1,38 @@
+# 仅对 example/ 生效的 pre-commit 配置（并行 fork 本地用；放在 example/ 内，
+# 以保证与上游的分歧仅限 example/）。
+#
+# 原则：「自动 hook 不修改文件，会改文件的 hook 一律手动跑」——
+# 避免历史遗留代码被批量重排/格式化，从而与上游产生大 diff、妨碍合并。
+#   自动(提交时/--all-files)：check-merge-conflict、ruff 致命检查(不改)。
+#   手动(--hook-stage manual)：trailing-whitespace、end-of-file-fixer、ruff-format。
+#
+# 用法（详见 example/AGENT.md）：
+#   pre-commit install --config example/.pre-commit-config.yaml          # 装本地 hook
+#   pre-commit run   --config example/.pre-commit-config.yaml --all-files
+#   # 需要时手动整理：
+#   pre-commit run --config example/.pre-commit-config.yaml --hook-stage manual --all-files
+#
+# files: 路径相对仓库根；只扫 example/，不会动上游目录。
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-merge-conflict
+        files: ^example/
+      - id: trailing-whitespace
+        files: ^example/
+        stages: [manual]
+      - id: end-of-file-fixer
+        files: ^example/
+        stages: [manual]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.8
+    hooks:
+      # 只查致命/未定义（E9 语法、F63 错缩进、F7 语法、F82 未定义名），不自动改
+      - id: ruff
+        files: ^example/.*\.py$
+        args: [--select, "E9,F63,F7,F82"]
+      - id: ruff-format
+        files: ^example/.*\.py$
+        stages: [manual]
