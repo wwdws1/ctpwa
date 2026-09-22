@@ -11,7 +11,7 @@ Hessian / 参数误差 → 保存结果与摘要。
 
 ```bash
 # 在放有 config.yml 的目录里运行
-python -u fit.py --config config.yml --runs 10 --niter 3000            # 默认 reparam
+python -u fit.py --config config.yml --runs 10 --niter 3000            # 默认 projected；推荐加 --optimizer reparam
 python -u fit.py --optimizer projected --runs 2 --niter 3000           # 对照（慢）
 python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-4  # 显式指定 reparam 参数
 ```
@@ -32,7 +32,7 @@ python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-4  # 显式�
 ## 2. 快速开始
 
 ```bash
-# 正式拟合（默认优化器 reparam）
+# 正式拟合（推荐 reparam；不写 --optimizer 则默认 projected）
 python -u fit.py --runs 10 --niter 3000
 
 # 早期快速调试
@@ -52,10 +52,11 @@ python -u fit.py --runs 20 --niter 3000 --resume
 
 ## 3. 优化器区别（重点）
 
-用 `--optimizer {reparam,projected,lbfgs}` 选择，默认 **`reparam`**。
+用 `--optimizer {reparam,projected,lbfgs}` 选择，默认 **`projected`**（与上游一致）；
+**实际分析推荐 `reparam`**（需显式 `--optimizer reparam`）。
 三者都在**同一个物理参数空间**上优化；下游的 Hessian / polish / 误差 / 输出与优化器无关。
 
-### 3.1 `reparam`（默认，推荐）
+### 3.1 `reparam`（推荐；非默认，需 `--optimizer reparam`）
 
 **做法**：把有界/半有界参数映射到无约束空间 `u`，用 `torch.optim.LBFGS(strong_wolfe)` 优化：
 
@@ -73,7 +74,7 @@ python -u fit.py --runs 20 --niter 3000 --resume
 
 相关参数：`--amp-max`、`--amp-lambda`、`--lr`、`--tol-grad`、`--tol-change`、`--history-size`。
 
-### 3.2 `projected`
+### 3.2 `projected`（默认）
 
 **做法**：自研的盒约束 L-BFGS——投影梯度 KKT 停机 + 活跃集剔除 + 可行 Armijo 线搜索，
 在物理参数空间直接优化，边界由算法处理（`honest=True`，不 clamp、不清零梯度）。
@@ -95,7 +96,7 @@ python -u fit.py --runs 20 --niter 3000 --resume
 
 ### 3.4 对比（示例数据，`--runs`/`--niter` 见备注）
 
-| 维度 | `reparam`（默认） | `projected` | `lbfgs`（legacy） |
+| 维度 | `reparam`（推荐） | `projected`（默认） | `lbfgs`（legacy） |
 |---|---|---|---|
 | 边界处理 | 重参数化软墙 | 投影梯度 + 活跃集（盒约束） | clamp + 边界梯度清零 |
 | 停机判据 | 无约束梯度/变化量（u 空间） | 投影梯度 KKT | 无约束梯度/变化量 |
@@ -107,9 +108,9 @@ python -u fit.py --runs 20 --niter 3000 --resume
 \* 实测自 `--niter 3000`：reparam/projected 数据来自 20/5 个 run，lbfgs 来自 2 个 run；
 具体数据集为 `jlsp` 的 `single` 配置，仅供相对比较。
 
-**如何选**：默认用 `reparam`。做 A/B 或复现历史行为时用 `--optimizer projected` 或
-`--optimizer lbfgs`。若 reparam 偶发振幅偏大，可调大 `--amp-lambda`（如 1e-3）或调小
-`--amp-max`。
+**如何选**：默认是 `projected`（与上游一致）；**实际分析推荐 `--optimizer reparam`**。
+做 A/B 或复现历史行为时用 `--optimizer projected` / `--optimizer lbfgs`。
+若 reparam 偶发振幅偏大，可调大 `--amp-lambda`（如 1e-3）或调小 `--amp-max`。
 
 ---
 
@@ -147,12 +148,15 @@ python -u fit.py --runs 20 --niter 3000 --resume
 ### 误差估计（Hessian 非正定回退）
 | 参数 | 说明 | 默认 | 环境变量 |
 |---|---|---|---|
-| `--err-mode` | `auto`=PD 直接求逆、否则伪逆；`strict`=原行为(非PD不给)；`pinv`=伪逆(丢 `λ<τλmax` 方向)；`psd`=把 `λ` 截到 `τλmax` 后求逆(更保守) | `auto` | `FIT_ERR_MODE` |
+| `--err-mode` | `auto`=PD 直接求逆、否则伪逆；`strict`=原行为(非PD不给)；`pinv`=伪逆(丢 `λ<τλmax` 方向)；`psd`=把 `λ` 截到 `τλmax` 后求逆(更保守) | `reparam`→`auto`，其它→`strict` | `FIT_ERR_MODE` |
 | `--err-tau` | 相对阈值 `τ`（`λ<τ·λmax` 视为平坦/不可测） | `1e-6` | `FIT_ERR_TAU` |
 
-> 当精确 Hessian 近奇异/非正定（本模型常见，存在 ~20–30 维近平坦子空间）时，
-> `auto` 自动退化为伪逆并给出参数误差，同时在日志打印 `mode=... / λmin / λmax /
-> flat(λ<τλmax)=N`；输出会标注这是**秩亏下的可行估计，非严格统计误差**。
+> **默认策略**：显式 `--err-mode` > `FIT_ERR_MODE` > **优化器相关**（`reparam`→`auto`，
+> 其它→`strict`）。即：只有选 `reparam` 时默认才自动回退给误差；`projected`/`lbfgs`
+> 默认与上游一致（非正定就不给误差）。
+> 当精确 Hessian 近奇异/非正定（本模型常见，存在 ~20–30 维近平坦子空间）时，`auto`
+> 自动退化为伪逆并给出参数误差，同时在日志打印 `mode=... / λmin / λmax / flat=N`；
+> 输出会标注这是**秩亏下的可行估计，非严格统计误差**。
 > `--err-mode strict` 可恢复“非正定就不给误差”的旧行为。
 
 ### Warm start
@@ -222,9 +226,9 @@ FIT_CHECKPOINT_INTERVAL
 2. `reparam` 的 `--amp-lambda` 是作用在**优化 loss** 上的弱先验；报告/保存的 NLL、
    Hessian、误差全部基于**真实 NLL**，不受罚项影响。
 3. 结果普遍 `正定性=False`：精确 Hessian 存在 ~20–30 维近平坦/简并子空间（诊断显示
-   沿负特征值方向 NLL 两侧都不下降，说明是数值/秩亏而非真鞍点）。参数误差默认由
-   **`--err-mode auto` 自动回退到伪逆**给出，并标注为“可行估计、非严格统计误差”；
-   `--err-mode strict` 可恢复“非正定就不给误差”的旧行为。拟合分数/效率仍以真 PD 为门控。
+   沿负特征值方向 NLL 两侧都不下降，说明是数值/秩亏而非真鞍点）。**用 `reparam` 时**
+   参数误差默认由 `--err-mode auto` 自动回退到伪逆给出，并标注为“可行估计、非严格统计
+   误差”；`projected`/`lbfgs` 默认 `strict`（非正定不给误差）。拟合分数/效率仍以真 PD 为门控。
 4. `--lr` 只对 `reparam`/`lbfgs` 有意义；`projected` 不用 `lr`，其停机由
    `--tol-grad`（gtol）控制。
 5. 若在集群提交作业，注意 `fit.py` 会读 cwd 的 `config.yml` 并需要 GPU；建议
