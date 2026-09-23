@@ -530,6 +530,29 @@ def projected_lbfgs(
 # ============================================================
 _REPARAM_EPS = 1e-12
 
+_SO_COMPLEX_DTYPE = None  # 缓存 ctpwa .so 的复数精度（None=未探测/探测失败）
+
+
+def _so_complex_dtype():
+    """返回与 ctpwa .so 编译精度匹配的 torch complex dtype（None=未知）。
+
+    getFitFractions/getEfficiency 要求 vector 的复数 dtype 与 .so 精度一致；
+    .so 为 double → complex128、float → complex64。探测失败（如 CPU 单测 stub）返回 None，
+    由调用方按 params 实数精度兜底。
+    """
+    global _SO_COMPLEX_DTYPE
+    if _SO_COMPLEX_DTYPE is not None:
+        return _SO_COMPLEX_DTYPE
+    try:
+        prec = ctpwa.DeviceManager().compiledPrecision()
+        if prec == "double":
+            _SO_COMPLEX_DTYPE = torch.complex128
+        elif prec == "float":
+            _SO_COMPLEX_DTYPE = torch.complex64
+    except Exception:
+        _SO_COMPLEX_DTYPE = None
+    return _SO_COMPLEX_DTYPE
+
 
 def _reparam_pack(params, nc, n_res, lower, upper, amp_max, eps=_REPARAM_EPS):
     """物理参数 -> 无约束 u。params: [re(nc) | im(nc) | theta(n_res)]。
@@ -1664,13 +1687,16 @@ class UnifiedPWAOptimizer:
     def extract_coupling_complex(self, params):
         """提取复数耦合向量，dtype 匹配 .so 精度。
 
-        本仓库 .so 为 **double** 精度（`getHessian` 文档即 `params: float64`）→ 需
-        **complex128**；旧版固定 `.float()`(complex64) 会在 getFitFractions/getEfficiency
-        触发 "vector dtype must match .so complex precision"。按 params 实数精度选择。
+        优先用 `ctpwa.DeviceManager().compiledPrecision()`（double→complex128 /
+        float→complex64）；探测失败时按 params 实数精度兜底。旧版固定 complex64 会在
+        getFitFractions/getEfficiency 触发 "vector dtype must match .so complex precision"。
         """
         real = params[: self.n_coupling_free]
         imag = params[self.n_coupling_free : 2 * self.n_coupling_free]
-        if params.dtype == torch.float64:
+        cdt = _so_complex_dtype()
+        if cdt is None:
+            cdt = torch.complex128 if params.dtype == torch.float64 else torch.complex64
+        if cdt == torch.complex128:
             return torch.complex(real.double(), imag.double())
         return torch.complex(real.float(), imag.float())
 
