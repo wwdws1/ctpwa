@@ -71,15 +71,18 @@ def generate_initial_params(n_coupling_free, free_res_info, seed=42, device="cud
     params = torch.zeros(n_total, dtype=torch.float64, device=device)
     torch.manual_seed(seed)
     params[0] = 1.0
-    for idx in range(1, n_coupling_free):
-        amplitude = torch.rand(1, device=device).item() * 0.5
-        phase = torch.rand(1, device=device).item() * 2 * torch.pi
-        params[idx] = amplitude * np.cos(phase)
-    params[n_coupling_free] = 0.0
-    for idx in range(1, n_coupling_free):
-        amplitude = torch.rand(1, device=device).item() * 0.5
-        phase = torch.rand(1, device=device).item() * 2 * torch.pi
-        params[n_coupling_free + idx] = amplitude * np.sin(phase)
+    nvar = n_coupling_free - 1
+    if nvar > 0:
+        # B11: 向量化（保持旧 RNG 抽样顺序: 先全部 re 再全部 im；每耦合 amp, phase）
+        r_re = torch.rand(2 * nvar, device=device).double()
+        r_im = torch.rand(2 * nvar, device=device).double()
+        amp_re, ph_re = r_re[0::2] * 0.5, r_re[1::2] * 2 * torch.pi
+        amp_im, ph_im = r_im[0::2] * 0.5, r_im[1::2] * 2 * torch.pi
+        params[1:n_coupling_free] = amp_re * torch.cos(ph_re)
+        params[n_coupling_free] = 0.0
+        params[n_coupling_free + 1 : 2 * n_coupling_free] = amp_im * torch.sin(ph_im)
+    else:
+        params[n_coupling_free] = 0.0
     if n_res > 0:
         init_vals = free_res_info[0].to(device=device, dtype=torch.float64)
         if seed > 42:
@@ -488,8 +491,8 @@ def projected_lbfgs(
             f"{n_eval / max(n_it, 1):.2f} eval/iter"
         )
         tr = diag["trials"]
-        hist = " ".join(f"{k}次×{tr[k]}" for k in sorted(tr))
-        print(f"    [pLBFGS-diag] 线搜索试探分布: {hist}")
+        trial_hist = " ".join(f"{k}次×{tr[k]}" for k in sorted(tr))
+        print(f"    [pLBFGS-diag] 线搜索试探分布: {trial_hist}")
         print(
             f"    [pLBFGS-diag] fallback={diag['fallback']} "
             f"max_ls 打满={diag['max_ls_hit']} 撞界cap={diag['capped']} "
@@ -569,18 +572,17 @@ def _reparam_unpack(
     phi = u[k : 2 * k]
     re = amp * torch.cos(phi)
     im = amp * torch.sin(phi)
-    parts = [
-        torch.ones(1, dtype=dtype, device=device),
-        re,
-        torch.zeros(1, dtype=dtype, device=device),
-        im,
-    ]
+    # B9: 预分配输出、按块填充（替代 list + cat 的多次分配；autograd 经 CopySlices 传递）
+    out = torch.zeros(2 * nc + n_res, dtype=dtype, device=device)
+    out[0] = 1.0  # 固定参考 re_0 = 1
+    out[1 : 1 + k] = re
+    out[nc + 1 : nc + 1 + k] = im
     if n_res > 0:
         lower = lower.to(dtype=dtype, device=device)
         upper = upper.to(dtype=dtype, device=device)
         theta = lower + (upper - lower) * torch.sigmoid(u[2 * k :])
-        parts.append(theta)
-    return torch.cat(parts)
+        out[2 * nc :] = theta
+    return out
 
 
 # ============================================================
@@ -723,17 +725,21 @@ class UnifiedPWAOptimizer:
 
         # 耦合实部
         params[0] = 1.0  # 固定参考
-        for idx in range(1, n_coupling_free):
-            amplitude = torch.rand(1, device=device).item() * 0.5
-            phase = torch.rand(1, device=device).item() * 2 * torch.pi
-            params[idx] = amplitude * np.cos(phase)
-
-        # 耦合虚部
-        params[n_coupling_free] = 0.0  # 固定参考
-        for idx in range(1, n_coupling_free):
-            amplitude = torch.rand(1, device=device).item() * 0.5
-            phase = torch.rand(1, device=device).item() * 2 * torch.pi
-            params[n_coupling_free + idx] = amplitude * np.sin(phase)
+        nvar = n_coupling_free - 1
+        if nvar > 0:
+            # B11: 一次性抽随机数再向量化赋值（保持旧 RNG 抽样顺序: 先全部 re, 再全部 im；
+            # 每个耦合 = amp, phase 两个数）
+            r_re = torch.rand(2 * nvar, device=device).double()
+            r_im = torch.rand(2 * nvar, device=device).double()
+            amp_re, ph_re = r_re[0::2] * 0.5, r_re[1::2] * 2 * torch.pi
+            amp_im, ph_im = r_im[0::2] * 0.5, r_im[1::2] * 2 * torch.pi
+            params[1:n_coupling_free] = amp_re * torch.cos(ph_re)
+            params[n_coupling_free] = 0.0  # 固定参考
+            params[n_coupling_free + 1 : 2 * n_coupling_free] = amp_im * torch.sin(
+                ph_im
+            )
+        else:
+            params[n_coupling_free] = 0.0  # 固定参考
 
         # 共振态参数
         if n_res > 0:
@@ -1260,13 +1266,16 @@ class UnifiedPWAOptimizer:
 
             accepted = False
             for _ in range(25):  # λ 自适应
-                M = H + torch.diag(lam * dg)
+                # B10: 用 diag 视图加阻尼，避免 torch.diag(lam*dg) 的 n×n 分配
+                M = H.clone()
+                M.diagonal().add_(lam * dg)
                 try:
                     d = torch.linalg.solve(M, -gf)
                 except Exception:
                     d = torch.linalg.lstsq(M, -gf).solution
                 gd = torch.dot(gf, d)
-                if (not bool(torch.isfinite(gd))) or gd >= 0:  # 非下降 → 加阻尼
+                gd_v = float(gd.item())  # 一次同步，Armijo 内复用
+                if (not bool(torch.isfinite(gd))) or gd_v >= 0:  # 非下降 → 加阻尼
                     lam *= 4.0
                     continue
                 # 物理步长帽（相对 free_range 宽度），避免巨步
@@ -1291,10 +1300,8 @@ class UnifiedPWAOptimizer:
                         t *= 0.5
                         continue
                     fn, gn = fg(cand)
-                    if fn <= f - 1e-4 * abs(t * gd.item()):
-                        pred = -(
-                            t * gd.item() + 0.5 * t * t * torch.dot(d, H @ d).item()
-                        )
+                    if fn <= f - 1e-4 * abs(t * gd_v):
+                        pred = -(t * gd_v + 0.5 * t * t * torch.dot(d, H @ d).item())
                         rho = (f - fn) / pred if pred > 0 else 1.0
                         lam = max(
                             lam * (0.5 if rho > 0.75 else (2.0 if rho < 0.25 else 1.0)),
