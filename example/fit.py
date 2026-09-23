@@ -864,6 +864,7 @@ class UnifiedPWAOptimizer:
         params = initial_params.clone().detach().requires_grad_(True)
         nll_history = []
         opt_status = "lbfgs"
+        opt_n_iter = None  # reparam: torch LBFGS 的 n_iter（供摘要/B4 诊断）
 
         start_time = time.time()
         if self.optimizer_kind == "projected":
@@ -917,7 +918,13 @@ class UnifiedPWAOptimizer:
                 line_search_fn="strong_wolfe",
             )
 
+            _prof = self.optimizer_prof  # FIT_OPT_PROF=1: 记录 eval 次数/耗时
+            _t_eval = 0.0
+            _n_eval = 0
+
             def closure():
+                nonlocal _t_eval, _n_eval
+                _t0 = time.perf_counter() if _prof else 0.0
                 optimizer.zero_grad()
                 p = _reparam_unpack(
                     u,
@@ -938,6 +945,9 @@ class UnifiedPWAOptimizer:
                     loss = nll + self.amp_lambda * (re_c * re_c + im_c * im_c).sum()
                 loss.backward()
                 nll_history.append(nll.item())  # 记录真实 NLL
+                if _prof:
+                    _t_eval += time.perf_counter() - _t0
+                    _n_eval += 1
                 return loss
 
             optimizer.step(closure)
@@ -962,12 +972,20 @@ class UnifiedPWAOptimizer:
                 )
             except Exception:
                 n_iter = 0
+            opt_n_iter = n_iter
             # ⚠ torch LBFGS 的容差停机 ≠ 物理空间 KKT 收敛：本模型实测约半数
             # 起点会在坏盆地"容差停机"（NLL 可比正常解差 100~700）。多起点流程
             # 请以 best-of-N 为准，勿据 status 判定单次结果成功。
             opt_status = (
                 "reparam-max-iter" if n_iter >= max_iter else "reparam-tol-stop"
             )
+            if _prof:
+                print(
+                    f"    [reparam-prof] evals={_n_eval} "
+                    f"eval={_t_eval:.3f}s "
+                    f"({_t_eval / max(_n_eval, 1) * 1e3:.3f} ms/eval) "
+                    f"n_iter={n_iter} status={opt_status}"
+                )
         else:
             # ---- legacy: torch LBFGS + clamp + 投影梯度清零（A/B 对照用） ----
             optimizer = torch.optim.LBFGS(
@@ -1047,6 +1065,9 @@ class UnifiedPWAOptimizer:
             "optimizer_status": opt_status,
             "hessian_time": hessian_time,
             "iterations": len(nll_history),
+            # evals: 每次函数求值计数（projected 的 record / reparam 的 closure）
+            "evals": len(nll_history),
+            "n_iter": opt_n_iter,  # 优化器内部迭代数（reparam；其它为 None）
             "initial_params": initial_params.clone().detach(),
             "hessian_full": hessian_full,
             "hessian": hessian,
@@ -2007,6 +2028,7 @@ class UnifiedPWAOptimizer:
             f.write("=" * 100 + "\n")
             f.write(
                 f"{'排名':<4} {'运行ID':<6} {'NLL':<12} {'迭代':<8} "
+                f"{'eval数':<8} {'n_iter':<7} "
                 f"{'耗时':<10} {'Hessian耗时':<12} {'正定':<6} "
                 f"{'误差模式':<12} {'平坦维':<6} {'优化器状态':<20}\n"
             )
@@ -2015,7 +2037,10 @@ class UnifiedPWAOptimizer:
             for rank, res in enumerate(sorted_results):
                 f.write(
                     f"{rank + 1:<4} {res['run_id']:<6} {res['final_nll']:<12.6f} "
-                    f"{res['iterations']:<8} {res['time']:<10.2f} "
+                    f"{res['iterations']:<8} "
+                    f"{res.get('evals', res['iterations']):<8} "
+                    f"{str(res.get('n_iter', '-')):<7} "
+                    f"{res['time']:<10.2f} "
                     f"{res['hessian_time']:<12.2f} "
                     f"{str(res['is_positive_definite']):<6} "
                     f"{str(res.get('err_mode_used', '-')):<12} "
