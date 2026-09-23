@@ -1552,6 +1552,100 @@ class UnifiedPWAOptimizer:
         return out
 
     # --------------------------------------------------------
+    def _propagation_curvature(self, params, mode=None, tau=None):
+        """构造用于 FF/效率误差传播的曲率（PSD 化/回退），传给 C++。
+
+        C++ getFitFractions/getEfficiency 只取耦合块 [0:n2]，且**只排除固定参考**
+        idx 0 与 n；本函数用**与 C++ 完全相同的 free 索引**做 eigh，再按 err_mode
+        重构曲率，使 inv(H_free) 等于目标协方差：
+          inv（真 PD）/ pinv（丢 λ<τλmax，协方差≈0）/ psd（λ 截到 τλmax，更保守）；
+          strict 非 PD → 返回 None（调用方退回原 Hessian，C++ 误差自然为 0）。
+        返回 (H_out 或 None, info)：H_out 为全尺寸 float64 CUDA 张量。
+
+        与 `_errors_from_hessian` 的区别：这里**不额外剔除活跃集**，严格镜像 C++
+        的 mask（耦合受 v_max/amp_max 限幅、默认 reparam 软墙下几乎不贴边）。
+        """
+        nc = self.n_coupling_free
+        n2 = 2 * nc
+        if mode is None:
+            mode = self.err_mode
+        if tau is None:
+            tau = self.err_tau
+        H = self._get_hessian_cached(params).double().clone()
+        if nc <= 1:
+            # 只有固定参考、无自由耦合方向 → 无需传播（C++ 误差为 0）
+            return None, {
+                "mode": "no-free",
+                "is_pd": True,
+                "n_flat": 0,
+                "min_eig": float("nan"),
+                "max_eig": float("nan"),
+            }
+        free = [j for j in range(n2) if j not in (0, nc)]
+        idx = torch.tensor(free, dtype=torch.long, device=H.device)
+        H_c = H[:n2, :n2]
+        H_free = H_c.index_select(0, idx).index_select(1, idx)
+        try:
+            eig, vec = torch.linalg.eigh(H_free)
+        except Exception as e:
+            log.exception(f"传播曲率特征分解失败: {e}")
+            return None, {
+                "mode": "eigh-fail",
+                "is_pd": False,
+                "n_flat": 0,
+                "min_eig": float("nan"),
+                "max_eig": float("nan"),
+            }
+        lmax = eig[-1].abs().clamp(min=1e-30)
+        lmin = float(eig[0].item())
+        lmax_v = float(lmax.item())
+        is_pd = lmin > tau * lmax_v
+        n_flat = int((eig < tau * lmax).sum().item())
+        if mode == "auto":
+            eff = "inv" if is_pd else "pinv"
+        elif mode == "strict":
+            if not is_pd:
+                log.warning(
+                    f"[ff] strict: Hessian 非正定（λmin={lmin:.3e}, "
+                    f"λmin/λmax={lmin / lmax_v:.2e}）→ 不传播误差（误差置 0）"
+                )
+                return None, {
+                    "mode": "strict(no-pd)",
+                    "is_pd": False,
+                    "n_flat": n_flat,
+                    "min_eig": lmin,
+                    "max_eig": float(eig[-1].item()),
+                }
+            eff = "inv"
+        else:
+            eff = mode  # pinv / psd 强制
+        if eff == "inv":
+            H_free_new = H_free
+        elif eff == "psd":
+            floor = torch.maximum(
+                tau * lmax, torch.tensor(1e-6, device=H.device, dtype=H.dtype)
+            )
+            eig2 = torch.clamp(eig, min=floor)
+            H_free_new = (vec * eig2) @ vec.t()
+        else:  # pinv
+            eig2 = torch.where(eig > tau * lmax, eig, lmax)
+            H_free_new = (vec * eig2) @ vec.t()
+        H_c = H[:n2, :n2].clone()
+        H_c[idx.unsqueeze(1), idx.unsqueeze(0)] = H_free_new
+        H[:n2, :n2] = H_c
+        log.info(
+            f"[ff] 传播曲率: mode={eff}(请求 {mode}), is_pd={is_pd}, "
+            f"λmin={lmin:.3e}, λmax={lmax_v:.3e}, flat(λ<τλmax)={n_flat}/{len(eig)}"
+        )
+        return H, {
+            "mode": eff,
+            "is_pd": is_pd,
+            "n_flat": n_flat,
+            "min_eig": lmin,
+            "max_eig": lmax_v,
+        }
+
+    # --------------------------------------------------------
     def compute_param_errors(self, params_phys, tau=None):
         """在给定参数点用精确 Hessian 求参数误差（含非正定回退）。
 
@@ -1595,9 +1689,14 @@ class UnifiedPWAOptimizer:
         # （旧版内部用独立的 computeCouplingHessian, 近平坦方向
         #  min_eig~1e-5 时正定判定翻脸 → 误差被跳过变全 0）。
         hessian_full = self._get_hessian_cached(params)
+        # 非正定 → 按 err_mode 构造 PSD 化曲率再传给 C++（否则 C++ 静默把误差置 0）
+        curv, info = self._propagation_curvature(params)
+        if curv is None:
+            log.warning(f"[ff] 拟合分数误差不传播（{info.get('mode')}）；仅输出中心值")
+            curv = hessian_full
         # getFitFractions 在配置无 phsp_truth 时天然返回空张量 [0,2]
         # （早期拟合不带 mctruth）→ 这里自然跳过, 不抛异常、不触碰相关 kernel
-        ff_result = self.analysis.getFitFractions(coupling, hessian_full)
+        ff_result = self.analysis.getFitFractions(coupling, curv)
         if ff_result is None or ff_result.numel() == 0:
             log.warning(
                 "跳过拟合分数: 配置没有 phsp_truth (无效率相空间 MC), "
@@ -1622,7 +1721,11 @@ class UnifiedPWAOptimizer:
 
         coupling = self.extract_coupling_complex(params)
         hessian_full = self._get_hessian_cached(params)
-        eff_result = self.analysis.getEfficiency(coupling, hessian_full)
+        curv, info = self._propagation_curvature(params)
+        if curv is None:
+            log.warning(f"[ff] 分波效率误差不传播（{info.get('mode')}）；仅输出中心值")
+            curv = hessian_full
+        eff_result = self.analysis.getEfficiency(coupling, curv)
         if eff_result is None or eff_result.numel() == 0:
             log.warning(
                 "跳过分波效率: 配置缺 phsp (带效率 MC) 或 phsp_truth, "
@@ -2066,7 +2169,7 @@ class UnifiedPWAOptimizer:
                     f"{res.get('optimizer_status', '-'):<20}\n"
                 )
 
-            if self.best_result.get("is_positive_definite", False):
+            if self.best_params is not None:
                 f.write("=" * 100 + "\n")
                 f.write("最佳拟合分数 (fit fractions, 无效率/MC无关):\n")
                 f.write("=" * 100 + "\n")
@@ -2730,37 +2833,37 @@ def main():
         event_data=cfg["event_data"],
     )
 
-    # ---- 拟合分数 ----
+    # ---- 拟合分数（不再以真 PD 门控：非 PD 时用 err_mode 回退曲率传播误差）----
+    if not best_res.get("is_positive_definite", False):
+        log.warning(
+            "Hessian 非正定；拟合分数/效率的误差来自 err_mode 回退曲率"
+            f"（err_mode={cfg['err_mode']}, τ={cfg['err_tau']:.1e}），"
+            "为秩亏下的可行估计、非严格统计误差；中心值不受影响。"
+        )
     ff_values = ff_errors = None
-    if best_res["is_positive_definite"]:
-        try:
-            ff_values, ff_errors = optimizer.compute_fit_fractions(
-                best_res["final_params"]
-            )
-            if ff_values is not None:
-                print(f"\n{'=' * 80}")
-                print("最佳结果的拟合分数 (fit fractions, Σ=1, 无效率/MC无关):")
-                print(f"{'=' * 80}")
-                for i in range(len(ff_values)):
-                    print(f"{i:2d}: {ff_values[i]:.6f} ± {ff_errors[i]:.6f}")
-        except Exception as e:
-            log.exception(f"计算拟合分数失败: {e}")
+    try:
+        ff_values, ff_errors = optimizer.compute_fit_fractions(best_res["final_params"])
+        if ff_values is not None:
+            print(f"\n{'=' * 80}")
+            print("最佳结果的拟合分数 (fit fractions, Σ=1, 无效率/MC无关):")
+            print(f"{'=' * 80}")
+            for i in range(len(ff_values)):
+                print(f"{i:2d}: {ff_values[i]:.6f} ± {ff_errors[i]:.6f}")
+    except Exception as e:
+        log.exception(f"计算拟合分数失败: {e}")
 
     # ---- 分波效率 ----
     eff_values = eff_errors = None
-    if best_res["is_positive_definite"]:
-        try:
-            eff_values, eff_errors = optimizer.compute_efficiency(
-                best_res["final_params"]
-            )
-            if eff_values is not None:
-                print(f"\n{'=' * 80}")
-                print("最佳结果的分波效率 (ε_i, phsp/phsp_truth 加权比值):")
-                print(f"{'=' * 80}")
-                for i in range(len(eff_values)):
-                    print(f"{i:2d}: {eff_values[i]:.6f} ± {eff_errors[i]:.6f}")
-        except Exception as e:
-            log.exception(f"计算分波效率失败: {e}")
+    try:
+        eff_values, eff_errors = optimizer.compute_efficiency(best_res["final_params"])
+        if eff_values is not None:
+            print(f"\n{'=' * 80}")
+            print("最佳结果的分波效率 (ε_i, phsp/phsp_truth 加权比值):")
+            print(f"{'=' * 80}")
+            for i in range(len(eff_values)):
+                print(f"{i:2d}: {eff_values[i]:.6f} ± {eff_errors[i]:.6f}")
+    except Exception as e:
+        log.exception(f"计算分波效率失败: {e}")
 
     # ---- 保存摘要 ----
     optimizer.save_all_results_summary(
