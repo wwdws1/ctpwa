@@ -2175,7 +2175,10 @@ class UnifiedPWAOptimizer:
             f.write(f"总参数维度: {self.n_params}\n")
             f.write(f"最佳NLL: {self.best_nll:.6f}\n")
             f.write(f"参数文件: parameters.txt\n")
-            f.write(f"NLL历史: nll_history.txt\n\n")
+            f.write(f"NLL历史: nll_history.txt\n")
+            if self.best_result and self.best_result.get("ff_only"):
+                f.write("模式: --ff-only（未重新拟合；参数来自 best_params.pt）\n")
+            f.write("\n")
 
             f.write("=" * 100 + "\n")
             f.write("运行结果 (按NLL排序):\n")
@@ -2202,25 +2205,14 @@ class UnifiedPWAOptimizer:
                     f"{res.get('optimizer_status', '-'):<20}\n"
                 )
 
-            if self.best_params is not None:
+            if fit_values is not None:
                 f.write("=" * 100 + "\n")
                 f.write("最佳拟合分数 (fit fractions, 无效率/MC无关):\n")
                 f.write("=" * 100 + "\n")
-                try:
-                    # 传入主程序已算好的结果，避免重复跑 truth 积分;
-                    # fit_attempted=True 时主程序已处理(含 phsp_truth 缺失的跳过), 不再重试
-                    if fit_values is None and not fit_attempted:
-                        fit_values, fit_errors = self.compute_fit_fractions(
-                            self.best_params
-                        )
-                    if fit_values is not None:
-                        for i in range(len(fit_values)):
-                            f.write(
-                                f"{i:2d}: {fit_values[i]:.6e} ± {fit_errors[i]:.6e}\n"
-                            )
-                except Exception as e:
-                    log.exception(f"计算拟合分数失败: {e}")
-                    f.write(f"计算拟合分数失败: {e}\n")
+                for i in range(len(fit_values)):
+                    f.write(f"{i:2d}: {fit_values[i]:.6e} ± {fit_errors[i]:.6e}\n")
+            else:
+                f.write("最佳拟合分数: 未计算（见日志；大 phsp_truth 可能导致失败）\n")
 
             if eff_values is not None:
                 f.write("=" * 100 + "\n")
@@ -2456,6 +2448,13 @@ def build_parser():
         default=None,
         help="每轮打印 projected L-BFGS 的 |pg|/active/ΔNLL (env: FIT_OPT_VERBOSE=1)",
     )
+    p.add_argument(
+        "--ff-only",
+        action="store_true",
+        default=None,
+        help="只算拟合分数/效率：跳过拟合与 polish，直接用最佳参数"
+        "（--warm-start 或 <output-dir>/best_params.pt）(env: FIT_FF_ONLY=1)",
+    )
 
     # --- Warm start ---
     p.add_argument(
@@ -2616,6 +2615,9 @@ def resolve_args(args):
     )
 
     cfg["resume"] = args.resume
+    cfg["ff_only"] = (
+        args.ff_only if args.ff_only is not None else _env_bool("FIT_FF_ONLY", False)
+    )
     cfg["config"] = args.config
     cfg["verbose"] = args.verbose
     cfg["quiet"] = args.quiet
@@ -2746,90 +2748,137 @@ def main():
     elif ws_path:
         log.warning(f"Warm start 文件不存在: {ws_path}，使用随机初值")
 
-    # 运行优化
-    results = optimizer.run_multiple_optimizations(
-        num_runs=cfg["num_runs"],
-        max_iter=cfg["max_iter"],
-        lr=cfg["lr"],
-        tolerance_grad=cfg["tolerance_grad"],
-        tolerance_change=cfg["tolerance_change"],
-        history_size=cfg["history_size"],
-        warm_start=warm,
-        output_dir=output_dir,
-        checkpoint_interval=cfg["checkpoint_interval"],
-        resume_from=resume_from,
-    )
-
-    # ---- 分析结果 ----
-    if not optimizer.all_results:
-        log.error("没有任何成功的优化结果!")
-        sys.exit(1)
-
-    print(f"\n{'=' * 80}")
-    print("所有优化结果总结:")
-    print(f"{'=' * 80}")
-
-    sorted_results = sorted(optimizer.all_results, key=lambda x: x["final_nll"])
-    for i, res in enumerate(sorted_results):
-        print(
-            f"运行 {res['run_id']:2d}: NLL = {res['final_nll']:12.6f}, "
-            f"迭代 = {res['iterations']:3d}, "
-            f"耗时 = {res['time']:6.2f}s, Hessian = {res['hessian_time']:6.2f}s, "
-            f"正定 = {res['is_positive_definite']}, "
-            f"优化器 = {res.get('optimizer_status', '-')}"
+    if cfg["ff_only"]:
+        # ---- --ff-only: 跳过拟合与 polish，直接用最佳参数算 FF/效率 ----
+        best_path = ws_path if ws_path else os.path.join(output_dir, "best_params.pt")
+        if not os.path.exists(best_path):
+            log.error(
+                f"--ff-only 找不到最佳参数文件: {best_path}"
+                "（可用 --warm-start 指定，或先正常拟合一次）"
+            )
+            sys.exit(1)
+        ff_params = torch.load(best_path, weights_only=True)
+        ff_params = ff_params.to(device=optimizer.device, dtype=torch.float64)
+        print(f"[--ff-only] 载入最佳参数: {best_path}（不重新拟合、不 polish）")
+        with torch.no_grad():
+            _nll_ff = float(optimizer.analysis.getNLL(ff_params).item())
+        _hess_ff = optimizer.analysis.getHessian(ff_params)
+        optimizer._hess_cache = (ff_params.clone(), _hess_ff)
+        _err_ff = optimizer._errors_from_hessian(_hess_ff, ff_params)
+        best_res = {
+            "run_id": 0,
+            "final_params": ff_params.clone(),
+            "final_nll": _nll_ff,
+            "nll_history": [],
+            "iterations": 0,
+            "time": 0.0,
+            "hessian_time": 0.0,
+            "optimizer_status": "ff-only",
+            "is_positive_definite": bool(_err_ff["is_pd"]),
+            "min_eigenvalue": _err_ff["min_eig"],
+            "max_eigenvalue": _err_ff["max_eig"],
+            "condition_number": _err_ff["cond_num"],
+            "coupling_real_errors": _err_ff["coupling_real_errors"],
+            "coupling_imag_errors": _err_ff["coupling_imag_errors"],
+            "res_errors": _err_ff["res_errors"],
+            "err_mode_used": _err_ff["mode_used"],
+            "n_flat_dirs": _err_ff["n_flat"],
+            "polish_status": "disabled",
+            "ff_only": True,
+        }
+        optimizer.best_params = best_res["final_params"]
+        optimizer.best_nll = best_res["final_nll"]
+        optimizer.best_result = best_res
+        optimizer.all_results = [best_res]
+        sorted_results = [best_res]
+        print(f"[--ff-only] NLL = {_nll_ff:.6f}")
+    else:
+        # 运行优化
+        results = optimizer.run_multiple_optimizations(
+            num_runs=cfg["num_runs"],
+            max_iter=cfg["max_iter"],
+            lr=cfg["lr"],
+            tolerance_grad=cfg["tolerance_grad"],
+            tolerance_change=cfg["tolerance_change"],
+            history_size=cfg["history_size"],
+            warm_start=warm,
+            output_dir=output_dir,
+            checkpoint_interval=cfg["checkpoint_interval"],
+            resume_from=resume_from,
         )
 
-    print(f"\n{'=' * 80}")
-    print("最佳结果:")
-    print(f"{'=' * 80}")
+        # ---- 分析结果 ----
+        if not optimizer.all_results:
+            log.error("没有任何成功的优化结果!")
+            sys.exit(1)
 
-    best_res = sorted_results[0]
-    print(f"最佳NLL: {best_res['final_nll']:.6f} (来自第 {best_res['run_id']} 次运行)")
+        print(f"\n{'=' * 80}")
+        print("所有优化结果总结:")
+        print(f"{'=' * 80}")
 
-    # ---- 精确 Hessian 抛光 ----
-    best_res.setdefault("polish_status", "disabled")
-    if cfg["polish"]:
-        best_res["polish_status"] = "running"
-        try:
-            _tp0 = time.time()
-            p2, nll2, pd2 = optimizer.polish_damped_newton(
-                best_res["final_params"],
-                max_steps=int(optimizer.optimizer_polish_steps),
-            )
-            _t_polish = time.time() - _tp0
-            _ps = getattr(optimizer, "_polish_stats", {}) or {}
+        sorted_results = sorted(optimizer.all_results, key=lambda x: x["final_nll"])
+        for i, res in enumerate(sorted_results):
             print(
-                f"抛光耗时 = {_t_polish:.2f}s, steps = {_ps.get('steps', '?')}, "
-                f"Hessian 次数 = {_ps.get('n_hess', '?')}, "
-                f"polish 内求值 = {_ps.get('n_evals', '?')}"
+                f"运行 {res['run_id']:2d}: NLL = {res['final_nll']:12.6f}, "
+                f"迭代 = {res['iterations']:3d}, "
+                f"耗时 = {res['time']:6.2f}s, Hessian = {res['hessian_time']:6.2f}s, "
+                f"正定 = {res['is_positive_definite']}, "
+                f"优化器 = {res.get('optimizer_status', '-')}"
             )
-            if nll2 < best_res["final_nll"]:
-                print(
-                    f"抛光: NLL {best_res['final_nll']:.6f} → {nll2:.6f} "
-                    f"(Δ={nll2 - best_res['final_nll']:.3f}), 正定={pd2}"
+
+        print(f"\n{'=' * 80}")
+        print("最佳结果:")
+        print(f"{'=' * 80}")
+
+        best_res = sorted_results[0]
+        print(
+            f"最佳NLL: {best_res['final_nll']:.6f} (来自第 {best_res['run_id']} 次运行)"
+        )
+
+        # ---- 精确 Hessian 抛光 ----
+        best_res.setdefault("polish_status", "disabled")
+        if cfg["polish"]:
+            best_res["polish_status"] = "running"
+            try:
+                _tp0 = time.time()
+                p2, nll2, pd2 = optimizer.polish_damped_newton(
+                    best_res["final_params"],
+                    max_steps=int(optimizer.optimizer_polish_steps),
                 )
-                best_res["final_params"] = p2.clone()
-                best_res["final_nll"] = nll2
-                best_res["is_positive_definite"] = pd2
-                # 同步优化器内部状态：否则摘要里的"最佳共振态参数"表仍然打印
-                # polish *之前* 的 self.best_params，与同一张表的 NLL/正定列不一致
-                optimizer.best_params = p2.clone()
-                optimizer.best_nll = nll2
-                optimizer.best_result = best_res
-                torch.save(p2.cpu(), os.path.join(output_dir, "best_params.pt"))
-            # 无论是否改进，都在当前最佳点上重算误差（含非正定回退 auto/pinv/psd）
-            (
-                best_res["coupling_real_errors"],
-                best_res["coupling_imag_errors"],
-                best_res["res_errors"],
-            ) = optimizer.compute_param_errors(best_res["final_params"])
-            best_res["polish_status"] = "ok"
-        except Exception as e:
-            # 不要静默：打印完整 traceback，并在状态里标注失败（上游教训：宽 except
-            # 曾把 polish 的 TypeError 吞成"抛光失败"却无人察觉）
-            best_res["polish_status"] = f"failed({type(e).__name__})"
-            log.exception(f"抛光失败: {e}")
-    print(f"polish 状态 = {best_res.get('polish_status')}")
+                _t_polish = time.time() - _tp0
+                _ps = getattr(optimizer, "_polish_stats", {}) or {}
+                print(
+                    f"抛光耗时 = {_t_polish:.2f}s, steps = {_ps.get('steps', '?')}, "
+                    f"Hessian 次数 = {_ps.get('n_hess', '?')}, "
+                    f"polish 内求值 = {_ps.get('n_evals', '?')}"
+                )
+                if nll2 < best_res["final_nll"]:
+                    print(
+                        f"抛光: NLL {best_res['final_nll']:.6f} → {nll2:.6f} "
+                        f"(Δ={nll2 - best_res['final_nll']:.3f}), 正定={pd2}"
+                    )
+                    best_res["final_params"] = p2.clone()
+                    best_res["final_nll"] = nll2
+                    best_res["is_positive_definite"] = pd2
+                    # 同步优化器内部状态：否则摘要里的"最佳共振态参数"表仍然打印
+                    # polish *之前* 的 self.best_params，与同一张表的 NLL/正定列不一致
+                    optimizer.best_params = p2.clone()
+                    optimizer.best_nll = nll2
+                    optimizer.best_result = best_res
+                    torch.save(p2.cpu(), os.path.join(output_dir, "best_params.pt"))
+                # 无论是否改进，都在当前最佳点上重算误差（含非正定回退 auto/pinv/psd）
+                (
+                    best_res["coupling_real_errors"],
+                    best_res["coupling_imag_errors"],
+                    best_res["res_errors"],
+                ) = optimizer.compute_param_errors(best_res["final_params"])
+                best_res["polish_status"] = "ok"
+            except Exception as e:
+                # 不要静默：打印完整 traceback，并在状态里标注失败（上游教训：宽 except
+                # 曾把 polish 的 TypeError 吞成"抛光失败"却无人察觉）
+                best_res["polish_status"] = f"failed({type(e).__name__})"
+                log.exception(f"抛光失败: {e}")
+        print(f"polish 状态 = {best_res.get('polish_status')}")
 
     # ---- 打印最佳参数 ----
     if best_res["coupling_real_errors"] is not None:
@@ -2857,22 +2906,34 @@ def main():
         )
     print(f"{'=' * 80}")
 
-    # ---- 保存最佳权重文件 ----
+    # ---- 保存最佳权重文件（--ff-only 且已存在则跳过：参数未变，root 与上次相同）----
     best_weight_file = os.path.join(output_dir, "weight_best.root")
-    optimizer.save_weight_file(
-        best_res["final_params"],
-        best_weight_file,
-        waves=cfg["waves"],
-        event_data=cfg["event_data"],
+    if (not cfg["ff_only"]) or (not os.path.exists(best_weight_file)):
+        optimizer.save_weight_file(
+            best_res["final_params"],
+            best_weight_file,
+            waves=cfg["waves"],
+            event_data=cfg["event_data"],
+        )
+    else:
+        print(f"（--ff-only）跳过重写已存在的权重文件: {best_weight_file}")
+
+    # ---- 先写核心摘要（不含 FF/效率）：确保随后 FF 崩溃也不丢核心结果 ----
+    optimizer.save_all_results_summary(
+        None, None, fit_attempted=True, output_dir=output_dir
     )
 
-    # ---- 拟合分数（不再以真 PD 门控：非 PD 时用 err_mode 回退曲率传播误差）----
+    # ---- 拟合分数/效率（放最后；大 phsp_truth 可能导致 C++ 崩溃）----
     if not best_res.get("is_positive_definite", False):
         log.warning(
             "Hessian 非正定；拟合分数/效率的误差来自 err_mode 回退曲率"
             f"（err_mode={cfg['err_mode']}, τ={cfg['err_tau']:.1e}），"
             "为秩亏下的可行估计、非严格统计误差；中心值不受影响。"
         )
+    log.warning(
+        "即将计算 FF/效率；若因 phsp_truth 过大而失败/崩溃，请减小其样本量后重跑"
+        "（可加 --ff-only 跳过拟合直接重算）。"
+    )
     ff_values = ff_errors = None
     try:
         ff_values, ff_errors = optimizer.compute_fit_fractions(best_res["final_params"])
