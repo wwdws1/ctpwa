@@ -1662,10 +1662,17 @@ class UnifiedPWAOptimizer:
 
     # --------------------------------------------------------
     def extract_coupling_complex(self, params):
-        """从统一参数中提取复数耦合向量 (complex64, n_coupling_free)"""
-        real = params[: self.n_coupling_free].float()
-        imag = params[self.n_coupling_free : 2 * self.n_coupling_free].float()
-        return torch.complex(real, imag)
+        """提取复数耦合向量，dtype 匹配 .so 精度。
+
+        本仓库 .so 为 **double** 精度（`getHessian` 文档即 `params: float64`）→ 需
+        **complex128**；旧版固定 `.float()`(complex64) 会在 getFitFractions/getEfficiency
+        触发 "vector dtype must match .so complex precision"。按 params 实数精度选择。
+        """
+        real = params[: self.n_coupling_free]
+        imag = params[self.n_coupling_free : 2 * self.n_coupling_free]
+        if params.dtype == torch.float64:
+            return torch.complex(real.double(), imag.double())
+        return torch.complex(real.float(), imag.float())
 
     def extract_theta_phys(self, params):
         """从统一参数中提取共振态物理参数"""
