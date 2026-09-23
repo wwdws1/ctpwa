@@ -1436,7 +1436,7 @@ class UnifiedPWAOptimizer:
         try:
             eig, vec = torch.linalg.eigh(H_k)
         except Exception as e:
-            log.error(f"Hessian 特征分解失败: {e}")
+            log.exception(f"Hessian 特征分解失败: {e}")
             return out
         lmax = eig[-1].abs().clamp(min=1e-30)
         lmin = eig[0].item()
@@ -1475,7 +1475,7 @@ class UnifiedPWAOptimizer:
                 cov = (vec * inv_eig) @ vec.t()
             sd_keep = torch.sqrt(torch.diag(cov).clamp(min=0.0))
         except Exception as e:
-            log.error(f"参数误差协方差求逆失败: {e}")
+            log.exception(f"参数误差协方差求逆失败: {e}")
             return out
 
         out["mode_used"] = eff
@@ -1698,7 +1698,7 @@ class UnifiedPWAOptimizer:
                 print(f"参数文件已创建: {txt_filename}")
             return True
         except Exception as e:
-            log.error(f"保存参数失败: {e}")
+            log.exception(f"保存参数失败: {e}")
             return False
 
     # --------------------------------------------------------
@@ -1721,7 +1721,7 @@ class UnifiedPWAOptimizer:
                 f.write("#" * 60 + "\n")
             return True
         except Exception as e:
-            log.error(f"保存NLL历史失败: {e}")
+            log.exception(f"保存NLL历史失败: {e}")
             return False
 
     # --------------------------------------------------------
@@ -1752,7 +1752,7 @@ class UnifiedPWAOptimizer:
                 print(f"权重文件已保存: {filename}")
             return True
         except Exception as e:
-            log.error(f"保存权重文件失败 {filename}: {e}")
+            log.exception(f"保存权重文件失败 {filename}: {e}")
             return False
 
     # --------------------------------------------------------
@@ -2040,6 +2040,7 @@ class UnifiedPWAOptimizer:
                                 f"{i:2d}: {fit_values[i]:.6e} ± {fit_errors[i]:.6e}\n"
                             )
                 except Exception as e:
+                    log.exception(f"计算拟合分数失败: {e}")
                     f.write(f"计算拟合分数失败: {e}\n")
 
             if eff_values is not None:
@@ -2580,7 +2581,9 @@ def main():
     print(f"最佳NLL: {best_res['final_nll']:.6f} (来自第 {best_res['run_id']} 次运行)")
 
     # ---- 精确 Hessian 抛光 ----
+    best_res.setdefault("polish_status", "disabled")
     if cfg["polish"]:
+        best_res["polish_status"] = "running"
         try:
             _tp0 = time.time()
             p2, nll2, pd2 = optimizer.polish_damped_newton(
@@ -2614,8 +2617,13 @@ def main():
                 best_res["coupling_imag_errors"],
                 best_res["res_errors"],
             ) = optimizer.compute_param_errors(best_res["final_params"])
+            best_res["polish_status"] = "ok"
         except Exception as e:
-            log.error(f"抛光失败: {e}")
+            # 不要静默：打印完整 traceback，并在状态里标注失败（上游教训：宽 except
+            # 曾把 polish 的 TypeError 吞成"抛光失败"却无人察觉）
+            best_res["polish_status"] = f"failed({type(e).__name__})"
+            log.exception(f"抛光失败: {e}")
+    print(f"polish 状态 = {best_res.get('polish_status')}")
 
     # ---- 打印最佳参数 ----
     if best_res["coupling_real_errors"] is not None:
@@ -2666,7 +2674,7 @@ def main():
                 for i in range(len(ff_values)):
                     print(f"{i:2d}: {ff_values[i]:.6f} ± {ff_errors[i]:.6f}")
         except Exception as e:
-            log.error(f"计算拟合分数失败: {e}")
+            log.exception(f"计算拟合分数失败: {e}")
 
     # ---- 分波效率 ----
     eff_values = eff_errors = None
@@ -2682,7 +2690,7 @@ def main():
                 for i in range(len(eff_values)):
                     print(f"{i:2d}: {eff_values[i]:.6f} ± {eff_errors[i]:.6f}")
         except Exception as e:
-            log.error(f"计算分波效率失败: {e}")
+            log.exception(f"计算分波效率失败: {e}")
 
     # ---- 保存摘要 ----
     optimizer.save_all_results_summary(
