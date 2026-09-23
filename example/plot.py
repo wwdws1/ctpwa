@@ -973,8 +973,14 @@ def generate_weight_file_from_params(run_id):
     try:
         ana = ctpwa.analysis()
 
-        # 将参数转换为torch张量
-        params_tensor = torch.tensor(params_list, dtype=torch.complex64, device="cuda")
+        # 将参数转换为torch张量；复数 dtype 须匹配 .so 编译精度（double→complex128），
+        # 否则 writeWeightFile 会报 "vector dtype must match .so complex precision"。
+        _cdt = (
+            torch.complex128
+            if ctpwa.DeviceManager().compiledPrecision() == "double"
+            else torch.complex64
+        )
+        params_tensor = torch.tensor(params_list, dtype=_cdt, device="cuda")
 
         # 生成权重文件
         ana.writeWeightFile(params_tensor, output_file, 0)

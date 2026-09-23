@@ -2175,9 +2175,11 @@ class UnifiedPWAOptimizer:
             f.write(f"总参数维度: {self.n_params}\n")
             f.write(f"最佳NLL: {self.best_nll:.6f}\n")
             f.write(f"参数文件: parameters.txt\n")
-            f.write(f"NLL历史: nll_history.txt\n")
             if self.best_result and self.best_result.get("ff_only"):
+                f.write("NLL历史: 不适用（--ff-only 未拟合）\n")
                 f.write("模式: --ff-only（未重新拟合；参数来自 best_params.pt）\n")
+            else:
+                f.write(f"NLL历史: nll_history.txt\n")
             f.write("\n")
 
             f.write("=" * 100 + "\n")
@@ -2678,6 +2680,11 @@ def main():
 
     output_dir = cfg["output_dir"]
     os.makedirs(output_dir, exist_ok=True)
+    # --ff-only 的输出落到 <output_dir>/ff_only/（best_params.pt 仍从 output_dir 读），
+    # 避免覆盖原拟合的 optimization_summary.txt / 参数表。
+    write_dir = os.path.join(output_dir, "ff_only") if cfg["ff_only"] else output_dir
+    if write_dir != output_dir:
+        os.makedirs(write_dir, exist_ok=True)
 
     # 打印最终配置
     print("=" * 60)
@@ -2760,6 +2767,7 @@ def main():
         ff_params = torch.load(best_path, weights_only=True)
         ff_params = ff_params.to(device=optimizer.device, dtype=torch.float64)
         print(f"[--ff-only] 载入最佳参数: {best_path}（不重新拟合、不 polish）")
+        print(f"[--ff-only] 输出目录: {write_dir}")
         with torch.no_grad():
             _nll_ff = float(optimizer.analysis.getNLL(ff_params).item())
         _hess_ff = optimizer.analysis.getHessian(ff_params)
@@ -2907,7 +2915,7 @@ def main():
     print(f"{'=' * 80}")
 
     # ---- 保存最佳权重文件（--ff-only 且已存在则跳过：参数未变，root 与上次相同）----
-    best_weight_file = os.path.join(output_dir, "weight_best.root")
+    best_weight_file = os.path.join(write_dir, "weight_best.root")
     if (not cfg["ff_only"]) or (not os.path.exists(best_weight_file)):
         optimizer.save_weight_file(
             best_res["final_params"],
@@ -2918,9 +2926,20 @@ def main():
     else:
         print(f"（--ff-only）跳过重写已存在的权重文件: {best_weight_file}")
 
+    # ---- --ff-only：补写 parameters.txt，使 ff_only/ 目录自洽（纯 numpy/IO，不碰 CUDA）----
+    if cfg["ff_only"]:
+        optimizer.save_parameters(
+            best_res["final_params"],
+            best_res["coupling_real_errors"],
+            best_res["coupling_imag_errors"],
+            best_res["res_errors"],
+            best_res["run_id"],
+            os.path.join(write_dir, "parameters"),
+        )
+
     # ---- 先写核心摘要（不含 FF/效率）：确保随后 FF 崩溃也不丢核心结果 ----
     optimizer.save_all_results_summary(
-        None, None, fit_attempted=True, output_dir=output_dir
+        None, None, fit_attempted=True, output_dir=write_dir
     )
 
     # ---- 拟合分数/效率（放最后；大 phsp_truth 可能导致 C++ 崩溃）----
@@ -2935,6 +2954,7 @@ def main():
         "（可加 --ff-only 跳过拟合直接重算）。"
     )
     ff_values = ff_errors = None
+    ff_error = None
     try:
         ff_values, ff_errors = optimizer.compute_fit_fractions(best_res["final_params"])
         if ff_values is not None:
@@ -2944,30 +2964,46 @@ def main():
             for i in range(len(ff_values)):
                 print(f"{i:2d}: {ff_values[i]:.6f} ± {ff_errors[i]:.6f}")
     except Exception as e:
+        ff_error = e
         log.exception(f"计算拟合分数失败: {e}")
 
     # ---- 分波效率 ----
+    # 若 FF 已抛异常（CUDA 上下文可能已损坏），跳过效率：它同样依赖 phsp_truth，
+    # 再试只会再崩一次、并可能把进程拖死。
     eff_values = eff_errors = None
-    try:
-        eff_values, eff_errors = optimizer.compute_efficiency(best_res["final_params"])
-        if eff_values is not None:
-            print(f"\n{'=' * 80}")
-            print("最佳结果的分波效率 (ε_i, phsp/phsp_truth 加权比值):")
-            print(f"{'=' * 80}")
-            for i in range(len(eff_values)):
-                print(f"{i:2d}: {eff_values[i]:.6f} ± {eff_errors[i]:.6f}")
-    except Exception as e:
-        log.exception(f"计算分波效率失败: {e}")
+    if ff_error is None:
+        try:
+            eff_values, eff_errors = optimizer.compute_efficiency(
+                best_res["final_params"]
+            )
+            if eff_values is not None:
+                print(f"\n{'=' * 80}")
+                print("最佳结果的分波效率 (ε_i, phsp/phsp_truth 加权比值):")
+                print(f"{'=' * 80}")
+                for i in range(len(eff_values)):
+                    print(f"{i:2d}: {eff_values[i]:.6f} ± {eff_errors[i]:.6f}")
+        except Exception as e:
+            log.exception(f"计算分波效率失败: {e}")
+    else:
+        log.warning("FF 计算已失败（CUDA 上下文可能已损坏）→ 跳过效率计算。")
 
-    # ---- 保存摘要 ----
-    optimizer.save_all_results_summary(
-        ff_values,
-        ff_errors,
-        fit_attempted=True,
-        eff_values=eff_values,
-        eff_errors=eff_errors,
-        output_dir=output_dir,
-    )
+    # ---- 重写摘要（带 FF/效率）----
+    # 仅当确有结果时才重写；否则保留核心摘要——避免在已损坏的 CUDA 上下文上再跑
+    # theta.cpu() 把文件截断、把进程 abort。
+    if ff_values is not None or eff_values is not None:
+        try:
+            optimizer.save_all_results_summary(
+                ff_values,
+                ff_errors,
+                fit_attempted=True,
+                eff_values=eff_values,
+                eff_errors=eff_errors,
+                output_dir=write_dir,
+            )
+        except Exception as e:
+            log.exception(f"写带 FF/效率的摘要失败（核心摘要已在盘上）: {e}")
+    else:
+        log.warning("FF/效率未产出结果；保留核心摘要（不含 FF/效率）。")
 
 
 if __name__ == "__main__":
