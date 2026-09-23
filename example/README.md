@@ -11,7 +11,7 @@ Hessian / 参数误差 → 保存结果与摘要。
 
 ```bash
 # 在放有 config.yml 的目录里运行
-python -u fit.py --config config.yml --runs 10 --niter 3000            # 默认 projected；推荐加 --optimizer reparam
+python -u fit.py --config config.yml --runs 10 --niter 3000            # 默认优化器 reparam
 python -u fit.py --optimizer projected --runs 2 --niter 3000           # 对照（慢）
 python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-4  # 显式指定 reparam 参数
 ```
@@ -21,10 +21,10 @@ python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-4  # 显式�
 ## 1. 运行前提
 
 - 需要 **ctpwa 包**（含 CUDA 扩展）与 **NVIDIA GPU**；`torch.cuda.is_available()` 必须为 True。
-- ⚠️ **必须在包含 `config.yml` 的目录下运行**。`fit.py` 在 **import 时**就用
-  **当前工作目录的 `./config.yml`** 构造 `ctpwa.analysis()`；`--config` 参数只用于
-  路径检查与相对路径解析，**不会**改变已经建好的 `ana`。因此换配置的正确做法是换
-  目录（或在 cwd 放对应 `config.yml`），而不是只传 `--config`。
+- **配置由 `--config` 指定**（默认 `./config.yml`）。`fit.py` 在 **import 时**用
+  `_config_path_from_argv()` 从 `sys.argv` 取出 `--config`，再传给 `ctpwa.analysis()`，
+  因此 `--config /path/to/other.yml` **真正生效**（无需 cd 到配置目录）。
+  注意：`config.yml` 内的相对路径按**该 config 文件所在目录**解析。
 - 建议用 `python -u`（无缓冲）以便实时看日志。
 
 ---
@@ -32,7 +32,7 @@ python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-4  # 显式�
 ## 2. 快速开始
 
 ```bash
-# 正式拟合（推荐 reparam；不写 --optimizer 则默认 projected）
+# 正式拟合（默认优化器 reparam）
 python -u fit.py --runs 10 --niter 3000
 
 # 早期快速调试
@@ -52,11 +52,10 @@ python -u fit.py --runs 20 --niter 3000 --resume
 
 ## 3. 优化器区别（重点）
 
-用 `--optimizer {reparam,projected,lbfgs}` 选择，默认 **`projected`**（与上游一致）；
-**实际分析推荐 `reparam`**（需显式 `--optimizer reparam`）。
+用 `--optimizer {reparam,projected,lbfgs}` 选择，默认 **`reparam`**。
 三者都在**同一个物理参数空间**上优化；下游的 Hessian / polish / 误差 / 输出与优化器无关。
 
-### 3.1 `reparam`（推荐；非默认，需 `--optimizer reparam`）
+### 3.1 `reparam`（默认，推荐）
 
 **做法**：把有界/半有界参数映射到无约束空间 `u`，用 `torch.optim.LBFGS(strong_wolfe)` 优化：
 
@@ -74,7 +73,7 @@ python -u fit.py --runs 20 --niter 3000 --resume
 
 相关参数：`--amp-max`、`--amp-lambda`、`--lr`、`--tol-grad`、`--tol-change`、`--history-size`。
 
-### 3.2 `projected`（默认）
+### 3.2 `projected`
 
 **做法**：自研的盒约束 L-BFGS——投影梯度 KKT 停机 + 活跃集剔除 + 可行 Armijo 线搜索，
 在物理参数空间直接优化，边界由算法处理（`honest=True`，不 clamp、不清零梯度）。
@@ -96,7 +95,7 @@ python -u fit.py --runs 20 --niter 3000 --resume
 
 ### 3.4 对比（示例数据，`--runs`/`--niter` 见备注）
 
-| 维度 | `reparam`（推荐） | `projected`（默认） | `lbfgs`（legacy） |
+| 维度 | `reparam`（默认） | `projected` | `lbfgs`（legacy） |
 |---|---|---|---|
 | 边界处理 | 重参数化软墙 | 投影梯度 + 活跃集（盒约束） | clamp + 边界梯度清零 |
 | 停机判据 | 无约束梯度/变化量（u 空间） | 投影梯度 KKT | 无约束梯度/变化量 |
@@ -117,6 +116,9 @@ python -u fit.py --runs 20 --niter 3000 --resume
 `--amp-max`。
 
 ### 3.5 推荐工作流（随机多起点 → 取最优 → polish）
+
+> 本节数值来自上游示例配置 `Jpsi2KKeta`（其 polish 后 `PD=True`）；我们 `jlsp single`
+> 配置的同类对比见 §3.4（该配置恒 `PD=False`）。不同配置/数据不可混用。
 
 本分析场景是"随机初值跑很多次、取最优、再对最优做 polish"，此时判据是
 **单位时间内的 best-of-N**，不是单起点可靠性：
@@ -251,9 +253,19 @@ FIT_RUNS  FIT_NITER  FIT_LR  FIT_TOL_GRAD  FIT_TOL_CHANGE  FIT_HISTORY_SIZE
 FIT_VMAX  FIT_AMP_MAX  FIT_AMP_LAMBDA  FIT_PROJECT  FIT_OPTIMIZER  FIT_OPT_VERBOSE
 FIT_ERR_MODE  FIT_ERR_TAU  FIT_POLISH  FIT_WARM  FIT_WAVES  FIT_EVENT_DATA
 FIT_CHECKPOINT_INTERVAL
+# 诊断 / 复现实验 / projected A/B 开关（默认=当前行为，一般不用设）：
+FIT_OPT_PROF  FIT_DETERMINISTIC  FIT_OPT_M  FIT_OPT_TWOLOOP  FIT_OPT_HONEST
+FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
 ```
 
 例：`FIT_OPTIMIZER=reparam FIT_AMP_LAMBDA=1e-4 python -u fit.py --runs 20 --niter 3000`
+
+- `FIT_OPT_PROF=1`：打印**每次 run 的求值次数与耗时占比**（`[pLBFGS-prof]`/`[reparam-prof]`，
+  含 `ms/eval`、`n_iter`、停机状态），用于“求值次数 × 单次成本”的归因。
+- `FIT_DETERMINISTIC=1`：启用确定性设置（`torch.use_deterministic_algorithms(warn_only)` +
+  cudnn 标志 + seed），降低不确定性；**不保证前向 NLL 逐位可复现**，仅用于对比实验。
+- `FIT_OPT_M` / `FIT_OPT_TWOLOOP` / `FIT_OPT_HONEST` / `FIT_OPT_LEGACY_SIGN` /
+  `FIT_OPT_POLISH_STEPS`：`projected` 路径的曲率历史/实现/停机 A/B 开关；默认即当前行为。
 
 ---
 
@@ -265,18 +277,23 @@ FIT_CHECKPOINT_INTERVAL
 |---|---|
 | `parameters.txt` | 每个 run 的耦合（实/虚部、幅度、相位）与共振态参数 |
 | `nll_history.txt` | 每个 run 的逐次求值 NLL 曲线 |
-| `optimization_summary.txt` | 各 run 的 NLL / 迭代 / 耗时 / 正定性 / 优化器状态，及最佳解 |
+| `optimization_summary.txt` | 各 run 的 NLL / 迭代 / **eval数 / n_iter** / 耗时 / 正定性 / **误差模式 / 平坦维** / 优化器状态，及最佳解 |
 | `best_params.pt` | 最佳参数（供 warm start） |
 | `checkpoint.pt` | 续跑状态（`--resume` 用） |
 | `weight_best.root` | 最佳解的权重文件（供 `plot.py` 画图） |
 
 > `plot.py` 另外生成 `results_plot.pdf` 等图形，不属于 `fit.py`。
 
+> 多起点（`--runs N`）结束时终端会打印一行 `[ensemble]`：`n / best / median / IQR / std /
+> worst`。前向 NLL 有数值混沌，**比较不同优化器/配置时请看中位数/IQR 而非单次 NLL**
+> （差异需大于系综 std 才可信）；详见 §3.5 备注。
+
 ---
 
 ## 7. 已知问题与备注
 
-1. **必须在含 `config.yml` 的目录运行**（见 §1）。
+1. **配置由 `--config` 指定**（见 §1）：`--config /path/to/other.yml` 现在**真正生效**
+   （import 期解析）；`config.yml` 内的相对路径按该文件所在目录解析。
 2. `reparam` 的 `--amp-lambda` 是作用在**优化 loss** 上的弱先验；报告/保存的 NLL、
    Hessian、误差全部基于**真实 NLL**，不受罚项影响。
 3. 结果普遍 `正定性=False`：精确 Hessian 存在 ~20–30 维近平坦/简并子空间（诊断显示
