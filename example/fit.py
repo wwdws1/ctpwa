@@ -1894,11 +1894,22 @@ class UnifiedPWAOptimizer:
                     log.debug(f"checkpoint 已保存: {resume_file}")
 
             except Exception as e:
-                log.error(f"第 {i} 次优化失败: {e}")
-                import traceback
-
-                traceback.print_exc()
+                log.exception(f"第 {i} 次优化失败: {e}")
                 continue
+
+        # ---- 系综统计（B6）: 前向 NLL 有混沌，单次跑会假阳性 → 看分布 ----
+        if results:
+            nlls = np.array([r["final_nll"] for r in results], dtype=float)
+            q1, med, q3 = np.percentile(nlls, [25, 50, 75])
+            print(
+                f"[ensemble] n={len(nlls)}  best={nlls.min():.6f}  "
+                f"median={med:.6f}  IQR=[{q1:.6f}, {q3:.6f}]  "
+                f"std={nlls.std():.3f}  worst={nlls.max():.6f}"
+            )
+            print(
+                "[ensemble] 提示: 比较不同优化器/配置时请用相同 seed 系综 + 中位数/IQR；"
+                "单次 NLL 差异需大于系综 std 才可信（上游方法学教训，见 reparam_analysis §13）。"
+            )
 
         return results
 
@@ -2122,6 +2133,29 @@ def _env_bool(name, default):
 def _env_str(name, default=""):
     """从环境变量读字符串，不存在则返回 default。"""
     return os.environ.get(name, default)
+
+
+def _apply_determinism(seed=42):
+    """FIT_DETERMINISTIC=1: 尽量确定性（供对比实验）。
+
+    ⚠ 仅降低不确定性，**不保证前向 NLL 逐位可复现**（原子加 1e-11 → 拟合混沌）；
+    结论仍需同 seed 系综 + 中位数/IQR（见 reparam_analysis §13、AGENT.md §4）。
+    用 warn_only=True，避免 CUDA 扩展里的非确定算子直接抛错。
+    """
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception as e:  # 老版本 torch / 扩展不支持时退化为告警
+        log.warning(f"设置确定性算法失败（忽略，继续运行）: {e}")
+    log.info(
+        "FIT_DETERMINISTIC=1: 已启用确定性设置（warn_only）；"
+        "注意前向 NLL 仍非逐位可复现，对比请用系综。"
+    )
 
 
 def build_parser():
@@ -2474,6 +2508,10 @@ def main():
 
     # ---- P4.3: 日志分级 ----
     _setup_logging(cfg["verbose"], cfg["quiet"])
+
+    # ---- 可选: 确定性设置（FIT_DETERMINISTIC=1）----
+    if _env_bool("FIT_DETERMINISTIC", False):
+        _apply_determinism()
 
     # ---- P4.2: 配置文件路径 ----
     config_path = os.path.abspath(cfg["config"])
