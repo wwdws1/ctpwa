@@ -200,6 +200,7 @@ python fit.py --optimizer projected --runs 5
 | `--no-project` | 关闭 legacy 路径的边界梯度清零 | False | `FIT_PROJECT=0` | lbfgs |
 | `--optimizer` | 优化器：`reparam`/`projected`/`lbfgs` | `reparam` | `FIT_OPTIMIZER` | — |
 | `--opt-verbose` | 每轮打印 projected 的 `pg/active/ΔNLL` | False | `FIT_OPT_VERBOSE=1` | projected |
+| `--ff-only` | 只算拟合分数/效率：跳过拟合与 polish，用最佳参数（`--warm-start` 或 `<output-dir>/best_params.pt`） | False | `FIT_FF_ONLY=1` | — |
 
 ### 误差估计（Hessian 非正定回退）
 | 参数 | 说明 | 默认 | 环境变量 |
@@ -299,8 +300,13 @@ FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
 3. 结果普遍 `正定性=False`：精确 Hessian 存在 ~20–30 维近平坦/简并子空间（诊断显示
    沿负特征值方向 NLL 两侧都不下降，说明是数值/秩亏而非真鞍点）。**用 `reparam` 时**
    参数误差默认由 `--err-mode auto` 自动回退到伪逆给出，并标注为“可行估计、非严格统计
-   误差”；`projected`/`lbfgs` 默认 `strict`（非正定不给误差）。拟合分数/效率仍以真 PD 为门控。
+   误差”；`projected`/`lbfgs` 默认 `strict`（非正定不给误差）。**拟合分数/效率不再以真 PD
+   为门控**：非正定时用与 `--err-mode` 一致的回退曲率传播误差（中心值恒输出）。
 4. `--lr` 只对 `reparam`/`lbfgs` 有意义；`projected` 不用 `lr`，其停机由
    `--tol-grad`（gtol）控制。
 5. 若在集群提交作业，注意 `fit.py` 会读 cwd 的 `config.yml` 并需要 GPU；建议
    一个方案一个目录（或配合 `--output-dir` 隔离结果）。
+6. **拟合分数/效率在大 `phsp_truth` 上可能导致 C++ 崩溃**（本机实测 ~15,000,000 事件时，
+   `computeBFKernel` illegal memory access / glibc abort）——该崩溃致命、`try/except` 无法捕获。
+   因此 `fit.py` **先写核心摘要**再算 FF/效率，并在计算前打印提示；若失败请**减小
+   `phsp_truth` 样本量**后重跑，可加 `--ff-only` 跳过拟合、直接用 `best_params.pt` 重算。
