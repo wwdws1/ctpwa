@@ -1,0 +1,32 @@
+# 仅对 example/ 生效的 pre-commit 配置（并行 fork 本地用；放在 example/ 内，
+# 以保证与上游的分歧仅限 example/）。
+#
+# 全部 hook 自动运行（含格式化/修空白）。⚠️ 与上游对比前，先把上游的同名文件
+# 复制到临时目录并用本配置跑一遍 pre-commit，再与我们的比较——否则会掺入
+# 大量格式差异（见 example/AGENT.md §5）。
+#
+# 用法：
+#   pre-commit install --config example/.pre-commit-config.yaml   # 装本地 git hook
+#   pre-commit run   --config example/.pre-commit-config.yaml --all-files
+#
+# files: 路径相对仓库根；只扫 example/，不会动上游目录。
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-merge-conflict
+        files: ^example/
+      - id: trailing-whitespace
+        files: ^example/
+      - id: end-of-file-fixer
+        files: ^example/
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.8
+    hooks:
+      # 只查致命/未定义（E9 语法、F63 错缩进、F7 语法、F82 未定义名）
+      - id: ruff
+        files: ^example/.*\.py$
+        args: [--select, "E9,F63,F7,F82"]
+      - id: ruff-format
+        files: ^example/.*\.py$
