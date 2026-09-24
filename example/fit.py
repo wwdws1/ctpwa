@@ -1437,6 +1437,9 @@ class UnifiedPWAOptimizer:
         索引映射按分块布局（与 params 一致）:
           red = [Re_1..Re_{nc-1}, Im_1..Im_{nc-1}, θ_0..θ_{n_res-1}]
         返回 dict（含 mode_used/n_flat/is_pd/min_eig/max_eig/cond_num）。
+
+        注：日志标签 `[param-err]` 中的 error 指**参数不确定度 (error bar)**，
+        不是程序报错；它报告误差在哪个 mode / 多大简并子空间下算出。
         """
         nc = self.n_coupling_free
         if mode is None:
@@ -1541,15 +1544,15 @@ class UnifiedPWAOptimizer:
         ]
         if pinned:
             print(
-                f"[errors] {len(pinned)} 个参数被 free_range 钉住，无统计误差(标 NaN): "
+                f"[param-err] {len(pinned)} 个参数被 free_range 钉住，无统计误差(标 NaN): "
                 f"{', '.join(pinned)}"
             )
             print(
-                "[errors]   这表示数据想把它们推到范围外 → 放宽该 free_range，"
+                "[param-err]   这表示数据想把它们推到范围外 → 放宽该 free_range，"
                 "或按单侧限制报告"
             )
         print(
-            f"[errors] mode={eff} (请求 {mode}), λmin={lmin:.3e} "
+            f"[param-err] mode={eff} (请求 {mode}), λmin={lmin:.3e} "
             f"λmax={eig[-1].item():.3e} λmin/λmax={lmin / lmax.item():.2e}, "
             f"flat(λ<τ·λmax)={n_flat}/{len(eig)}, "
             f"active={int(active_full.sum())}, keep={int(keep.sum())}"
@@ -2934,7 +2937,7 @@ def main():
                 "Hessian 在非活跃子空间非正定；以下误差来自 PSD 回退"
                 f"（err_mode={cfg['err_mode']}, τ={cfg['err_tau']:.1e}）"
                 "，是秩亏/近平坦方向下的可行估计，非严格统计误差。"
-                "详见 [errors] 日志的 λmin/λmax 与平坦方向数。"
+                "详见 [param-err] 日志的 λmin/λmax 与平坦方向数。"
             )
         optimizer.print_optimized_parameters(
             best_res["final_params"],
@@ -2946,7 +2949,7 @@ def main():
     else:
         log.warning(
             "无法提供参数误差估计（err_mode=strict 且 Hessian 非正定，"
-            "或所有自由方向被边界钉住）；看上面 [errors] 的 λmin/λmax 输出"
+            "或所有自由方向被边界钉住）；看上面 [param-err] 的 λmin/λmax 输出"
         )
         optimizer.print_optimized_parameters(
             best_res["final_params"], run_id=best_res["run_id"]
