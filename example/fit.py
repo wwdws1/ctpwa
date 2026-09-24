@@ -6,6 +6,8 @@ import sys
 import csv
 import argparse
 import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Optional, TypedDict
 import ctpwa
 
@@ -2713,8 +2715,67 @@ def build_parser():
     return p
 
 
+# ============================================================
+# 最终配置：FitConfig
+# ============================================================
+@dataclass
+class FitConfig(Mapping):
+    """`resolve_args` 的返回类型：既有字段访问，也保留 dict 接口。
+
+    实现 Mapping 以兼容历史调用方式 `cfg["key"]` / `cfg.get("key")`（大量存在）；
+    新增字段请同步更新本类，否则 `FitConfig(**cfg)` 会报缺失/多余键。
+    """
+
+    num_runs: int
+    max_iter: int
+    lr: float
+    tolerance_grad: float
+    tolerance_change: float
+    history_size: int
+    v_max: float
+    project_grad: bool
+    optimizer_kind: str
+    amp_max: float
+    amp_lambda: float
+    err_mode: str
+    err_tau: float
+    polish: bool
+    warm_start_path: Optional[str]
+    waves: list
+    event_data: bool
+    checkpoint_interval: int
+    resume: bool
+    ff_only: bool
+    cal_ff: bool
+    cal_eff: bool
+    seed: Optional[int]
+    seed_auto: bool
+    config: str
+    verbose: int
+    quiet: bool
+    output_dir: str
+
+    def __getitem__(self, key: str) -> Any:
+        try:
+            return getattr(self, key)
+        except AttributeError as e:
+            raise KeyError(key) from e
+
+    def __iter__(self):
+        return iter(self.__dataclass_fields__)
+
+    def __len__(self) -> int:
+        return len(self.__dataclass_fields__)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def keys(self):
+        return self.__dataclass_fields__.keys()
+
+
 def resolve_args(args):
-    """将 argparse Namespace 与环境变量合并，返回最终配置 dict。
+    """将 argparse Namespace 与环境变量合并，返回最终配置 FitConfig。
     优先级: CLI 显式传入 > FIT_* 环境变量 > 硬编码默认值。"""
     cfg = {}
 
@@ -2826,7 +2887,7 @@ def resolve_args(args):
     cfg["quiet"] = args.quiet
     cfg["output_dir"] = args.output_dir
 
-    return cfg
+    return FitConfig(**cfg)
 
 
 # ============================================================
