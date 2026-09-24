@@ -2158,6 +2158,8 @@ class UnifiedPWAOptimizer:
         eff_values=None,
         eff_errors=None,
         output_dir="results",
+        ff_requested=True,
+        eff_requested=False,
     ):
         if not self.all_results:
             log.warning("没有结果!")
@@ -2213,6 +2215,8 @@ class UnifiedPWAOptimizer:
                 f.write("=" * 100 + "\n")
                 for i in range(len(fit_values)):
                     f.write(f"{i:2d}: {fit_values[i]:.6e} ± {fit_errors[i]:.6e}\n")
+            elif not ff_requested:
+                f.write("最佳拟合分数: 未计算（--cal-ff False）\n")
             else:
                 f.write("最佳拟合分数: 未计算（见日志；大 phsp_truth 可能导致失败）\n")
 
@@ -2222,6 +2226,12 @@ class UnifiedPWAOptimizer:
                 f.write("=" * 100 + "\n")
                 for i in range(len(eff_values)):
                     f.write(f"{i:2d}: {eff_values[i]:.6e} ± {eff_errors[i]:.6e}\n")
+            elif not eff_requested:
+                f.write(
+                    "分波效率: 未计算（--cal-eff 默认 False，加 --cal-eff True 开启）\n"
+                )
+            else:
+                f.write("分波效率: 未计算（见日志）\n")
 
             if self.best_params is not None and self.has_free_res:
                 f.write("=" * 100 + "\n")
@@ -2270,6 +2280,16 @@ def _env_bool(name, default):
 def _env_str(name, default=""):
     """从环境变量读字符串，不存在则返回 default。"""
     return os.environ.get(name, default)
+
+
+def _str2bool(v):
+    """argparse 类型：把 "True"/"False"（大小写不敏感，也接受 1/0）转成 bool。"""
+    s = str(v).strip().lower()
+    if s in ("1", "true", "t", "yes", "y"):
+        return True
+    if s in ("0", "false", "f", "no", "n"):
+        return False
+    raise argparse.ArgumentTypeError(f"期望 True/False，收到: {v!r}")
 
 
 def _apply_determinism(seed=42):
@@ -2457,6 +2477,21 @@ def build_parser():
         help="只算拟合分数/效率：跳过拟合与 polish，直接用最佳参数"
         "（--warm-start 或 <output-dir>/best_params.pt）(env: FIT_FF_ONLY=1)",
     )
+    p.add_argument(
+        "--cal-ff",
+        type=_str2bool,
+        default=True,
+        metavar="{True,False}",
+        help="是否计算拟合分数 FF（默认 True）",
+    )
+    p.add_argument(
+        "--cal-eff",
+        type=_str2bool,
+        default=False,
+        metavar="{True,False}",
+        help="是否计算分波效率（默认 False；大 phsp/phsp_truth 上可能 C++ 崩溃，"
+        "建议配小样本 config + --ff-only 使用）",
+    )
 
     # --- Warm start ---
     p.add_argument(
@@ -2620,6 +2655,8 @@ def resolve_args(args):
     cfg["ff_only"] = (
         args.ff_only if args.ff_only is not None else _env_bool("FIT_FF_ONLY", False)
     )
+    cfg["cal_ff"] = args.cal_ff
+    cfg["cal_eff"] = args.cal_eff
     cfg["config"] = args.config
     cfg["verbose"] = args.verbose
     cfg["quiet"] = args.quiet
@@ -2712,6 +2749,7 @@ def main():
     print(f"  event_data={cfg['event_data']}")
     print(f"  checkpoint_interval={cfg['checkpoint_interval']}")
     print(f"  resume={cfg['resume']}")
+    print(f"  cal_ff={cfg['cal_ff']}, cal_eff={cfg['cal_eff']}")
     print(f"  output_dir={output_dir}")
     print("=" * 60)
 
@@ -2940,39 +2978,60 @@ def main():
 
     # ---- 先写核心摘要（不含 FF/效率）：确保随后 FF 崩溃也不丢核心结果 ----
     optimizer.save_all_results_summary(
-        None, None, fit_attempted=True, output_dir=write_dir
+        None,
+        None,
+        fit_attempted=True,
+        output_dir=write_dir,
+        ff_requested=cfg["cal_ff"],
+        eff_requested=cfg["cal_eff"],
     )
 
-    # ---- 拟合分数/效率（放最后；大 phsp_truth 可能导致 C++ 崩溃）----
-    if not best_res.get("is_positive_definite", False):
-        log.warning(
-            "Hessian 非正定；拟合分数/效率的误差来自 err_mode 回退曲率"
-            f"（err_mode={cfg['err_mode']}, τ={cfg['err_tau']:.1e}），"
-            "为秩亏下的可行估计、非严格统计误差；中心值不受影响。"
-        )
-    log.warning(
-        "即将计算 FF/效率；若因 phsp_truth 过大而失败/崩溃，请减小其样本量后重跑"
-        "（可加 --ff-only 跳过拟合直接重算）。"
-    )
+    # ---- 拟合分数/效率（放最后；大 phsp/phsp_truth 可能导致 C++ 崩溃）----
+    # 默认只算 FF（--cal-ff True）；效率需显式 --cal-eff True（默认关）。
     ff_values = ff_errors = None
+    eff_values = eff_errors = None
     ff_error = None
-    try:
-        ff_values, ff_errors = optimizer.compute_fit_fractions(best_res["final_params"])
-        if ff_values is not None:
-            print(f"\n{'=' * 80}")
-            print("最佳结果的拟合分数 (fit fractions, Σ=1, 无效率/MC无关):")
-            print(f"{'=' * 80}")
-            for i in range(len(ff_values)):
-                print(f"{i:2d}: {ff_values[i]:.6f} ± {ff_errors[i]:.6f}")
-    except Exception as e:
-        ff_error = e
-        log.exception(f"计算拟合分数失败: {e}")
+
+    if cfg["cal_ff"] or cfg["cal_eff"]:
+        if not best_res.get("is_positive_definite", False):
+            log.warning(
+                "Hessian 非正定；拟合分数/效率的误差来自 err_mode 回退曲率"
+                f"（err_mode={cfg['err_mode']}, τ={cfg['err_tau']:.1e}），"
+                "为秩亏下的可行估计、非严格统计误差；中心值不受影响。"
+            )
+        _what = " 和 ".join(
+            [n for n, on in (("FF", cfg["cal_ff"]), ("效率", cfg["cal_eff"])) if on]
+        )
+        log.warning(
+            f"即将计算 {_what}；若因 phsp/phsp_truth 过大而失败/崩溃，"
+            "请减小其样本量后重跑（可加 --ff-only 跳过拟合直接重算）。"
+        )
+    else:
+        log.info("跳过 FF/效率计算（--cal-ff False 且 --cal-eff False）。")
+
+    if cfg["cal_ff"]:
+        try:
+            ff_values, ff_errors = optimizer.compute_fit_fractions(
+                best_res["final_params"]
+            )
+            if ff_values is not None:
+                print(f"\n{'=' * 80}")
+                print("最佳结果的拟合分数 (fit fractions, Σ=1, 无效率/MC无关):")
+                print(f"{'=' * 80}")
+                for i in range(len(ff_values)):
+                    print(f"{i:2d}: {ff_values[i]:.6f} ± {ff_errors[i]:.6f}")
+        except Exception as e:
+            ff_error = e
+            log.exception(f"计算拟合分数失败: {e}")
 
     # ---- 分波效率 ----
-    # 若 FF 已抛异常（CUDA 上下文可能已损坏），跳过效率：它同样依赖 phsp_truth，
-    # 再试只会再崩一次、并可能把进程拖死。
-    eff_values = eff_errors = None
-    if ff_error is None:
+    # 默认关闭；仅 --cal-eff True 时计算。若 FF 已抛异常（CUDA 上下文可能已损坏），
+    # 跳过效率：它同样依赖 phsp/phsp_truth，再试只会再崩一次、并可能把进程拖死。
+    if not cfg["cal_eff"]:
+        log.info("未计算分波效率（--cal-eff 默认 False；加 --cal-eff True 开启）。")
+    elif ff_error is not None:
+        log.warning("FF 计算已失败（CUDA 上下文可能已损坏）→ 跳过效率计算。")
+    else:
         try:
             eff_values, eff_errors = optimizer.compute_efficiency(
                 best_res["final_params"]
@@ -2985,8 +3044,6 @@ def main():
                     print(f"{i:2d}: {eff_values[i]:.6f} ± {eff_errors[i]:.6f}")
         except Exception as e:
             log.exception(f"计算分波效率失败: {e}")
-    else:
-        log.warning("FF 计算已失败（CUDA 上下文可能已损坏）→ 跳过效率计算。")
 
     # ---- 重写摘要（带 FF/效率）----
     # 仅当确有结果时才重写；否则保留核心摘要——避免在已损坏的 CUDA 上下文上再跑
@@ -3000,6 +3057,8 @@ def main():
                 eff_values=eff_values,
                 eff_errors=eff_errors,
                 output_dir=write_dir,
+                ff_requested=cfg["cal_ff"],
+                eff_requested=cfg["cal_eff"],
             )
         except Exception as e:
             log.exception(f"写带 FF/效率的摘要失败（核心摘要已在盘上）: {e}")
