@@ -19,7 +19,6 @@ def _config_path_from_argv(default="config.yml"):
     ⚠ 分析对象在**模块导入期**构建（早于 main() 解析参数），因此必须在这里就
     取出 --config，否则 ctpwa 只会读 cwd 下的 config.yml，
     `--config /path/to/other.yml` 会静默失效（只影响 chdir）。
-    见 doc/optimizer-attribution.md §13。
     """
     argv = sys.argv[1:]
     for i, a in enumerate(argv):
@@ -73,7 +72,7 @@ def generate_initial_params(n_coupling_free, free_res_info, seed=42, device="cud
     params[0] = 1.0
     nvar = n_coupling_free - 1
     if nvar > 0:
-        # B11: 向量化（保持旧 RNG 抽样顺序: 先全部 re 再全部 im；每耦合 amp, phase）
+        # 向量化（保持旧 RNG 抽样顺序: 先全部 re 再全部 im；每耦合 amp, phase）
         r_re = torch.rand(2 * nvar, device=device).double()
         r_im = torch.rand(2 * nvar, device=device).double()
         amp_re, ph_re = r_re[0::2] * 0.5, r_re[1::2] * 2 * torch.pi
@@ -595,7 +594,7 @@ def _reparam_unpack(
     phi = u[k : 2 * k]
     re = amp * torch.cos(phi)
     im = amp * torch.sin(phi)
-    # B9: 预分配输出、按块填充（替代 list + cat 的多次分配；autograd 经 CopySlices 传递）
+    # 预分配输出、按块填充（替代 list + cat 的多次分配；autograd 经 CopySlices 传递）
     out = torch.zeros(2 * nc + n_res, dtype=dtype, device=device)
     out[0] = 1.0  # 固定参考 re_0 = 1
     out[1 : 1 + k] = re
@@ -705,7 +704,7 @@ class UnifiedPWAOptimizer:
         # 每迭代 op 数与 m 几乎无关（实测 m=15/50 都是 ≈376 op/iter），而 m 越大
         # 收敛越快（well-cond: m=15 需 167 轮, m=50 只需 118 轮）→ 不砍 m。
         self.optimizer_m = _env_int("FIT_OPT_M", 50)
-        # ---- 归因实验开关（默认 = 当前行为，仅用于 A/B；见 doc/optimizer-ablation-plan.md）----
+        # ---- 归因实验开关（默认 = 当前行为，仅用于 A/B）----
         # two-loop 实现: batched(默认, 闭式三角求解) / legacy(逐对 torch.dot)
         self.optimizer_twoloop = str(
             os.environ.get("FIT_OPT_TWOLOOP", "batched")
@@ -750,7 +749,7 @@ class UnifiedPWAOptimizer:
         params[0] = 1.0  # 固定参考
         nvar = n_coupling_free - 1
         if nvar > 0:
-            # B11: 一次性抽随机数再向量化赋值（保持旧 RNG 抽样顺序: 先全部 re, 再全部 im；
+            # 一次性抽随机数再向量化赋值（保持旧 RNG 抽样顺序: 先全部 re, 再全部 im；
             # 每个耦合 = amp, phase 两个数）
             r_re = torch.rand(2 * nvar, device=device).double()
             r_im = torch.rand(2 * nvar, device=device).double()
@@ -893,7 +892,7 @@ class UnifiedPWAOptimizer:
         params = initial_params.clone().detach().requires_grad_(True)
         nll_history = []
         opt_status = "lbfgs"
-        opt_n_iter = None  # reparam: torch LBFGS 的 n_iter（供摘要/B4 诊断）
+        opt_n_iter = None  # reparam: torch LBFGS 的 n_iter（供摘要诊断）
 
         start_time = time.time()
         if self.optimizer_kind == "projected":
@@ -1289,7 +1288,7 @@ class UnifiedPWAOptimizer:
 
             accepted = False
             for _ in range(25):  # λ 自适应
-                # B10: 用 diag 视图加阻尼，避免 torch.diag(lam*dg) 的 n×n 分配
+                # 用 diag 视图加阻尼，避免 torch.diag(lam*dg) 的 n×n 分配
                 M = H.clone()
                 M.diagonal().add_(lam * dg)
                 try:
@@ -2043,7 +2042,7 @@ class UnifiedPWAOptimizer:
                 log.exception(f"第 {i} 次优化失败: {e}")
                 continue
 
-        # ---- 系综统计（B6）: 前向 NLL 有混沌，单次跑会假阳性 → 看分布 ----
+        # ---- 系综统计: 前向 NLL 有混沌，单次跑会假阳性 → 看分布 ----
         if results:
             nlls = np.array([r["final_nll"] for r in results], dtype=float)
             q1, med, q3 = np.percentile(nlls, [25, 50, 75])
@@ -2054,7 +2053,8 @@ class UnifiedPWAOptimizer:
             )
             print(
                 "[ensemble] 提示: 比较不同优化器/配置时请用相同 seed 系综 + 中位数/IQR；"
-                "单次 NLL 差异需大于系综 std 才可信（上游方法学教训，见 reparam_analysis §13）。"
+                "单次 NLL 差异需大于系综 std 才可信"
+                "（前向 NLL 存在数值混沌；方法学说明见 README §6）。"
             )
 
         return results
@@ -2299,7 +2299,7 @@ def _apply_determinism(seed=42):
     """FIT_DETERMINISTIC=1: 尽量确定性（供对比实验）。
 
     ⚠ 仅降低不确定性，**不保证前向 NLL 逐位可复现**（原子加 1e-11 → 拟合混沌）；
-    结论仍需同 seed 系综 + 中位数/IQR（见 reparam_analysis §13、AGENT.md §4）。
+    结论仍需同 seed 系综 + 中位数/IQR。
     用 warn_only=True，避免 CUDA 扩展里的非确定算子直接抛错。
     """
     torch.manual_seed(seed)
