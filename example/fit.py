@@ -18,6 +18,12 @@ _REPARAM_EPS = 1e-12  # reparam 幅度 sigmoid 夹取下限
 _SO_COMPLEX_DTYPE = None  # 缓存 ctpwa .so 的复数精度（None=未探测/探测失败）
 _RES_NOISE_FRAC = 0.1  # 共振态初值噪声幅度（占 free_range 区间的比例）
 
+# 输出约定（受 -v/-q 控制的是 log，print 始终可见）：
+#   RESULT  → print：结果表/配置 dump/进度/落盘提示/可复现 tag（[seed]/[ensemble]/[param-err]/[ff]）
+#   DIAG    → log.info：内部诊断（pLBFGS/polish 的迭代与统计）
+#   VERBOSE → log.info/debug：仅在 --opt-verbose / FIT_OPT_PROF / -vv 等开关下输出
+#   WARN/ERR→ log.warning/error
+
 
 # ============================================================
 # 初始化分析对象
@@ -237,7 +243,7 @@ def projected_lbfgs(
     if (not torch.isfinite(g).all().item()) or not (f == f and abs(f) != float("inf")):
         # 随机初值发散（梯度/目标非有限）—— 直接判该 run 失败，不要白烧 25 次线搜索
         if verbose:
-            print(f"    [pLBFGS] stop: status=nan-start, NLL={f}")
+            log.info(f"    [pLBFGS] stop: status=nan-start, NLL={f}")
         return x, f, "nan-start"
 
     for it in range(max_iter):
@@ -427,7 +433,7 @@ def projected_lbfgs(
                 restarts += 1
                 diag["restart_ls"] += 1
                 if verbose:
-                    print(
+                    log.info(
                         f"    [pLBFGS] it{it}: 线搜索无下降 → 清空曲率历史重启 "
                         f"({restarts}/8)"
                     )
@@ -462,7 +468,7 @@ def projected_lbfgs(
         step_inf = float((t * d).abs().max().item())
         x, f, g = xn.detach(), fn, gn
         if verbose:
-            print(
+            log.info(
                 f"    [pLBFGS] it{it:4d}  NLL={f:.6f}  Δ={-df:+.3e}  "
                 f"|pg|={pg_inf:.2e}  t={t.item():.2e}  active={n_active}"
                 f"{'  [capped]' if capped else ''}"
@@ -493,7 +499,7 @@ def projected_lbfgs(
             tiny_streak = 0
 
     if verbose:
-        print(
+        log.info(
             f"    [pLBFGS] stop: status={status}, NLL={f:.6f}, "
             f"active={n_active}, iter={it + 1}, evals={len(record) if record is not None else -1}"
         )
@@ -501,7 +507,7 @@ def projected_lbfgs(
         n_it = it + 1 if max_iter > 0 else 0
         t_house = time.perf_counter() - t_loop - t_eval
         tot = max(t_eval + t_house, 1e-9)
-        print(
+        log.info(
             f"    [pLBFGS-prof] iters={n_it} evals={n_eval}  "
             f"eval={t_eval:.3f}s ({t_eval / max(n_eval, 1) * 1e3:.3f} ms/eval, "
             f"{100 * t_eval / tot:.1f}%)  "
@@ -511,15 +517,15 @@ def projected_lbfgs(
         )
         tr = diag["trials"]
         trial_hist = " ".join(f"{k}次×{tr[k]}" for k in sorted(tr))
-        print(f"    [pLBFGS-diag] 线搜索试探分布: {trial_hist}")
-        print(
+        log.info(f"    [pLBFGS-diag] 线搜索试探分布: {trial_hist}")
+        log.info(
             f"    [pLBFGS-diag] fallback={diag['fallback']} "
             f"max_ls 打满={diag['max_ls_hit']} 撞界cap={diag['capped']} "
             f"重启(线搜索)={diag['restart_ls']} 重启(无下降)={diag['restart_nod']} "
             f"重启(步长为0)={diag['restart_step0']} 重启(停滞)={diag['restart_stall']}"
         )
         if slow_log:
-            print(
+            log.info(
                 f"    [pLBFGS-slow] 多试探迭代 {len(slow_log)} 次（≥8 次试探），"
                 f"方向由哪些坐标顶起："
             )
@@ -529,7 +535,7 @@ def projected_lbfgs(
                     f"(|d|={v:.2e},|g|={gv:.2e}{',贴边' if bnd else ''})"
                     for i, v, gv, bnd in r["top"]
                 )
-                print(
+                log.info(
                     f"      it={r['it']:4d} trials={r['trials']:2d} "
                     f"t_acc={r['t_acc']:.2e} γ={r['gam']:.3e} "
                     f"gtd={r['gtd']:.3e} | {tops}"
@@ -1190,7 +1196,7 @@ class UnifiedPWAOptimizer:
             pg = pg_of(x, g)
             if not bool(free.any()):
                 if verbose:
-                    print(f"[polish] step{step}: 全部为活跃约束 → KKT")
+                    log.info(f"[polish] step{step}: 全部为活跃约束 → KKT")
                 break
             pg_inf = pg[free].abs().max().item()
 
@@ -1203,7 +1209,7 @@ class UnifiedPWAOptimizer:
 
             if pg_inf <= gtol and at_min:
                 if verbose:
-                    print(
+                    log.info(
                         f"[polish] step{step}: 真局部极小 |pg|={pg_inf:.2e}, "
                         f"active={int(act.sum())}"
                     )
@@ -1242,7 +1248,7 @@ class UnifiedPWAOptimizer:
                 if cand_best[0] < f - max(tol, 0.0):
                     f, x, g = cand_best[0], cand_best[1], cand_best[2]
                     if verbose:
-                        print(
+                        log.info(
                             f"[polish] step{step}: 负曲率逃逸 "
                             f"(λmin/λmax={ev_all[0].item() / lmax_all.item():.2e}) "
                             f"→ NLL={f:.6f}"
@@ -1308,7 +1314,7 @@ class UnifiedPWAOptimizer:
                     break
             if not accepted:
                 if verbose:
-                    print(
+                    log.info(
                         f"[polish] step{step}: stall (λ={lam:.1e}, |pg|={pg_inf:.2e}, "
                         f"active={int(act.sum())})"
                     )
@@ -1317,7 +1323,7 @@ class UnifiedPWAOptimizer:
             df = f - fn
             x, f, g = cand, fn, gn
             if verbose:
-                print(
+                log.info(
                     f"[polish] step{step}: λ={lam:.2e} α={t:.2e} ΔNLL={-df:+.4f} "
                     f"|pg|={pg_inf:.2e} active={int(act.sum())} maxA={_max_amp(x):.3e}"
                 )
@@ -1328,7 +1334,7 @@ class UnifiedPWAOptimizer:
                 tiny_streak += 1
                 if tiny_streak >= patience:
                     if verbose:
-                        print(
+                        log.info(
                             f"[polish] stop: 噪声底 (连续 {tiny_streak} 步 ΔNLL<{floor_tol})"
                         )
                     break
@@ -1361,7 +1367,7 @@ class UnifiedPWAOptimizer:
         # 播种缓存: 抛光终点的 Hessian 供误差/分支比复用
         self._hess_cache = (x.clone(), H_final)
         if verbose:
-            print(
+            log.info(
                 f"[polish] done: NLL={f:.6f}, PD(free)={pd}, "
                 f"λmin={eig_f[0].item():.3e} λmax={lmax.item():.3e} "
                 f"λmin/λmax={ratio:.2e}, "
@@ -1369,7 +1375,7 @@ class UnifiedPWAOptimizer:
                 f"steps={n_step}"
             )
             if not bool(free.any()):
-                print(
+                log.info(
                     "[polish] 注意: 所有自由方向都是活跃约束 → "
                     "参数误差无定义，只能报单侧限制"
                 )
