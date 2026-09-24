@@ -12,6 +12,14 @@ log = logging.getLogger("pwa-fit")
 
 
 # ============================================================
+# 常量
+# ============================================================
+_REPARAM_EPS = 1e-12  # reparam 幅度 sigmoid 夹取下限
+_SO_COMPLEX_DTYPE = None  # 缓存 ctpwa .so 的复数精度（None=未探测/探测失败）
+_RES_NOISE_FRAC = 0.1  # 共振态初值噪声幅度（占 free_range 区间的比例）
+
+
+# ============================================================
 # 初始化分析对象
 # ============================================================
 def _config_path_from_argv(default="config.yml"):
@@ -36,7 +44,6 @@ int_time2 = int(time.time())
 print(f"振幅初始化耗时: {int_time2 - int_time1} 秒")
 
 # 参数信息
-conjugate_pairs = ana.getConstraintsIndex()
 params_names = (
     ana.getParamNames()
 )  # 前 n_coupling_free 个耦合名 + 后 n_res_free 个共振态名
@@ -45,9 +52,7 @@ n_coupling_free = ana.getNVector()  # 自由耦合复数参数数
 # 共振态参数信息
 free_res_info = ana.getFreeResParams()  # [3, n_res] float64 CPU
 n_res_free = free_res_info.shape[1]
-HAS_FREE_RES = n_res_free > 0
 
-n_params_total = 2 * n_coupling_free + n_res_free
 print(f"耦合参数数量: {n_coupling_free}")
 print(f"共振态参数数量: {n_res_free}")
 
@@ -91,7 +96,7 @@ def generate_initial_params(n_coupling_free, free_res_info, seed=42, device="cud
             upper = free_res_info[2].to(device=device, dtype=torch.float64)
             noise = (
                 (torch.rand(n_res, device=device, dtype=torch.float64) - 0.5)
-                * 0.1
+                * _RES_NOISE_FRAC
                 * (upper - lower)
             )
             init_vals = torch.clamp(
@@ -528,11 +533,6 @@ def projected_lbfgs(
 #   与 ptc-mle 的 sigmoid 重参数化、tf-pwa 的 Bound 软墙同源；区别是这里靠
 #   autograd 自动传链式法则（无需手写 dy/dx）。
 # ============================================================
-_REPARAM_EPS = 1e-12
-
-_SO_COMPLEX_DTYPE = None  # 缓存 ctpwa .so 的复数精度（None=未探测/探测失败）
-
-
 def _so_complex_dtype():
     """返回与 ctpwa .so 编译精度匹配的 torch complex dtype（None=未知）。
 
@@ -773,7 +773,7 @@ class UnifiedPWAOptimizer:
                 upper = free_res_info[2].to(device=device, dtype=torch.float64)
                 noise = (
                     (torch.rand(n_res, device=device, dtype=torch.float64) - 0.5)
-                    * 0.1
+                    * _RES_NOISE_FRAC
                     * (upper - lower)
                 )
                 init_vals = torch.clamp(
@@ -2732,13 +2732,11 @@ def resolve_args(args):
     # warm start
     if args.warm_start is not None:
         if args.warm_start == "auto":
-            cfg["warm_start_path"] = os.path.join(
-                cfg.get("_output_dir", "results"), "best_params.pt"
-            )
+            cfg["warm_start_path"] = os.path.join(args.output_dir, "best_params.pt")
         else:
             cfg["warm_start_path"] = args.warm_start
     elif _env_bool("FIT_WARM", False):
-        cfg["warm_start_path"] = os.path.join("results", "best_params.pt")
+        cfg["warm_start_path"] = os.path.join(args.output_dir, "best_params.pt")
     else:
         cfg["warm_start_path"] = None
 
@@ -3070,7 +3068,7 @@ def main():
                 ) = optimizer.compute_param_errors(best_res["final_params"])
                 best_res["polish_status"] = "ok"
             except Exception as e:
-                # 不要静默：打印完整 traceback，并在状态里标注失败（上游教训：宽 except
+                # 不要静默：打印完整 traceback，并在状态里标注失败（宽 except
                 # 曾把 polish 的 TypeError 吞成"抛光失败"却无人察觉）
                 best_res["polish_status"] = f"failed({type(e).__name__})"
                 log.exception(f"抛光失败: {e}")
