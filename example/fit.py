@@ -58,36 +58,37 @@ print(f"共振态参数数量: {n_res_free}")
 
 
 # ============================================================
-# 生成初始参数（已移入 UnifiedPWAOptimizer.generate_initial_params）
-# 保留模块级函数作为向后兼容包装器
+# 生成初始参数（共享实现；模块级函数仅为向后兼容包装器）
 # ============================================================
-def generate_initial_params(n_coupling_free, free_res_info, seed=42, device="cuda"):
-    """向后兼容包装器。新代码请用 optimizer.generate_initial_params(seed)。"""
-    import warnings
+def _generate_initial_params(n_coupling_free, free_res_info, seed=42, device="cuda"):
+    """生成统一参数向量 [real_coupling | imag_coupling | theta]。
 
-    warnings.warn(
-        "generate_initial_params() 已移入 UnifiedPWAOptimizer 类方法，"
-        "请直接使用 optimizer.generate_initial_params(seed=...)",
-        DeprecationWarning,
-        stacklevel=2,
-    )
+    Layout: [real_0..real_{n_free-1}, imag_0..imag_{n_free-1}, theta_0..]
+    real_0=1.0, imag_0=0.0 为固定参考振幅。
+    seed<=42 时共振态参数取 PDG 初值；seed>42 时在 bounds 内加 _RES_NOISE_FRAC 噪声。
+    ⚠ 该函数被类方法与废弃包装器共用；抽样顺序不可改（本地 bit-exact 单测依赖）。
+    """
     n_res = free_res_info.shape[1]
     n_total = 2 * n_coupling_free + n_res
     params = torch.zeros(n_total, dtype=torch.float64, device=device)
+
     torch.manual_seed(seed)
-    params[0] = 1.0
+
+    # 耦合（一次性抽随机数再向量化赋值，保持旧 RNG 抽样顺序: 先全部 re 再全部 im）
+    params[0] = 1.0  # 固定参考
     nvar = n_coupling_free - 1
     if nvar > 0:
-        # 向量化（保持旧 RNG 抽样顺序: 先全部 re 再全部 im；每耦合 amp, phase）
         r_re = torch.rand(2 * nvar, device=device).double()
         r_im = torch.rand(2 * nvar, device=device).double()
         amp_re, ph_re = r_re[0::2] * 0.5, r_re[1::2] * 2 * torch.pi
         amp_im, ph_im = r_im[0::2] * 0.5, r_im[1::2] * 2 * torch.pi
         params[1:n_coupling_free] = amp_re * torch.cos(ph_re)
-        params[n_coupling_free] = 0.0
+        params[n_coupling_free] = 0.0  # 固定参考
         params[n_coupling_free + 1 : 2 * n_coupling_free] = amp_im * torch.sin(ph_im)
     else:
-        params[n_coupling_free] = 0.0
+        params[n_coupling_free] = 0.0  # 固定参考
+
+    # 共振态参数
     if n_res > 0:
         init_vals = free_res_info[0].to(device=device, dtype=torch.float64)
         if seed > 42:
@@ -106,6 +107,19 @@ def generate_initial_params(n_coupling_free, free_res_info, seed=42, device="cud
             )
         params[2 * n_coupling_free :] = init_vals
     return params
+
+
+def generate_initial_params(n_coupling_free, free_res_info, seed=42, device="cuda"):
+    """向后兼容包装器。新代码请用 optimizer.generate_initial_params(seed)。"""
+    import warnings
+
+    warnings.warn(
+        "generate_initial_params() 已移入 UnifiedPWAOptimizer 类方法，"
+        "请直接使用 optimizer.generate_initial_params(seed=...)",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _generate_initial_params(n_coupling_free, free_res_info, seed, device)
 
 
 # ============================================================
@@ -729,62 +743,16 @@ class UnifiedPWAOptimizer:
 
     # --------------------------------------------------------
     def generate_initial_params(self, seed=42):
-        """生成统一参数向量 [real_coupling | imag_coupling | theta]。
+        """生成统一参数向量（实现见模块级 `_generate_initial_params`）。
 
-        Layout: [real_0,...,real_{n_free-1}, imag_0,...,imag_{n_free-1},
-                 theta_0,...,theta_{n_res-1}]
-        real_0=1.0, imag_0=0.0 为固定参考振幅。
-        seed=42 时共振态参数取 PDG 初值；seed>42 时在 bounds 内加 10% 噪声。
+        seed<=42 时共振态参数取 PDG 初值；seed>42 时在 bounds 内加 _RES_NOISE_FRAC 噪声。
         """
-        free_res_info = self._free_res_info
-        n_coupling_free = self.n_coupling_free
-        device = self.device
-
-        n_res = free_res_info.shape[1]
-        n_total = 2 * n_coupling_free + n_res
-        params = torch.zeros(n_total, dtype=torch.float64, device=device)
-
-        torch.manual_seed(seed)
-
-        # 耦合实部
-        params[0] = 1.0  # 固定参考
-        nvar = n_coupling_free - 1
-        if nvar > 0:
-            # 一次性抽随机数再向量化赋值（保持旧 RNG 抽样顺序: 先全部 re, 再全部 im；
-            # 每个耦合 = amp, phase 两个数）
-            r_re = torch.rand(2 * nvar, device=device).double()
-            r_im = torch.rand(2 * nvar, device=device).double()
-            amp_re, ph_re = r_re[0::2] * 0.5, r_re[1::2] * 2 * torch.pi
-            amp_im, ph_im = r_im[0::2] * 0.5, r_im[1::2] * 2 * torch.pi
-            params[1:n_coupling_free] = amp_re * torch.cos(ph_re)
-            params[n_coupling_free] = 0.0  # 固定参考
-            params[n_coupling_free + 1 : 2 * n_coupling_free] = amp_im * torch.sin(
-                ph_im
-            )
-        else:
-            params[n_coupling_free] = 0.0  # 固定参考
-
-        # 共振态参数
-        if n_res > 0:
-            init_vals = free_res_info[0].to(device=device, dtype=torch.float64)
-            if seed > 42:
-                torch.manual_seed(seed)
-                lower = free_res_info[1].to(device=device, dtype=torch.float64)
-                upper = free_res_info[2].to(device=device, dtype=torch.float64)
-                noise = (
-                    (torch.rand(n_res, device=device, dtype=torch.float64) - 0.5)
-                    * _RES_NOISE_FRAC
-                    * (upper - lower)
-                )
-                init_vals = torch.clamp(
-                    init_vals + noise,
-                    lower + 1e-7 * (upper - lower),
-                    upper - 1e-7 * (upper - lower),
-                )
-            params[2 * n_coupling_free :] = init_vals
-
+        params = _generate_initial_params(
+            self.n_coupling_free, self._free_res_info, seed, self.device
+        )
         print(
-            f"生成初始参数 (seed={seed}): n_coupling={n_coupling_free}, n_res={n_res}"
+            f"生成初始参数 (seed={seed}): n_coupling={self.n_coupling_free}, "
+            f"n_res={self.n_res_free}"
         )
         return params
 
