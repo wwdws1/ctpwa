@@ -200,7 +200,9 @@ python fit.py --optimizer projected --runs 5
 | `--no-project` | 关闭 legacy 路径的边界梯度清零 | False | `FIT_PROJECT=0` | lbfgs |
 | `--optimizer` | 优化器：`reparam`/`projected`/`lbfgs` | `reparam` | `FIT_OPTIMIZER` | — |
 | `--opt-verbose` | 每轮打印 projected 的 `pg/active/ΔNLL` | False | `FIT_OPT_VERBOSE=1` | projected |
-| `--ff-only` | 只算拟合分数/效率：跳过拟合与 polish，用最佳参数（`--warm-start` 或 `<output-dir>/best_params.pt`） | False | `FIT_FF_ONLY=1` | — |
+| `--ff-only` | 只算拟合分数：跳过拟合与 polish，用最佳参数（`--warm-start` 或 `<output-dir>/best_params.pt`） | False | `FIT_FF_ONLY=1` | — |
+| `--cal-ff` | 是否计算拟合分数 FF（`True`/`False` 带值；默认开） | `True` | — | — |
+| `--cal-eff` | 是否计算分波效率（默认关；大 `phsp`/`phsp_truth` 上可能 C++ 崩溃，建议配小样本 config + `--ff-only`） | `False` | — | — |
 
 ### 误差估计（Hessian 非正定回退）
 | 参数 | 说明 | 默认 | 环境变量 |
@@ -306,7 +308,10 @@ FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
    `--tol-grad`（gtol）控制。
 5. 若在集群提交作业，注意 `fit.py` 会读 cwd 的 `config.yml` 并需要 GPU；建议
    一个方案一个目录（或配合 `--output-dir` 隔离结果）。
-6. **拟合分数/效率在大 `phsp_truth` 上可能导致 C++ 崩溃**（本机实测 ~15,000,000 事件时，
-   `computeBFKernel` illegal memory access / glibc abort）——该崩溃致命、`try/except` 无法捕获。
-   因此 `fit.py` **先写核心摘要**再算 FF/效率，并在计算前打印提示；若失败请**减小
-   `phsp_truth` 样本量**后重跑，可加 `--ff-only` 跳过拟合、直接用 `best_params.pt` 重算。
+6. **拟合分数默认计算，分波效率默认关闭**：`--cal-ff True`（默认）算 FF；效率需显式
+   `--cal-eff True`。二者在过大 `phsp`/`phsp_truth` 上可能触发 C++ `computeBFKernel`
+   illegal memory access / glibc abort（本机实测：拟合期显存已近满，约 3.5M 事件即可崩）——
+   该崩溃致命、`try/except` 无法捕获。因此 `fit.py` **先写核心摘要**再算 FF/效率，并在
+   计算前打印提示。要算效率时建议：**减小 `phsp` 与 `phsp_truth` 样本量**后用
+   `--ff-only --cal-eff True` 跳过拟合、直接以 `best_params.pt` 重算（两个样本都要减，
+   效率同时用到它们）。
