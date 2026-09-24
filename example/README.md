@@ -328,3 +328,7 @@ FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
    计算前打印提示。要算效率时建议：**减小 `phsp` 与 `phsp_truth` 样本量**后用
    `--ff-only --cal-eff True` 跳过拟合、直接以 `best_params.pt` 重算（两个样本都要减，
    效率同时用到它们）。
+7. **`--warm-start auto` / `FIT_WARM` 现在按 `--output-dir` 找 `best_params.pt`**
+   （旧版恒指向 `results/`，在非默认 `--output-dir` 下会找错）。
+8. **输出约定**：`print` 输出结果（配置/进度/结果表/落盘提示/可复现 tag），
+   `log`（含 `-v/-q` 级别控制）输出内部诊断（`[pLBFGS]`/`[polish]` 迭代与统计）。

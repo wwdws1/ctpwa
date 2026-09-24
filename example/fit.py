@@ -6,15 +6,77 @@ import sys
 import csv
 import argparse
 import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Optional, TypedDict
 import ctpwa
 
 log = logging.getLogger("pwa-fit")
 
 
 # ============================================================
+# 类型（仅静态提示，运行时仍是普通 dict）
+# ============================================================
+class ErrDict(TypedDict, total=False):
+    """`_errors_from_hessian` 的返回结构。"""
+
+    coupling_real_errors: Any
+    coupling_imag_errors: Any
+    res_errors: Any
+    mode_used: str
+    n_flat: int
+    is_pd: bool
+    min_eig: float
+    max_eig: float
+    cond_num: float
+    cov: Any
+    cov_labels: Any
+    cov_mode: Any
+
+
+class RunResult(TypedDict, total=False):
+    """`optimize_single_run` 的返回结构。"""
+
+    run_id: int
+    final_params: torch.Tensor
+    final_nll: float
+    nll_history: list
+    iterations: int
+    evals: int
+    n_iter: int
+    time: float
+    hessian_time: float
+    optimizer_status: str
+    is_positive_definite: bool
+    min_eigenvalue: float
+    max_eigenvalue: float
+    condition_number: float
+    coupling_real_errors: Any
+    coupling_imag_errors: Any
+    res_errors: Any
+    err_mode_used: str
+    n_flat_dirs: int
+    polish_status: str
+
+
+# ============================================================
+# 常量
+# ============================================================
+_REPARAM_EPS = 1e-12  # reparam 幅度 sigmoid 夹取下限
+_SO_COMPLEX_DTYPE = None  # 缓存 ctpwa .so 的复数精度（None=未探测/探测失败）
+_RES_NOISE_FRAC = 0.1  # 共振态初值噪声幅度（占 free_range 区间的比例）
+
+# 输出约定（受 -v/-q 控制的是 log，print 始终可见）：
+#   RESULT  → print：结果表/配置 dump/进度/落盘提示/可复现 tag（[seed]/[ensemble]/[param-err]/[ff]）
+#   DIAG    → log.info：内部诊断（pLBFGS/polish 的迭代与统计）
+#   VERBOSE → log.info/debug：仅在 --opt-verbose / FIT_OPT_PROF / -vv 等开关下输出
+#   WARN/ERR→ log.warning/error
+
+
+# ============================================================
 # 初始化分析对象
 # ============================================================
-def _config_path_from_argv(default="config.yml"):
+def _config_path_from_argv(default: str = "config.yml") -> str:
     """在 argparse 之前取出 --config 的值。
 
     ⚠ 分析对象在**模块导入期**构建（早于 main() 解析参数），因此必须在这里就
@@ -36,7 +98,6 @@ int_time2 = int(time.time())
 print(f"振幅初始化耗时: {int_time2 - int_time1} 秒")
 
 # 参数信息
-conjugate_pairs = ana.getConstraintsIndex()
 params_names = (
     ana.getParamNames()
 )  # 前 n_coupling_free 个耦合名 + 后 n_res_free 个共振态名
@@ -45,44 +106,48 @@ n_coupling_free = ana.getNVector()  # 自由耦合复数参数数
 # 共振态参数信息
 free_res_info = ana.getFreeResParams()  # [3, n_res] float64 CPU
 n_res_free = free_res_info.shape[1]
-HAS_FREE_RES = n_res_free > 0
 
-n_params_total = 2 * n_coupling_free + n_res_free
 print(f"耦合参数数量: {n_coupling_free}")
 print(f"共振态参数数量: {n_res_free}")
 
 
 # ============================================================
-# 生成初始参数（已移入 UnifiedPWAOptimizer.generate_initial_params）
-# 保留模块级函数作为向后兼容包装器
+# 生成初始参数（共享实现；模块级函数仅为向后兼容包装器）
 # ============================================================
-def generate_initial_params(n_coupling_free, free_res_info, seed=42, device="cuda"):
-    """向后兼容包装器。新代码请用 optimizer.generate_initial_params(seed)。"""
-    import warnings
+def _generate_initial_params(
+    n_coupling_free: int,
+    free_res_info: torch.Tensor,
+    seed: int = 42,
+    device: str = "cuda",
+) -> torch.Tensor:
+    """生成统一参数向量 [real_coupling | imag_coupling | theta]。
 
-    warnings.warn(
-        "generate_initial_params() 已移入 UnifiedPWAOptimizer 类方法，"
-        "请直接使用 optimizer.generate_initial_params(seed=...)",
-        DeprecationWarning,
-        stacklevel=2,
-    )
+    Layout: [real_0..real_{n_free-1}, imag_0..imag_{n_free-1}, theta_0..]
+    real_0=1.0, imag_0=0.0 为固定参考振幅。
+    seed<=42 时共振态参数取 PDG 初值；seed>42 时在 bounds 内加 _RES_NOISE_FRAC 噪声。
+    ⚠ 该函数被类方法与废弃包装器共用；抽样顺序不可改（本地 bit-exact 单测依赖）。
+    """
     n_res = free_res_info.shape[1]
     n_total = 2 * n_coupling_free + n_res
     params = torch.zeros(n_total, dtype=torch.float64, device=device)
+
     torch.manual_seed(seed)
-    params[0] = 1.0
+
+    # 耦合（一次性抽随机数再向量化赋值，保持旧 RNG 抽样顺序: 先全部 re 再全部 im）
+    params[0] = 1.0  # 固定参考
     nvar = n_coupling_free - 1
     if nvar > 0:
-        # 向量化（保持旧 RNG 抽样顺序: 先全部 re 再全部 im；每耦合 amp, phase）
         r_re = torch.rand(2 * nvar, device=device).double()
         r_im = torch.rand(2 * nvar, device=device).double()
         amp_re, ph_re = r_re[0::2] * 0.5, r_re[1::2] * 2 * torch.pi
         amp_im, ph_im = r_im[0::2] * 0.5, r_im[1::2] * 2 * torch.pi
         params[1:n_coupling_free] = amp_re * torch.cos(ph_re)
-        params[n_coupling_free] = 0.0
+        params[n_coupling_free] = 0.0  # 固定参考
         params[n_coupling_free + 1 : 2 * n_coupling_free] = amp_im * torch.sin(ph_im)
     else:
-        params[n_coupling_free] = 0.0
+        params[n_coupling_free] = 0.0  # 固定参考
+
+    # 共振态参数
     if n_res > 0:
         init_vals = free_res_info[0].to(device=device, dtype=torch.float64)
         if seed > 42:
@@ -91,7 +156,7 @@ def generate_initial_params(n_coupling_free, free_res_info, seed=42, device="cud
             upper = free_res_info[2].to(device=device, dtype=torch.float64)
             noise = (
                 (torch.rand(n_res, device=device, dtype=torch.float64) - 0.5)
-                * 0.1
+                * _RES_NOISE_FRAC
                 * (upper - lower)
             )
             init_vals = torch.clamp(
@@ -101,6 +166,24 @@ def generate_initial_params(n_coupling_free, free_res_info, seed=42, device="cud
             )
         params[2 * n_coupling_free :] = init_vals
     return params
+
+
+def generate_initial_params(
+    n_coupling_free: int,
+    free_res_info: torch.Tensor,
+    seed: int = 42,
+    device: str = "cuda",
+) -> torch.Tensor:
+    """向后兼容包装器。新代码请用 optimizer.generate_initial_params(seed)。"""
+    import warnings
+
+    warnings.warn(
+        "generate_initial_params() 已移入 UnifiedPWAOptimizer 类方法，"
+        "请直接使用 optimizer.generate_initial_params(seed=...)",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _generate_initial_params(n_coupling_free, free_res_info, seed, device)
 
 
 # ============================================================
@@ -218,7 +301,7 @@ def projected_lbfgs(
     if (not torch.isfinite(g).all().item()) or not (f == f and abs(f) != float("inf")):
         # 随机初值发散（梯度/目标非有限）—— 直接判该 run 失败，不要白烧 25 次线搜索
         if verbose:
-            print(f"    [pLBFGS] stop: status=nan-start, NLL={f}")
+            log.info(f"    [pLBFGS] stop: status=nan-start, NLL={f}")
         return x, f, "nan-start"
 
     for it in range(max_iter):
@@ -408,7 +491,7 @@ def projected_lbfgs(
                 restarts += 1
                 diag["restart_ls"] += 1
                 if verbose:
-                    print(
+                    log.info(
                         f"    [pLBFGS] it{it}: 线搜索无下降 → 清空曲率历史重启 "
                         f"({restarts}/8)"
                     )
@@ -443,7 +526,7 @@ def projected_lbfgs(
         step_inf = float((t * d).abs().max().item())
         x, f, g = xn.detach(), fn, gn
         if verbose:
-            print(
+            log.info(
                 f"    [pLBFGS] it{it:4d}  NLL={f:.6f}  Δ={-df:+.3e}  "
                 f"|pg|={pg_inf:.2e}  t={t.item():.2e}  active={n_active}"
                 f"{'  [capped]' if capped else ''}"
@@ -474,7 +557,7 @@ def projected_lbfgs(
             tiny_streak = 0
 
     if verbose:
-        print(
+        log.info(
             f"    [pLBFGS] stop: status={status}, NLL={f:.6f}, "
             f"active={n_active}, iter={it + 1}, evals={len(record) if record is not None else -1}"
         )
@@ -482,7 +565,7 @@ def projected_lbfgs(
         n_it = it + 1 if max_iter > 0 else 0
         t_house = time.perf_counter() - t_loop - t_eval
         tot = max(t_eval + t_house, 1e-9)
-        print(
+        log.info(
             f"    [pLBFGS-prof] iters={n_it} evals={n_eval}  "
             f"eval={t_eval:.3f}s ({t_eval / max(n_eval, 1) * 1e3:.3f} ms/eval, "
             f"{100 * t_eval / tot:.1f}%)  "
@@ -492,15 +575,15 @@ def projected_lbfgs(
         )
         tr = diag["trials"]
         trial_hist = " ".join(f"{k}次×{tr[k]}" for k in sorted(tr))
-        print(f"    [pLBFGS-diag] 线搜索试探分布: {trial_hist}")
-        print(
+        log.info(f"    [pLBFGS-diag] 线搜索试探分布: {trial_hist}")
+        log.info(
             f"    [pLBFGS-diag] fallback={diag['fallback']} "
             f"max_ls 打满={diag['max_ls_hit']} 撞界cap={diag['capped']} "
             f"重启(线搜索)={diag['restart_ls']} 重启(无下降)={diag['restart_nod']} "
             f"重启(步长为0)={diag['restart_step0']} 重启(停滞)={diag['restart_stall']}"
         )
         if slow_log:
-            print(
+            log.info(
                 f"    [pLBFGS-slow] 多试探迭代 {len(slow_log)} 次（≥8 次试探），"
                 f"方向由哪些坐标顶起："
             )
@@ -510,7 +593,7 @@ def projected_lbfgs(
                     f"(|d|={v:.2e},|g|={gv:.2e}{',贴边' if bnd else ''})"
                     for i, v, gv, bnd in r["top"]
                 )
-                print(
+                log.info(
                     f"      it={r['it']:4d} trials={r['trials']:2d} "
                     f"t_acc={r['t_acc']:.2e} γ={r['gam']:.3e} "
                     f"gtd={r['gtd']:.3e} | {tops}"
@@ -528,12 +611,7 @@ def projected_lbfgs(
 #   与 ptc-mle 的 sigmoid 重参数化、tf-pwa 的 Bound 软墙同源；区别是这里靠
 #   autograd 自动传链式法则（无需手写 dy/dx）。
 # ============================================================
-_REPARAM_EPS = 1e-12
-
-_SO_COMPLEX_DTYPE = None  # 缓存 ctpwa .so 的复数精度（None=未探测/探测失败）
-
-
-def _so_complex_dtype():
+def _so_complex_dtype() -> Optional[torch.dtype]:
     """返回与 ctpwa .so 编译精度匹配的 torch complex dtype（None=未知）。
 
     getFitFractions/getEfficiency 要求 vector 的复数 dtype 与 .so 精度一致；
@@ -554,7 +632,15 @@ def _so_complex_dtype():
     return _SO_COMPLEX_DTYPE
 
 
-def _reparam_pack(params, nc, n_res, lower, upper, amp_max, eps=_REPARAM_EPS):
+def _reparam_pack(
+    params: torch.Tensor,
+    nc: int,
+    n_res: int,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    amp_max: float,
+    eps: float = _REPARAM_EPS,
+) -> torch.Tensor:
     """物理参数 -> 无约束 u。params: [re(nc) | im(nc) | theta(n_res)]。
 
     nc 为耦合复数个数（index 0 是固定参考）；n_res 为自由共振态参数个数。
@@ -579,8 +665,15 @@ def _reparam_pack(params, nc, n_res, lower, upper, amp_max, eps=_REPARAM_EPS):
 
 
 def _reparam_unpack(
-    u, nc, n_res, lower, upper, amp_max, dtype=torch.float64, device="cpu"
-):
+    u: torch.Tensor,
+    nc: int,
+    n_res: int,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    amp_max: float,
+    dtype: torch.dtype = torch.float64,
+    device: str = "cpu",
+) -> torch.Tensor:
     """无约束 u -> 物理参数（对 u 可微，供 autograd 链式法则）。
 
     amp = amp_max·sigmoid(u_amp) ∈ (0, amp_max)：小幅度区 ≈ exp(u_amp)，
@@ -729,62 +822,16 @@ class UnifiedPWAOptimizer:
 
     # --------------------------------------------------------
     def generate_initial_params(self, seed=42):
-        """生成统一参数向量 [real_coupling | imag_coupling | theta]。
+        """生成统一参数向量（实现见模块级 `_generate_initial_params`）。
 
-        Layout: [real_0,...,real_{n_free-1}, imag_0,...,imag_{n_free-1},
-                 theta_0,...,theta_{n_res-1}]
-        real_0=1.0, imag_0=0.0 为固定参考振幅。
-        seed=42 时共振态参数取 PDG 初值；seed>42 时在 bounds 内加 10% 噪声。
+        seed<=42 时共振态参数取 PDG 初值；seed>42 时在 bounds 内加 _RES_NOISE_FRAC 噪声。
         """
-        free_res_info = self._free_res_info
-        n_coupling_free = self.n_coupling_free
-        device = self.device
-
-        n_res = free_res_info.shape[1]
-        n_total = 2 * n_coupling_free + n_res
-        params = torch.zeros(n_total, dtype=torch.float64, device=device)
-
-        torch.manual_seed(seed)
-
-        # 耦合实部
-        params[0] = 1.0  # 固定参考
-        nvar = n_coupling_free - 1
-        if nvar > 0:
-            # 一次性抽随机数再向量化赋值（保持旧 RNG 抽样顺序: 先全部 re, 再全部 im；
-            # 每个耦合 = amp, phase 两个数）
-            r_re = torch.rand(2 * nvar, device=device).double()
-            r_im = torch.rand(2 * nvar, device=device).double()
-            amp_re, ph_re = r_re[0::2] * 0.5, r_re[1::2] * 2 * torch.pi
-            amp_im, ph_im = r_im[0::2] * 0.5, r_im[1::2] * 2 * torch.pi
-            params[1:n_coupling_free] = amp_re * torch.cos(ph_re)
-            params[n_coupling_free] = 0.0  # 固定参考
-            params[n_coupling_free + 1 : 2 * n_coupling_free] = amp_im * torch.sin(
-                ph_im
-            )
-        else:
-            params[n_coupling_free] = 0.0  # 固定参考
-
-        # 共振态参数
-        if n_res > 0:
-            init_vals = free_res_info[0].to(device=device, dtype=torch.float64)
-            if seed > 42:
-                torch.manual_seed(seed)
-                lower = free_res_info[1].to(device=device, dtype=torch.float64)
-                upper = free_res_info[2].to(device=device, dtype=torch.float64)
-                noise = (
-                    (torch.rand(n_res, device=device, dtype=torch.float64) - 0.5)
-                    * 0.1
-                    * (upper - lower)
-                )
-                init_vals = torch.clamp(
-                    init_vals + noise,
-                    lower + 1e-7 * (upper - lower),
-                    upper - 1e-7 * (upper - lower),
-                )
-            params[2 * n_coupling_free :] = init_vals
-
+        params = _generate_initial_params(
+            self.n_coupling_free, self._free_res_info, seed, self.device
+        )
         print(
-            f"生成初始参数 (seed={seed}): n_coupling={n_coupling_free}, n_res={n_res}"
+            f"生成初始参数 (seed={seed}): n_coupling={self.n_coupling_free}, "
+            f"n_res={self.n_res_free}"
         )
         return params
 
@@ -863,7 +910,7 @@ class UnifiedPWAOptimizer:
         return nll, grad
 
     # --------------------------------------------------------
-    def bounds(self, like):
+    def bounds(self, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """构造 [lo, hi] 盒约束（与 params 同 device/dtype）。
         固定参数（re_0=1, im_0=0）用 lo==hi 表示。
         """
@@ -881,14 +928,14 @@ class UnifiedPWAOptimizer:
     # --------------------------------------------------------
     def optimize_single_run(
         self,
-        initial_params,
-        run_id=0,
-        max_iter=500,
-        lr=1.0,
-        tolerance_grad=1e-8,
-        tolerance_change=1e-10,
-        history_size=100,
-    ):
+        initial_params: torch.Tensor,
+        run_id: int = 0,
+        max_iter: int = 500,
+        lr: float = 1.0,
+        tolerance_grad: float = 1e-8,
+        tolerance_change: float = 1e-10,
+        history_size: int = 100,
+    ) -> "RunResult":
         """单次优化"""
         params = initial_params.clone().detach().requires_grad_(True)
         nll_history = []
@@ -1119,7 +1166,7 @@ class UnifiedPWAOptimizer:
         return result
 
     # --------------------------------------------------------
-    def _project_params_(self, p):
+    def _project_params(self, p):
         """把参数向量投影回可行域（固定参考 + 耦合 ±v_max + 共振态 bounds）"""
         with torch.no_grad():
             p.data[0] = 1.0
@@ -1159,7 +1206,7 @@ class UnifiedPWAOptimizer:
         相对旧版的四点改动（旧版在强不定 H 上会"巨步→拒绝→微步"空转，40 步烧完
         只前进一点点）:
           1. **活跃集**: 贴边且下降方向朝外的坐标从 Newton 系统里剔除，
-             不再被 _project_params_ 夹回而毁掉整个下降方向；
+             不再被 _project_params 夹回而毁掉整个下降方向；
           2. **缩放阻尼** H + λ·diag(H)（Marquardt），替代 H + λI —— 等量 λ 对
              耦合块(~1e2)与质量/宽度块(~1e4)尺度差两个数量级，会把好方向一起压死；
           3. λ 用 **gain-ratio** 自适应 + **Armijo** 回溯，替代 accept/reject×10；
@@ -1190,7 +1237,7 @@ class UnifiedPWAOptimizer:
         mask[nc] = False
 
         x = params_phys.clone().detach()
-        self._project_params_(x)
+        self._project_params(x)
         lo, hi = self.bounds(x)
         w = (hi - lo).clamp(min=1e-30)
         n_evals = [0]  # 归因用: polish 内部求值次数
@@ -1222,7 +1269,7 @@ class UnifiedPWAOptimizer:
             pg = pg_of(x, g)
             if not bool(free.any()):
                 if verbose:
-                    print(f"[polish] step{step}: 全部为活跃约束 → KKT")
+                    log.info(f"[polish] step{step}: 全部为活跃约束 → KKT")
                 break
             pg_inf = pg[free].abs().max().item()
 
@@ -1235,7 +1282,7 @@ class UnifiedPWAOptimizer:
 
             if pg_inf <= gtol and at_min:
                 if verbose:
-                    print(
+                    log.info(
                         f"[polish] step{step}: 真局部极小 |pg|={pg_inf:.2e}, "
                         f"active={int(act.sum())}"
                     )
@@ -1262,7 +1309,7 @@ class UnifiedPWAOptimizer:
                 for sgn in (1.0, -1.0):
                     cand = x.clone()
                     cand[free] = x[free] + sgn * base * v
-                    self._project_params_(cand)
+                    self._project_params(cand)
                     if use_amp_cap and _max_amp(cand) > amp_cap:
                         continue
                     fn, gn = fg(cand)
@@ -1274,7 +1321,7 @@ class UnifiedPWAOptimizer:
                 if cand_best[0] < f - max(tol, 0.0):
                     f, x, g = cand_best[0], cand_best[1], cand_best[2]
                     if verbose:
-                        print(
+                        log.info(
                             f"[polish] step{step}: 负曲率逃逸 "
                             f"(λmin/λmax={ev_all[0].item() / lmax_all.item():.2e}) "
                             f"→ NLL={f:.6f}"
@@ -1318,7 +1365,7 @@ class UnifiedPWAOptimizer:
                 for _ in range(30):  # Armijo 回溯
                     cand = x.clone()
                     cand[free] = x[free] + t * d
-                    self._project_params_(cand)
+                    self._project_params(cand)
                     if use_amp_cap and _max_amp(cand) > amp_cap:
                         t *= 0.5
                         continue
@@ -1340,7 +1387,7 @@ class UnifiedPWAOptimizer:
                     break
             if not accepted:
                 if verbose:
-                    print(
+                    log.info(
                         f"[polish] step{step}: stall (λ={lam:.1e}, |pg|={pg_inf:.2e}, "
                         f"active={int(act.sum())})"
                     )
@@ -1349,7 +1396,7 @@ class UnifiedPWAOptimizer:
             df = f - fn
             x, f, g = cand, fn, gn
             if verbose:
-                print(
+                log.info(
                     f"[polish] step{step}: λ={lam:.2e} α={t:.2e} ΔNLL={-df:+.4f} "
                     f"|pg|={pg_inf:.2e} active={int(act.sum())} maxA={_max_amp(x):.3e}"
                 )
@@ -1360,7 +1407,7 @@ class UnifiedPWAOptimizer:
                 tiny_streak += 1
                 if tiny_streak >= patience:
                     if verbose:
-                        print(
+                        log.info(
                             f"[polish] stop: 噪声底 (连续 {tiny_streak} 步 ΔNLL<{floor_tol})"
                         )
                     break
@@ -1393,7 +1440,7 @@ class UnifiedPWAOptimizer:
         # 播种缓存: 抛光终点的 Hessian 供误差/分支比复用
         self._hess_cache = (x.clone(), H_final)
         if verbose:
-            print(
+            log.info(
                 f"[polish] done: NLL={f:.6f}, PD(free)={pd}, "
                 f"λmin={eig_f[0].item():.3e} λmax={lmax.item():.3e} "
                 f"λmin/λmax={ratio:.2e}, "
@@ -1401,7 +1448,7 @@ class UnifiedPWAOptimizer:
                 f"steps={n_step}"
             )
             if not bool(free.any()):
-                print(
+                log.info(
                     "[polish] 注意: 所有自由方向都是活跃约束 → "
                     "参数误差无定义，只能报单侧限制"
                 )
@@ -1423,7 +1470,13 @@ class UnifiedPWAOptimizer:
         return h
 
     # --------------------------------------------------------
-    def _errors_from_hessian(self, hessian_full, params_phys, mode=None, tau=None):
+    def _errors_from_hessian(
+        self,
+        hessian_full: torch.Tensor,
+        params_phys: torch.Tensor,
+        mode: Optional[str] = None,
+        tau: Optional[float] = None,
+    ) -> "ErrDict":
         """从统一 Hessian 求参数误差（含非正定回退 auto/pinv/psd）。
 
         与 polish 共用「非活跃子空间」判据：去掉固定参考(0/nc) + 活跃集剔除，
@@ -1715,7 +1768,7 @@ class UnifiedPWAOptimizer:
         )
 
     # --------------------------------------------------------
-    def extract_coupling_complex(self, params):
+    def extract_coupling_complex(self, params: torch.Tensor) -> torch.Tensor:
         """提取复数耦合向量，dtype 匹配 .so 精度。
 
         优先用 `ctpwa.DeviceManager().compiledPrecision()`（double→complex128 /
@@ -1731,7 +1784,7 @@ class UnifiedPWAOptimizer:
             return torch.complex(real.double(), imag.double())
         return torch.complex(real.float(), imag.float())
 
-    def extract_theta_phys(self, params):
+    def extract_theta_phys(self, params: torch.Tensor) -> Optional[torch.Tensor]:
         """从统一参数中提取共振态物理参数"""
         if not self.has_free_res:
             return None
@@ -2360,19 +2413,19 @@ class UnifiedPWAOptimizer:
 # ============================================================
 # CLI 参数解析
 # ============================================================
-def _env_float(name, default):
+def _env_float(name: str, default: Optional[float]) -> Optional[float]:
     """从环境变量读 float，不存在则返回 default。"""
     v = os.environ.get(name)
     return float(v) if v is not None else default
 
 
-def _env_int(name, default):
+def _env_int(name: str, default: Optional[int]) -> Optional[int]:
     """从环境变量读 int，不存在则返回 default。"""
     v = os.environ.get(name)
     return int(v) if v is not None else default
 
 
-def _env_bool(name, default):
+def _env_bool(name: str, default: bool) -> bool:
     """从环境变量读 bool（"1"/"true"/"yes" → True），不存在则返回 default。"""
     v = os.environ.get(name)
     if v is None:
@@ -2380,12 +2433,12 @@ def _env_bool(name, default):
     return v.lower() in ("1", "true", "yes")
 
 
-def _env_str(name, default=""):
+def _env_str(name: str, default: str = "") -> str:
     """从环境变量读字符串，不存在则返回 default。"""
     return os.environ.get(name, default)
 
 
-def _str2bool(v):
+def _str2bool(v: str) -> bool:
     """argparse 类型：把 "True"/"False"（大小写不敏感，也接受 1/0）转成 bool。"""
     s = str(v).strip().lower()
     if s in ("1", "true", "t", "yes", "y"):
@@ -2662,8 +2715,67 @@ def build_parser():
     return p
 
 
+# ============================================================
+# 最终配置：FitConfig
+# ============================================================
+@dataclass
+class FitConfig(Mapping):
+    """`resolve_args` 的返回类型：既有字段访问，也保留 dict 接口。
+
+    实现 Mapping 以兼容历史调用方式 `cfg["key"]` / `cfg.get("key")`（大量存在）；
+    新增字段请同步更新本类，否则 `FitConfig(**cfg)` 会报缺失/多余键。
+    """
+
+    num_runs: int
+    max_iter: int
+    lr: float
+    tolerance_grad: float
+    tolerance_change: float
+    history_size: int
+    v_max: float
+    project_grad: bool
+    optimizer_kind: str
+    amp_max: float
+    amp_lambda: float
+    err_mode: str
+    err_tau: float
+    polish: bool
+    warm_start_path: Optional[str]
+    waves: list
+    event_data: bool
+    checkpoint_interval: int
+    resume: bool
+    ff_only: bool
+    cal_ff: bool
+    cal_eff: bool
+    seed: Optional[int]
+    seed_auto: bool
+    config: str
+    verbose: int
+    quiet: bool
+    output_dir: str
+
+    def __getitem__(self, key: str) -> Any:
+        try:
+            return getattr(self, key)
+        except AttributeError as e:
+            raise KeyError(key) from e
+
+    def __iter__(self):
+        return iter(self.__dataclass_fields__)
+
+    def __len__(self) -> int:
+        return len(self.__dataclass_fields__)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def keys(self):
+        return self.__dataclass_fields__.keys()
+
+
 def resolve_args(args):
-    """将 argparse Namespace 与环境变量合并，返回最终配置 dict。
+    """将 argparse Namespace 与环境变量合并，返回最终配置 FitConfig。
     优先级: CLI 显式传入 > FIT_* 环境变量 > 硬编码默认值。"""
     cfg = {}
 
@@ -2732,13 +2844,11 @@ def resolve_args(args):
     # warm start
     if args.warm_start is not None:
         if args.warm_start == "auto":
-            cfg["warm_start_path"] = os.path.join(
-                cfg.get("_output_dir", "results"), "best_params.pt"
-            )
+            cfg["warm_start_path"] = os.path.join(args.output_dir, "best_params.pt")
         else:
             cfg["warm_start_path"] = args.warm_start
     elif _env_bool("FIT_WARM", False):
-        cfg["warm_start_path"] = os.path.join("results", "best_params.pt")
+        cfg["warm_start_path"] = os.path.join(args.output_dir, "best_params.pt")
     else:
         cfg["warm_start_path"] = None
 
@@ -2777,7 +2887,7 @@ def resolve_args(args):
     cfg["quiet"] = args.quiet
     cfg["output_dir"] = args.output_dir
 
-    return cfg
+    return FitConfig(**cfg)
 
 
 # ============================================================
@@ -2798,6 +2908,48 @@ def _setup_logging(verbose, quiet):
         format="%(levelname)-5s %(message)s",
         stream=sys.stdout,  # 日志也进 stdout(.log)：避免只看 .log 时漏掉警告/异常栈
         force=True,  # 覆盖可能已有的 basicConfig
+    )
+
+
+def _determine_base_seed(
+    resume_from: Optional[dict],
+    cli_seed: Optional[int],
+    now: Optional[int] = None,
+) -> tuple[int, str, list]:
+    """决定随机初值 base seed。
+
+    优先级: checkpoint(续跑) > CLI/env > 当前时间(now 缺省 time.time())。
+    返回 (base_seed, 来源, warnings)；warnings 由调用方 log。
+    """
+    warnings = []
+    if resume_from is not None and resume_from.get("seed") is not None:
+        base = int(resume_from["seed"])
+        if cli_seed is not None and int(cli_seed) != base:
+            warnings.append(
+                f"--resume: 以 checkpoint 的 seed={base} 为准，"
+                f"忽略 --seed/FIT_SEED={cli_seed}"
+            )
+        return base, "checkpoint", warnings
+    if cli_seed is not None:
+        return int(cli_seed), "--seed/FIT_SEED", warnings
+    if resume_from is not None:
+        warnings.append(
+            "checkpoint 未记录 seed（旧版本）→ 续跑用当前时间，"
+            "随机初值可能与上一段不一致"
+        )
+    return int(time.time() if now is None else now), "当前时间", warnings
+
+
+def _seed_message(base_seed: int, src: str) -> str:
+    """构造可复现提示（seed 来源为当前时间时附带可读时间）。"""
+    when = (
+        f"，{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(base_seed))}"
+        if src == "当前时间"
+        else ""
+    )
+    return (
+        f"[seed] base seed={base_seed}（来源: {src}{when}）; "
+        f"run i 的 seed = base+i; 复现本作业请加 --seed {base_seed}"
     )
 
 
@@ -2912,35 +3064,12 @@ def main():
     # ---- 随机初值 base seed: CLI/env > checkpoint(续跑) > 当前时间 ----
     base_seed = None
     if not cfg["ff_only"]:
-        _cli_seed = cfg["seed"]
-        if resume_from is not None and resume_from.get("seed") is not None:
-            base_seed = int(resume_from["seed"])
-            _src = "checkpoint"
-            if _cli_seed is not None and int(_cli_seed) != base_seed:
-                log.warning(
-                    f"--resume: 以 checkpoint 的 seed={base_seed} 为准，"
-                    f"忽略 --seed/FIT_SEED={_cli_seed}"
-                )
-        elif _cli_seed is not None:
-            base_seed = int(_cli_seed)
-            _src = "--seed/FIT_SEED"
-        else:
-            base_seed = int(time.time())
-            _src = "当前时间"
-            if resume_from is not None:
-                log.warning(
-                    "checkpoint 未记录 seed（旧版本）→ 续跑用当前时间，"
-                    "随机初值可能与上一段不一致"
-                )
-        _when = (
-            f"，{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(base_seed))}"
-            if _src == "当前时间"
-            else ""
+        base_seed, _seed_src, _seed_warns = _determine_base_seed(
+            resume_from, cfg["seed"]
         )
-        print(
-            f"[seed] base seed={base_seed}（来源: {_src}{_when}）; "
-            f"run i 的 seed = base+i; 复现本作业请加 --seed {base_seed}"
-        )
+        for _w in _seed_warns:
+            log.warning(_w)
+        print(_seed_message(base_seed, _seed_src))
 
     if cfg["ff_only"]:
         # ---- --ff-only: 跳过拟合与 polish，直接用最佳参数算 FF/效率 ----
@@ -3070,7 +3199,7 @@ def main():
                 ) = optimizer.compute_param_errors(best_res["final_params"])
                 best_res["polish_status"] = "ok"
             except Exception as e:
-                # 不要静默：打印完整 traceback，并在状态里标注失败（上游教训：宽 except
+                # 不要静默：打印完整 traceback，并在状态里标注失败（宽 except
                 # 曾把 polish 的 TypeError 吞成"抛光失败"却无人察觉）
                 best_res["polish_status"] = f"failed({type(e).__name__})"
                 log.exception(f"抛光失败: {e}")
