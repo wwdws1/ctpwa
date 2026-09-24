@@ -2644,6 +2644,7 @@ def _setup_logging(verbose, quiet):
     logging.basicConfig(
         level=level,
         format="%(levelname)-5s %(message)s",
+        stream=sys.stdout,  # 日志也进 stdout(.log)：避免只看 .log 时漏掉警告/异常栈
         force=True,  # 覆盖可能已有的 basicConfig
     )
 
