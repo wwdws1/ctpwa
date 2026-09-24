@@ -190,6 +190,7 @@ python fit.py --optimizer projected --runs 5
 | `--tol-grad` | 梯度收敛阈值 | 1e-5 | `FIT_TOL_GRAD` | 全部 |
 | `--tol-change` | 参数变化收敛阈值 | 1e-5 | `FIT_TOL_CHANGE` | reparam / lbfgs |
 | `--history-size` | LBFGS history 大小 | 200 | `FIT_HISTORY_SIZE` | 全部 |
+| `--seed` | 随机初值 base seed（run i 用 `seed+i`）。**默认取当前 Unix 时间戳**→每次随机；要复现就用日志 `[seed]` 行打印的值 | 当前时间 | `FIT_SEED` | 全部 |
 
 ### 约束 / 数值稳定
 | 参数 | 说明 | 默认 | 环境变量 | 适用优化器 |
@@ -255,7 +256,7 @@ python fit.py --optimizer projected --runs 5
 FIT_RUNS  FIT_NITER  FIT_LR  FIT_TOL_GRAD  FIT_TOL_CHANGE  FIT_HISTORY_SIZE
 FIT_VMAX  FIT_AMP_MAX  FIT_AMP_LAMBDA  FIT_PROJECT  FIT_OPTIMIZER  FIT_OPT_VERBOSE
 FIT_ERR_MODE  FIT_ERR_TAU  FIT_POLISH  FIT_WARM  FIT_WAVES  FIT_EVENT_DATA
-FIT_CHECKPOINT_INTERVAL
+FIT_CHECKPOINT_INTERVAL  FIT_SEED
 # 诊断 / 复现实验 / projected A/B 开关（默认=当前行为，一般不用设）：
 FIT_OPT_PROF  FIT_DETERMINISTIC  FIT_OPT_M  FIT_OPT_TWOLOOP  FIT_OPT_HONEST
 FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
@@ -282,14 +283,26 @@ FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
 | `nll_history.txt` | 每个 run 的逐次求值 NLL 曲线 |
 | `optimization_summary.txt` | 各 run 的 NLL / 迭代 / **eval数 / n_iter** / 耗时 / 正定性 / **误差模式 / 平坦维** / 优化器状态，及最佳解 |
 | `best_params.pt` | 最佳参数（供 warm start） |
-| `checkpoint.pt` | 续跑状态（`--resume` 用） |
+| `checkpoint.pt` | 续跑状态（`--resume` 用；含 base seed） |
 | `weight_best.root` | 最佳解的权重文件（供 `plot.py` 画图） |
+| `param_covariance.csv` | **最佳点**的参数协方差矩阵（完整 N×N，`--err-mode` 回退口径） |
+| `param_correlation.csv` | **最佳点**的参数关联系数矩阵 `ρ_ij=C_ij/(σ_iσ_j)`（完整 N×N；`σ=0` 处置 `nan`） |
+
+> 参数协方差/相关矩阵只在**正常拟合**时输出（`--ff-only` 不输出），且只对 **best** 点；
+> log 里有一行 `[param-err] 参数协方差/相关矩阵已保存: ...` 提醒。矩阵覆盖**全部非固定参数**
+> （排除固定参考 `idx 0/nc`，含贴边 `active`）。因本模型常见 `PD=False`、`err_mode=auto→pinv`，
+> 这是**秩亏下的可行估计、非严格统计误差**（CSV 头部亦有注明）。
 
 > `plot.py` 另外生成 `results_plot.pdf` 等图形，不属于 `fit.py`。
 
 > 多起点（`--runs N`）结束时终端会打印一行 `[ensemble]`：`n / best / median / IQR / std /
 > worst`。前向 NLL 有数值混沌，**比较不同优化器/配置时请看中位数/IQR 而非单次 NLL**
 > （差异需大于系综 std 才可信）；详见 §3.5 备注。
+
+> **随机初值 seed**：启动时打印一行 `[seed] base seed=...; run i 的 seed = base+i; 复现本作业请加 --seed ...`。
+> 默认 `base seed = 当前 Unix 时间戳`（每次作业不同）；要复现/要同 seed 系综对比，用日志里的值
+> 加 `--seed <base>`（或用 `FIT_SEED`）。`--seed 42` 等价于旧的固定 `42,43,44,…`。`--resume`
+> 以 `checkpoint.pt` 内记录的 seed 为准。
 
 ---
 

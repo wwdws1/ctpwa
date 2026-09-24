@@ -3,6 +3,7 @@ import numpy as np
 import time
 import os
 import sys
+import csv
 import argparse
 import logging
 import ctpwa
@@ -1455,6 +1456,9 @@ class UnifiedPWAOptimizer:
             "min_eig": float("nan"),
             "max_eig": float("nan"),
             "cond_num": float("nan"),
+            "cov": None,
+            "cov_labels": None,
+            "cov_mode": None,
         }
 
         fixed_mask = torch.ones(self.n_params, dtype=torch.bool, device=self.device)
@@ -1556,6 +1560,31 @@ class UnifiedPWAOptimizer:
             f"flat(λ<τ·λmax)={n_flat}/{len(eig)}, "
             f"active={int(active_full.sum())}, keep={int(keep.sum())}"
         )
+
+        # ---- 参数协方差矩阵（tf-pwa 口径）: 在**全部非固定参数** red 子空间上，
+        # 含贴边 active（不额外剔除），供 save_param_matrices 输出 CSV。
+        # 注意: 既有对角误差走 keep（剔除 active）；active=0 时两者一致。
+        try:
+            eig_r, vec_r = torch.linalg.eigh(H_red)
+            lmax_r = eig_r[-1].abs().clamp(min=1e-30)
+            if eff == "inv" and bool(eig_r[0] > tau * lmax_r):
+                cov_r = (vec_r * (1.0 / eig_r)) @ vec_r.t()
+                cov_mode = "inv"
+            elif eff == "psd":
+                _eig2 = torch.clamp(eig_r, min=tau * lmax_r)
+                cov_r = (vec_r * (1.0 / _eig2)) @ vec_r.t()
+                cov_mode = "psd"
+            else:  # pinv
+                _inv = torch.where(
+                    eig_r > tau * lmax_r, 1.0 / eig_r, torch.zeros_like(eig_r)
+                )
+                cov_r = (vec_r * _inv) @ vec_r.t()
+                cov_mode = "pinv"
+            out["cov"] = cov_r
+            out["cov_labels"] = [_label(int(j)) for j in red_idx.tolist()]
+            out["cov_mode"] = cov_mode
+        except Exception as e:
+            log.exception(f"参数协方差矩阵构造失败: {e}")
 
         n_c_var = nc - 1
         coupling_real_errors = torch.full(
@@ -1868,6 +1897,74 @@ class UnifiedPWAOptimizer:
             return False
 
     # --------------------------------------------------------
+    def save_param_matrices(self, err, output_dir="results"):
+        """把参数协方差/关联系数矩阵写成完整 N×N CSV（tf-pwa 口径）。
+
+        数据来自 `_errors_from_hessian` 的 `cov`（全部非固定参数 red 子空间，含 active）。
+        - `param_covariance.csv`：协方差 C_ij（物理参数基，Re/Im c、θ）。
+        - `param_correlation.csv`：ρ_ij = C_ij/(σ_i σ_j)；σ=0/NaN 处置 NaN
+          （pinv 丢掉的平坦方向即如此）。
+        首行/首列带参数标签；log 只打印一行提醒（不打印矩阵内容）。
+        非正定回退下的协方差是秩亏下的**可行估计、非严格统计误差**。
+        """
+        cov = err.get("cov")
+        labels = err.get("cov_labels")
+        if cov is None or labels is None:
+            log.warning(
+                "参数协方差矩阵不可用（err_mode=strict 非正定或求逆失败）→ 不输出矩阵"
+            )
+            return False
+        try:
+            cov_np = cov.detach().cpu().numpy().astype(float, copy=False)
+            n = cov_np.shape[0]
+            sd = np.sqrt(np.clip(np.diag(cov_np), 0.0, None))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                inv_sd = np.where(sd > 0, 1.0 / sd, np.nan)
+                corr_np = cov_np * inv_sd[:, None] * inv_sd[None, :]
+            header = (
+                f"# 参数协方差/相关矩阵（完整 {n}x{n}）\n"
+                f"# err_mode={err.get('mode_used')} (请求 {self.err_mode}), "
+                f"τ={self.err_tau:.1e}\n"
+                f"# λmin={err.get('min_eig'):.3e}, λmax={err.get('max_eig'):.3e}, "
+                f"flat(λ<τλmax)={err.get('n_flat')}\n"
+                f"# 子空间=全部非固定参数（排除固定参考 idx 0/{self.n_coupling_free}；"
+                f"含贴边 active）\n"
+                f"# 秩亏/非正定回退下的可行估计，非严格统计误差\n"
+            )
+            cov_file = os.path.join(output_dir, "param_covariance.csv")
+            corr_file = os.path.join(output_dir, "param_correlation.csv")
+            with open(cov_file, "w", newline="") as f:
+                f.write(header)
+                f.write("# covariance\n")
+                w = csv.writer(f)
+                w.writerow(["param"] + list(labels))
+                for i, lab in enumerate(labels):
+                    w.writerow([lab] + [f"{cov_np[i, j]:.6e}" for j in range(n)])
+            with open(corr_file, "w", newline="") as f:
+                f.write(header)
+                f.write("# correlation\n")
+                w = csv.writer(f)
+                w.writerow(["param"] + list(labels))
+                for i, lab in enumerate(labels):
+                    w.writerow(
+                        [lab]
+                        + [
+                            f"{corr_np[i, j]:.6e}"
+                            if np.isfinite(corr_np[i, j])
+                            else "nan"
+                            for j in range(n)
+                        ]
+                    )
+            log.info(
+                f"[param-err] 参数协方差/相关矩阵已保存: {cov_file}, {corr_file}"
+                f"（{n}x{n}，完整矩阵；秩亏下的可行估计、非严格统计误差）"
+            )
+            return True
+        except Exception as e:
+            log.exception(f"保存参数矩阵失败: {e}")
+            return False
+
+    # --------------------------------------------------------
     def save_nll_history(self, nll_history, run_id, filename_base):
         try:
             txt_filename = f"{filename_base}.txt"
@@ -1929,6 +2026,7 @@ class UnifiedPWAOptimizer:
         output_dir="results",
         checkpoint_interval=1,
         resume_from=None,
+        seed=None,
         **kwargs,
     ):
         """多次优化运行。
@@ -1937,6 +2035,7 @@ class UnifiedPWAOptimizer:
             checkpoint_interval: 每 N 轮保存一次 checkpoint（默认 1 = 每轮都存）。
             resume_from: dict，含 'start_run' 和 'all_nlls' 等续跑状态；
                          None 则从头开始。
+            seed: 随机初值 base seed；run i 用 seed+i（None → 42，兼容旧行为）。
         """
         results = []
         os.makedirs(output_dir, exist_ok=True)
@@ -1961,8 +2060,8 @@ class UnifiedPWAOptimizer:
             print(f"开始第 {i}/{num_runs - 1} 次优化")
             print(f"{'=' * 80}")
 
-            seed = 42 if i == 0 else 42 + i
-            initial_params = self.generate_initial_params(seed=seed)
+            run_seed = (seed if seed is not None else 42) + i
+            initial_params = self.generate_initial_params(seed=run_seed)
             # warm start: run 0 从收敛解出发（耦合 + 共振态参数都带上，并夹回本
             # 轮 config 的范围内）。实测: 随机初值 + 放开共振态参数时优化器会沿
             # 平坦方向放飞（NLL 正值/贴边界）；从已收敛解出发则稳定、且这就是
@@ -2033,6 +2132,7 @@ class UnifiedPWAOptimizer:
                             if self.best_params is not None
                             else None,
                             "all_nlls": [r["final_nll"] for r in self.all_results],
+                            "seed": seed,
                         },
                         resume_file,
                     )
@@ -2495,6 +2595,14 @@ def build_parser():
         help="是否计算分波效率（默认 False；大 phsp/phsp_truth 上可能 C++ 崩溃，"
         "建议配小样本 config + --ff-only 使用）",
     )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        metavar="<int>",
+        help="随机初值 base seed（run i 用 seed+i；默认取当前 Unix 时间戳 → 每次随机，"
+        "日志会打印可复现命令）(env: FIT_SEED)",
+    )
 
     # --- Warm start ---
     p.add_argument(
@@ -2660,6 +2768,10 @@ def resolve_args(args):
     )
     cfg["cal_ff"] = args.cal_ff
     cfg["cal_eff"] = args.cal_eff
+    # 随机初值 base seed: CLI --seed > FIT_SEED > None(由 main 取当前时间)
+    _seed = args.seed if args.seed is not None else _env_int("FIT_SEED", None)
+    cfg["seed"] = _seed
+    cfg["seed_auto"] = _seed is None
     cfg["config"] = args.config
     cfg["verbose"] = args.verbose
     cfg["quiet"] = args.quiet
@@ -2797,6 +2909,39 @@ def main():
     elif ws_path:
         log.warning(f"Warm start 文件不存在: {ws_path}，使用随机初值")
 
+    # ---- 随机初值 base seed: CLI/env > checkpoint(续跑) > 当前时间 ----
+    base_seed = None
+    if not cfg["ff_only"]:
+        _cli_seed = cfg["seed"]
+        if resume_from is not None and resume_from.get("seed") is not None:
+            base_seed = int(resume_from["seed"])
+            _src = "checkpoint"
+            if _cli_seed is not None and int(_cli_seed) != base_seed:
+                log.warning(
+                    f"--resume: 以 checkpoint 的 seed={base_seed} 为准，"
+                    f"忽略 --seed/FIT_SEED={_cli_seed}"
+                )
+        elif _cli_seed is not None:
+            base_seed = int(_cli_seed)
+            _src = "--seed/FIT_SEED"
+        else:
+            base_seed = int(time.time())
+            _src = "当前时间"
+            if resume_from is not None:
+                log.warning(
+                    "checkpoint 未记录 seed（旧版本）→ 续跑用当前时间，"
+                    "随机初值可能与上一段不一致"
+                )
+        _when = (
+            f"，{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(base_seed))}"
+            if _src == "当前时间"
+            else ""
+        )
+        print(
+            f"[seed] base seed={base_seed}（来源: {_src}{_when}）; "
+            f"run i 的 seed = base+i; 复现本作业请加 --seed {base_seed}"
+        )
+
     if cfg["ff_only"]:
         # ---- --ff-only: 跳过拟合与 polish，直接用最佳参数算 FF/效率 ----
         best_path = ws_path if ws_path else os.path.join(output_dir, "best_params.pt")
@@ -2855,6 +3000,7 @@ def main():
             output_dir=output_dir,
             checkpoint_interval=cfg["checkpoint_interval"],
             resume_from=resume_from,
+            seed=base_seed,
         )
 
         # ---- 分析结果 ----
@@ -2955,6 +3101,17 @@ def main():
             best_res["final_params"], run_id=best_res["run_id"]
         )
     print(f"{'=' * 80}")
+
+    # ---- 参数协方差/相关矩阵 CSV（tf-pwa 口径；仅正常拟合输出，--ff-only 不输出）----
+    if not cfg["ff_only"]:
+        try:
+            _hess_best = optimizer._get_hessian_cached(best_res["final_params"])
+            _err_best = optimizer._errors_from_hessian(
+                _hess_best, best_res["final_params"]
+            )
+            optimizer.save_param_matrices(_err_best, write_dir)
+        except Exception as e:
+            log.exception(f"输出参数协方差/相关矩阵失败: {e}")
 
     # ---- 保存最佳权重文件（--ff-only 且已存在则跳过：参数未变，root 与上次相同）----
     best_weight_file = os.path.join(write_dir, "weight_best.root")
