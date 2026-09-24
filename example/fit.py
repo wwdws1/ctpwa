@@ -1436,6 +1436,7 @@ class UnifiedPWAOptimizer:
             # 自由子空间为空: 全部方向都是活跃约束 —— 空矩阵是"正定"的（虚真），
             # 但该点上的参数误差无定义（这些参数只由边界决定）
             eig_f = torch.zeros(1, dtype=torch.float64, device=dev)
+            lmax = eig_f[-1].abs().clamp(min=1e-30)  # 供下方 verbose 日志使用
             pd, ratio = True, float("nan")
         # 播种缓存: 抛光终点的 Hessian 供误差/分支比复用
         self._hess_cache = (x.clone(), H_final)
