@@ -1119,7 +1119,7 @@ class UnifiedPWAOptimizer:
         return result
 
     # --------------------------------------------------------
-    def _project_params_(self, p):
+    def _project_params(self, p):
         """把参数向量投影回可行域（固定参考 + 耦合 ±v_max + 共振态 bounds）"""
         with torch.no_grad():
             p.data[0] = 1.0
@@ -1159,7 +1159,7 @@ class UnifiedPWAOptimizer:
         相对旧版的四点改动（旧版在强不定 H 上会"巨步→拒绝→微步"空转，40 步烧完
         只前进一点点）:
           1. **活跃集**: 贴边且下降方向朝外的坐标从 Newton 系统里剔除，
-             不再被 _project_params_ 夹回而毁掉整个下降方向；
+             不再被 _project_params 夹回而毁掉整个下降方向；
           2. **缩放阻尼** H + λ·diag(H)（Marquardt），替代 H + λI —— 等量 λ 对
              耦合块(~1e2)与质量/宽度块(~1e4)尺度差两个数量级，会把好方向一起压死；
           3. λ 用 **gain-ratio** 自适应 + **Armijo** 回溯，替代 accept/reject×10；
@@ -1190,7 +1190,7 @@ class UnifiedPWAOptimizer:
         mask[nc] = False
 
         x = params_phys.clone().detach()
-        self._project_params_(x)
+        self._project_params(x)
         lo, hi = self.bounds(x)
         w = (hi - lo).clamp(min=1e-30)
         n_evals = [0]  # 归因用: polish 内部求值次数
@@ -1262,7 +1262,7 @@ class UnifiedPWAOptimizer:
                 for sgn in (1.0, -1.0):
                     cand = x.clone()
                     cand[free] = x[free] + sgn * base * v
-                    self._project_params_(cand)
+                    self._project_params(cand)
                     if use_amp_cap and _max_amp(cand) > amp_cap:
                         continue
                     fn, gn = fg(cand)
@@ -1318,7 +1318,7 @@ class UnifiedPWAOptimizer:
                 for _ in range(30):  # Armijo 回溯
                     cand = x.clone()
                     cand[free] = x[free] + t * d
-                    self._project_params_(cand)
+                    self._project_params(cand)
                     if use_amp_cap and _max_amp(cand) > amp_cap:
                         t *= 0.5
                         continue
