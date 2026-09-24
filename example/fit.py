@@ -2911,6 +2911,48 @@ def _setup_logging(verbose, quiet):
     )
 
 
+def _determine_base_seed(
+    resume_from: Optional[dict],
+    cli_seed: Optional[int],
+    now: Optional[int] = None,
+) -> tuple[int, str, list]:
+    """决定随机初值 base seed。
+
+    优先级: checkpoint(续跑) > CLI/env > 当前时间(now 缺省 time.time())。
+    返回 (base_seed, 来源, warnings)；warnings 由调用方 log。
+    """
+    warnings = []
+    if resume_from is not None and resume_from.get("seed") is not None:
+        base = int(resume_from["seed"])
+        if cli_seed is not None and int(cli_seed) != base:
+            warnings.append(
+                f"--resume: 以 checkpoint 的 seed={base} 为准，"
+                f"忽略 --seed/FIT_SEED={cli_seed}"
+            )
+        return base, "checkpoint", warnings
+    if cli_seed is not None:
+        return int(cli_seed), "--seed/FIT_SEED", warnings
+    if resume_from is not None:
+        warnings.append(
+            "checkpoint 未记录 seed（旧版本）→ 续跑用当前时间，"
+            "随机初值可能与上一段不一致"
+        )
+    return int(time.time() if now is None else now), "当前时间", warnings
+
+
+def _seed_message(base_seed: int, src: str) -> str:
+    """构造可复现提示（seed 来源为当前时间时附带可读时间）。"""
+    when = (
+        f"，{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(base_seed))}"
+        if src == "当前时间"
+        else ""
+    )
+    return (
+        f"[seed] base seed={base_seed}（来源: {src}{when}）; "
+        f"run i 的 seed = base+i; 复现本作业请加 --seed {base_seed}"
+    )
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -3022,35 +3064,12 @@ def main():
     # ---- 随机初值 base seed: CLI/env > checkpoint(续跑) > 当前时间 ----
     base_seed = None
     if not cfg["ff_only"]:
-        _cli_seed = cfg["seed"]
-        if resume_from is not None and resume_from.get("seed") is not None:
-            base_seed = int(resume_from["seed"])
-            _src = "checkpoint"
-            if _cli_seed is not None and int(_cli_seed) != base_seed:
-                log.warning(
-                    f"--resume: 以 checkpoint 的 seed={base_seed} 为准，"
-                    f"忽略 --seed/FIT_SEED={_cli_seed}"
-                )
-        elif _cli_seed is not None:
-            base_seed = int(_cli_seed)
-            _src = "--seed/FIT_SEED"
-        else:
-            base_seed = int(time.time())
-            _src = "当前时间"
-            if resume_from is not None:
-                log.warning(
-                    "checkpoint 未记录 seed（旧版本）→ 续跑用当前时间，"
-                    "随机初值可能与上一段不一致"
-                )
-        _when = (
-            f"，{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(base_seed))}"
-            if _src == "当前时间"
-            else ""
+        base_seed, _seed_src, _seed_warns = _determine_base_seed(
+            resume_from, cfg["seed"]
         )
-        print(
-            f"[seed] base seed={base_seed}（来源: {_src}{_when}）; "
-            f"run i 的 seed = base+i; 复现本作业请加 --seed {base_seed}"
-        )
+        for _w in _seed_warns:
+            log.warning(_w)
+        print(_seed_message(base_seed, _seed_src))
 
     if cfg["ff_only"]:
         # ---- --ff-only: 跳过拟合与 polish，直接用最佳参数算 FF/效率 ----
