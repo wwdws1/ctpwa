@@ -6,9 +6,55 @@ import sys
 import csv
 import argparse
 import logging
+from typing import Any, Optional, TypedDict
 import ctpwa
 
 log = logging.getLogger("pwa-fit")
+
+
+# ============================================================
+# 类型（仅静态提示，运行时仍是普通 dict）
+# ============================================================
+class ErrDict(TypedDict, total=False):
+    """`_errors_from_hessian` 的返回结构。"""
+
+    coupling_real_errors: Any
+    coupling_imag_errors: Any
+    res_errors: Any
+    mode_used: str
+    n_flat: int
+    is_pd: bool
+    min_eig: float
+    max_eig: float
+    cond_num: float
+    cov: Any
+    cov_labels: Any
+    cov_mode: Any
+
+
+class RunResult(TypedDict, total=False):
+    """`optimize_single_run` 的返回结构。"""
+
+    run_id: int
+    final_params: torch.Tensor
+    final_nll: float
+    nll_history: list
+    iterations: int
+    evals: int
+    n_iter: int
+    time: float
+    hessian_time: float
+    optimizer_status: str
+    is_positive_definite: bool
+    min_eigenvalue: float
+    max_eigenvalue: float
+    condition_number: float
+    coupling_real_errors: Any
+    coupling_imag_errors: Any
+    res_errors: Any
+    err_mode_used: str
+    n_flat_dirs: int
+    polish_status: str
 
 
 # ============================================================
@@ -28,7 +74,7 @@ _RES_NOISE_FRAC = 0.1  # 共振态初值噪声幅度（占 free_range 区间的�
 # ============================================================
 # 初始化分析对象
 # ============================================================
-def _config_path_from_argv(default="config.yml"):
+def _config_path_from_argv(default: str = "config.yml") -> str:
     """在 argparse 之前取出 --config 的值。
 
     ⚠ 分析对象在**模块导入期**构建（早于 main() 解析参数），因此必须在这里就
@@ -66,7 +112,12 @@ print(f"共振态参数数量: {n_res_free}")
 # ============================================================
 # 生成初始参数（共享实现；模块级函数仅为向后兼容包装器）
 # ============================================================
-def _generate_initial_params(n_coupling_free, free_res_info, seed=42, device="cuda"):
+def _generate_initial_params(
+    n_coupling_free: int,
+    free_res_info: torch.Tensor,
+    seed: int = 42,
+    device: str = "cuda",
+) -> torch.Tensor:
     """生成统一参数向量 [real_coupling | imag_coupling | theta]。
 
     Layout: [real_0..real_{n_free-1}, imag_0..imag_{n_free-1}, theta_0..]
@@ -115,7 +166,12 @@ def _generate_initial_params(n_coupling_free, free_res_info, seed=42, device="cu
     return params
 
 
-def generate_initial_params(n_coupling_free, free_res_info, seed=42, device="cuda"):
+def generate_initial_params(
+    n_coupling_free: int,
+    free_res_info: torch.Tensor,
+    seed: int = 42,
+    device: str = "cuda",
+) -> torch.Tensor:
     """向后兼容包装器。新代码请用 optimizer.generate_initial_params(seed)。"""
     import warnings
 
@@ -553,7 +609,7 @@ def projected_lbfgs(
 #   与 ptc-mle 的 sigmoid 重参数化、tf-pwa 的 Bound 软墙同源；区别是这里靠
 #   autograd 自动传链式法则（无需手写 dy/dx）。
 # ============================================================
-def _so_complex_dtype():
+def _so_complex_dtype() -> Optional[torch.dtype]:
     """返回与 ctpwa .so 编译精度匹配的 torch complex dtype（None=未知）。
 
     getFitFractions/getEfficiency 要求 vector 的复数 dtype 与 .so 精度一致；
@@ -574,7 +630,15 @@ def _so_complex_dtype():
     return _SO_COMPLEX_DTYPE
 
 
-def _reparam_pack(params, nc, n_res, lower, upper, amp_max, eps=_REPARAM_EPS):
+def _reparam_pack(
+    params: torch.Tensor,
+    nc: int,
+    n_res: int,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    amp_max: float,
+    eps: float = _REPARAM_EPS,
+) -> torch.Tensor:
     """物理参数 -> 无约束 u。params: [re(nc) | im(nc) | theta(n_res)]。
 
     nc 为耦合复数个数（index 0 是固定参考）；n_res 为自由共振态参数个数。
@@ -599,8 +663,15 @@ def _reparam_pack(params, nc, n_res, lower, upper, amp_max, eps=_REPARAM_EPS):
 
 
 def _reparam_unpack(
-    u, nc, n_res, lower, upper, amp_max, dtype=torch.float64, device="cpu"
-):
+    u: torch.Tensor,
+    nc: int,
+    n_res: int,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    amp_max: float,
+    dtype: torch.dtype = torch.float64,
+    device: str = "cpu",
+) -> torch.Tensor:
     """无约束 u -> 物理参数（对 u 可微，供 autograd 链式法则）。
 
     amp = amp_max·sigmoid(u_amp) ∈ (0, amp_max)：小幅度区 ≈ exp(u_amp)，
@@ -837,7 +908,7 @@ class UnifiedPWAOptimizer:
         return nll, grad
 
     # --------------------------------------------------------
-    def bounds(self, like):
+    def bounds(self, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """构造 [lo, hi] 盒约束（与 params 同 device/dtype）。
         固定参数（re_0=1, im_0=0）用 lo==hi 表示。
         """
@@ -855,14 +926,14 @@ class UnifiedPWAOptimizer:
     # --------------------------------------------------------
     def optimize_single_run(
         self,
-        initial_params,
-        run_id=0,
-        max_iter=500,
-        lr=1.0,
-        tolerance_grad=1e-8,
-        tolerance_change=1e-10,
-        history_size=100,
-    ):
+        initial_params: torch.Tensor,
+        run_id: int = 0,
+        max_iter: int = 500,
+        lr: float = 1.0,
+        tolerance_grad: float = 1e-8,
+        tolerance_change: float = 1e-10,
+        history_size: int = 100,
+    ) -> "RunResult":
         """单次优化"""
         params = initial_params.clone().detach().requires_grad_(True)
         nll_history = []
@@ -1397,7 +1468,13 @@ class UnifiedPWAOptimizer:
         return h
 
     # --------------------------------------------------------
-    def _errors_from_hessian(self, hessian_full, params_phys, mode=None, tau=None):
+    def _errors_from_hessian(
+        self,
+        hessian_full: torch.Tensor,
+        params_phys: torch.Tensor,
+        mode: Optional[str] = None,
+        tau: Optional[float] = None,
+    ) -> "ErrDict":
         """从统一 Hessian 求参数误差（含非正定回退 auto/pinv/psd）。
 
         与 polish 共用「非活跃子空间」判据：去掉固定参考(0/nc) + 活跃集剔除，
@@ -1689,7 +1766,7 @@ class UnifiedPWAOptimizer:
         )
 
     # --------------------------------------------------------
-    def extract_coupling_complex(self, params):
+    def extract_coupling_complex(self, params: torch.Tensor) -> torch.Tensor:
         """提取复数耦合向量，dtype 匹配 .so 精度。
 
         优先用 `ctpwa.DeviceManager().compiledPrecision()`（double→complex128 /
@@ -1705,7 +1782,7 @@ class UnifiedPWAOptimizer:
             return torch.complex(real.double(), imag.double())
         return torch.complex(real.float(), imag.float())
 
-    def extract_theta_phys(self, params):
+    def extract_theta_phys(self, params: torch.Tensor) -> Optional[torch.Tensor]:
         """从统一参数中提取共振态物理参数"""
         if not self.has_free_res:
             return None
@@ -2334,19 +2411,19 @@ class UnifiedPWAOptimizer:
 # ============================================================
 # CLI 参数解析
 # ============================================================
-def _env_float(name, default):
+def _env_float(name: str, default: Optional[float]) -> Optional[float]:
     """从环境变量读 float，不存在则返回 default。"""
     v = os.environ.get(name)
     return float(v) if v is not None else default
 
 
-def _env_int(name, default):
+def _env_int(name: str, default: Optional[int]) -> Optional[int]:
     """从环境变量读 int，不存在则返回 default。"""
     v = os.environ.get(name)
     return int(v) if v is not None else default
 
 
-def _env_bool(name, default):
+def _env_bool(name: str, default: bool) -> bool:
     """从环境变量读 bool（"1"/"true"/"yes" → True），不存在则返回 default。"""
     v = os.environ.get(name)
     if v is None:
@@ -2354,12 +2431,12 @@ def _env_bool(name, default):
     return v.lower() in ("1", "true", "yes")
 
 
-def _env_str(name, default=""):
+def _env_str(name: str, default: str = "") -> str:
     """从环境变量读字符串，不存在则返回 default。"""
     return os.environ.get(name, default)
 
 
-def _str2bool(v):
+def _str2bool(v: str) -> bool:
     """argparse 类型：把 "True"/"False"（大小写不敏感，也接受 1/0）转成 bool。"""
     s = str(v).strip().lower()
     if s in ("1", "true", "t", "yes", "y"):
