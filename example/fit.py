@@ -1156,6 +1156,7 @@ class UnifiedPWAOptimizer:
             "res_errors": res_errors,
             "err_mode_used": err["mode_used"],
             "n_flat_dirs": err["n_flat"],
+            "_err_full": err,  # 完整 err（含 cov），供 best 点参数矩阵复用
         }
 
         if final_nll < self.best_nll:
@@ -1758,7 +1759,8 @@ class UnifiedPWAOptimizer:
         """在给定参数点用精确 Hessian 求参数误差（含非正定回退）。
 
         具体回退策略见 `_errors_from_hessian`（auto/pinv/psd/strict）。
-        返回 (coupling_real_errors, coupling_imag_errors, res_errors)。
+        返回 (coupling_real_errors, coupling_imag_errors, res_errors, err_dict)；
+        第 4 项为完整 err dict（含 cov，供参数矩阵输出复用，避免重复求 Hessian/特征分解）。
         """
         hessian_full = self._get_hessian_cached(params_phys)
         err = self._errors_from_hessian(hessian_full, params_phys, tau=tau)
@@ -1766,6 +1768,7 @@ class UnifiedPWAOptimizer:
             err["coupling_real_errors"],
             err["coupling_imag_errors"],
             err["res_errors"],
+            err,
         )
 
     # --------------------------------------------------------
@@ -3197,6 +3200,7 @@ def main():
                     best_res["coupling_real_errors"],
                     best_res["coupling_imag_errors"],
                     best_res["res_errors"],
+                    best_res["_err_full"],
                 ) = optimizer.compute_param_errors(best_res["final_params"])
                 best_res["polish_status"] = "ok"
             except Exception as e:
@@ -3233,12 +3237,15 @@ def main():
     print(f"{'=' * 80}")
 
     # ---- 参数协方差/相关矩阵 CSV（tf-pwa 口径；仅正常拟合输出，--ff-only 不输出）----
+    # 复用 best 点已算好的完整 err（含 cov）；仅当缺失（理论上不会）才重算。
     if not cfg["ff_only"]:
         try:
-            _hess_best = optimizer._get_hessian_cached(best_res["final_params"])
-            _err_best = optimizer._errors_from_hessian(
-                _hess_best, best_res["final_params"]
-            )
+            _err_best = best_res.get("_err_full")
+            if _err_best is None:
+                _hess_best = optimizer._get_hessian_cached(best_res["final_params"])
+                _err_best = optimizer._errors_from_hessian(
+                    _hess_best, best_res["final_params"]
+                )
             optimizer.save_param_matrices(_err_best, write_dir)
         except Exception as e:
             log.exception(f"输出参数协方差/相关矩阵失败: {e}")
@@ -3284,11 +3291,17 @@ def main():
 
     if cfg["cal_ff"] or cfg["cal_eff"]:
         if not best_res.get("is_positive_definite", False):
-            log.warning(
-                "Hessian 非正定；拟合分数/效率的误差来自 err_mode 回退曲率"
-                f"（err_mode={cfg['err_mode']}, τ={cfg['err_tau']:.1e}），"
-                "为秩亏下的可行估计、非严格统计误差；中心值不受影响。"
-            )
+            if cfg["err_mode"] == "strict":
+                log.warning(
+                    "Hessian 非正定；err_mode=strict → 严格模式：不传播误差，"
+                    "拟合分数/效率仅输出中心值（误差为 0）。"
+                )
+            else:
+                log.warning(
+                    "Hessian 非正定；拟合分数/效率的误差来自 err_mode 回退曲率"
+                    f"（err_mode={cfg['err_mode']}, τ={cfg['err_tau']:.1e}），"
+                    "为秩亏下的可行估计、非严格统计误差；中心值不受影响。"
+                )
         _what = " 和 ".join(
             [n for n, on in (("FF", cfg["cal_ff"]), ("效率", cfg["cal_eff"])) if on]
         )
