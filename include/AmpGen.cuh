@@ -121,6 +121,12 @@ private:
     bool slamp_released_ = false;   // true = 静态 SL 表已释放（固定链组合，A 已物化）
     std::vector<std::vector<DeviceMomenta*>> d_mom_sigma_; // [σ][gpu]：σ 拓扑的重建四动量（σ=0 复用 d_momenta_）
     std::vector<DeviceMomenta*> d_mom_tab_;  // [gpu]：[nSigma] DeviceMomenta 值数组（kernel 用）
+    // convertToDeviceMomenta 每次调用分配的每 GPU 四动量缓冲：返回的指针由调用方
+    // 即用即弃，旧代码从不释放 → 每调用泄漏 n_events×n_particles×16B（issue #3）。
+    // 这里记录下来，在**下次调用开头**释放（析构时 torch 已销毁 CUDA 上下文，
+    // 不能在那里 cudaFree——见 ~AmpCasDecay 注释）。
+    std::vector<std::pair<int, DeviceMomenta*>> d_momenta_structs_;  // (gpu, ptr)
+    std::vector<std::pair<int, LorentzVector*>>  d_momenta_arrays_;   // (gpu, ptr)
     std::vector<double*> d_sign_tab_;     // [gpu]: [nSigma]（sign[0]=+1）
     std::vector<DeviceMomenta*> d_momenta_;// = nullptr;
     std::vector<DecayNode*> d_decayNodes_;// = nullptr;

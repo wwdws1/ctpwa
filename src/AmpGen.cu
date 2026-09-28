@@ -154,9 +154,30 @@ AmpCasDecay::AmpCasDecay(const std::vector<Particle>& particles)
 
 AmpCasDecay::~AmpCasDecay()
 {
-    // 同 AmpCalc::~AmpCalc：退出 GC 阶段析构时 torch 已销毁 CUDA 上下文，
-    // 裸 cudaFree/cudaMemcpy 会段错误。CUDA 上下文销毁自动回收显存。
-    (void)d_slamp_tab_;
+    // 退出 GC 阶段析构时 torch 已销毁 CUDA 上下文，裸 cudaFree 会段错误
+    // （CUDA 上下文销毁会自动回收显存）。因此先探测上下文是否仍可用：
+    // cudaFree(nullptr) 是安全的空操作，上下文失效时返回错误且无副作用。
+    // ⚠ 必须这样做的原因：calculateAmplitudes 每次调用都为每个 (链×组合)
+    //   make_shared<AmpCasDecay> 新建实例，用完即毁；旧析构不释放 → 每组
+    //   设备表（slamp/mom/decayNodes/slCombination/…）与 momenta 缓冲
+    //   （n_events×n_particles×16B）**永久泄漏**（issue #3 的根因）。
+    //   持久实例（AmpCalc::cas_list_ 持有）只在分析销毁时走到这里，此时
+    //   探测失败 → 跳过，行为与旧实现一致。
+    if (cudaFree(nullptr) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return;
+    }
+    for (size_t g = 0; g < d_slamp_tab_.size(); ++g) {
+        cudaSetDevice((int)g);
+        if (d_slamp_tab_[g])       cudaFree(d_slamp_tab_[g]);
+        if (g < d_sign_tab_.size() && d_sign_tab_[g])             cudaFree(d_sign_tab_[g]);
+        if (g < d_mom_tab_.size() && d_mom_tab_[g])               cudaFree(d_mom_tab_[g]);
+        if (g < d_decayNodes_.size() && d_decayNodes_[g])         cudaFree(d_decayNodes_[g]);
+        if (g < d_slCombination_.size() && d_slCombination_[g])   cudaFree(d_slCombination_[g]);
+        if (g < d_polarization_map_.size() && d_polarization_map_[g]) cudaFree(d_polarization_map_[g]);
+    }
+    for (auto& [dev, ptr] : d_momenta_structs_) { cudaSetDevice(dev); if (ptr) cudaFree(ptr); }
+    for (auto& [dev, ptr] : d_momenta_arrays_)  { cudaSetDevice(dev); if (ptr) cudaFree(ptr); }
 }
 
 void AmpCasDecay::addDecay(const Amp2BD& amp, const std::string& mother, const std::string& daug1, const std::string& daug2)
@@ -534,6 +555,20 @@ std::vector<DeviceMomenta*> AmpCasDecay::convertToDeviceMomenta(
     const std::map<std::string, int>& particleToIndex,
     const std::vector<DecayNodeHost>& decayChain)
 {
+    // 释放上一次调用留下的缓冲（旧代码把 d_momenta_i / d_momenta_array 分配后
+    // 直接返回，调用方用完即弃却从不释放 → 每次调用泄漏；issue #3 实测每次
+    // getFitFractions 因此增长数百 MB～GB 级）
+    for (auto& [dev, ptr] : d_momenta_structs_) {
+        cudaSetDevice(dev);
+        if (ptr) cudaFree(ptr);
+    }
+    for (auto& [dev, ptr] : d_momenta_arrays_) {
+        cudaSetDevice(dev);
+        if (ptr) cudaFree(ptr);
+    }
+    d_momenta_structs_.clear();
+    d_momenta_arrays_.clear();
+
     std::vector<DeviceMomenta*> d_momenta(finalMomenta.size(), nullptr);
     // cudaMalloc(&d_momenta, sizeof(DeviceMomenta));
     // for (size_t i = 0; i < finalMomenta.size(); ++i)
@@ -648,6 +683,8 @@ std::vector<DeviceMomenta*> AmpCasDecay::convertToDeviceMomenta(
         cudaMemcpy(d_momenta_i, &h_momenta, sizeof(DeviceMomenta), cudaMemcpyHostToDevice);
 
         d_momenta[i] = d_momenta_i;
+        d_momenta_structs_.emplace_back((int)i, d_momenta_i);
+        d_momenta_arrays_.emplace_back((int)i, d_momenta_array);
     }
 
     return d_momenta;
@@ -655,6 +692,30 @@ std::vector<DeviceMomenta*> AmpCasDecay::convertToDeviceMomenta(
 
 void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vector<LorentzVector>>>& finalMomenta)
 {
+    // ⚠ 释放上一次调用留下的表：下面是"resize 后直接 cudaMalloc 覆盖成员指针"的写法，
+    //   旧分配只在析构函数里释放 → 每调用一次就泄漏一整组表（issue #3 的根因：
+    //   getFitFractions/getEfficiency 每个 batch 调用一次 computeSLAmps，
+    //   实测每调用泄漏 ~1.5-2.2 GB，两次调用就把卡吃干 → cudaMalloc 失败 →
+    //   旧代码不检查返回值 → nullptr 进 kernel → illegal memory access）。
+    for (size_t g = 0; g < d_slamp_tab_.size(); ++g) {
+        if (d_slamp_tab_[g])  { cudaFree(d_slamp_tab_[g]);  d_slamp_tab_[g]  = nullptr; }
+    }
+    for (size_t g = 0; g < d_mom_tab_.size(); ++g) {
+        if (d_mom_tab_[g])    { cudaFree(d_mom_tab_[g]);    d_mom_tab_[g]    = nullptr; }
+    }
+    for (size_t g = 0; g < d_sign_tab_.size(); ++g) {
+        if (d_sign_tab_[g])   { cudaFree(d_sign_tab_[g]);   d_sign_tab_[g]   = nullptr; }
+    }
+    for (size_t g = 0; g < d_decayNodes_.size(); ++g) {
+        if (d_decayNodes_[g]) { cudaFree(d_decayNodes_[g]); d_decayNodes_[g] = nullptr; }
+    }
+    for (size_t g = 0; g < d_slCombination_.size(); ++g) {
+        if (d_slCombination_[g]) { cudaFree(d_slCombination_[g]); d_slCombination_[g] = nullptr; }
+    }
+    for (size_t g = 0; g < d_polarization_map_.size(); ++g) {
+        if (d_polarization_map_[g]) { cudaFree(d_polarization_map_[g]); d_polarization_map_[g] = nullptr; }
+    }
+
     d_slamp_tab_.resize(finalMomenta.size(), nullptr);
     d_mom_tab_.resize(finalMomenta.size(), nullptr);
     d_sign_tab_.resize(finalMomenta.size(), nullptr);
@@ -911,6 +972,11 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
         cudaFree(d_dimj);
         cudaFree(d_dimj1);
         cudaFree(d_dimj2);
+
+        // 注意: 这里**不能**释放本次分配的 momenta 缓冲——d_momenta_/d_mom_sigma_ 是
+        // 成员，后续路径（reComputeAmps 等）仍会引用；实测在函数末尾 cudaFree 会让
+        // 上下文出现非法访问（后续 cudaMemGetInfo 返回 0 显存）。释放只能发生在
+        // "确定该实例不再被使用"时（见 convertToDeviceMomenta 开头的上一轮释放）。
     }
 }
 
