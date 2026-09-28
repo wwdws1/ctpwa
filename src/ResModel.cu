@@ -442,12 +442,15 @@ std::vector<double> buildModelAST(
         }
         case ResModelType::ONE: {
             // F = [MODEL_BF(L_runtime, q, q0, d)]（has_bf=false 时 F = 1）
-            // 顶点 Bf 用 CVAR_L: 与 computeNodeFactor 的 Bf(sl.L, ...) 逐波一致
+            // 顶点 Bf 用 CVAR_L: 与 computeNodeFactor 的 Bf(sl.L, ...) 逐波一致。
+            // q0 用固定参考（oneRefQ0，与运行时 oneRefQ0<T>(d) 同值）——占位
+            // "质量"参数不参与, 因此写大/写小都不会让 Bf 变 NaN；Bf 与 q0 的
+            // 依赖断开后 ∂F/∂θ 恒为 0（ONE 的质量本就不该浮动）。
             if (has_bf) {
                 ast = Node::makeComposite(MODEL_BF, {
                     Node::makeVar(CVAR_L),
                     Node::makeVar(CVAR_Q),
-                    q0_ast,
+                    Node::makeNum(oneRefQ0<double>(d)),
                     Node::makeNum(d)
                 });
             } else {

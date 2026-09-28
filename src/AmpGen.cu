@@ -1581,7 +1581,10 @@ computeAmpsKernelT(Out* amplitudes,                      // 输出振幅
             }
         }
 
-        double q0 = std::sqrt((mass_mother * mass_mother - std::pow(mass_daug1 + mass_daug2, 2)) * (mass_mother * mass_mother - std::pow(mass_daug1 - mass_daug2, 2))) / 2 / mass_mother;
+        // q0 用 computeQ0AD（子粒子质量和 > 母质量时钳到 0, 不产生 sqrt(负) 的 NaN）,
+        // 与 buildModelAST 的 MODEL_BREAKUP_Q0 路径同源；否则自由质量扫到阈值
+        // 以下、或 ONE 占位质量写得偏小, 都会让 Bf 变 NaN。
+        double q0 = computeQ0AD<double>(mass_mother, mass_daug1, mass_daug2);
 
         if (nodeIdx == 0)
         {

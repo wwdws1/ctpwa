@@ -587,9 +587,52 @@ void Parameters::transformExtendedHessian(
 // CouplingMatrixBuilder: buildWithTrans implementation
 // ============================================================
 
+namespace {
+
+// chain_key 结构: <chain.name> + ("_" + <中间态名> + "[" + <共振态名> + "]")*
+struct TransKeyParts {
+    std::string group;                                       // chain.name
+    std::vector<std::pair<std::string, std::string>> elems;  // (中间态名, 共振态名)
+};
+
+// 中间态名等价判定: 完全相同, 或一个是另一个的 "<name>_<序号>" 实例形式
+// （如 "R_Keta" 与 "R_Keta_0"）
+bool transIdentEqual(const std::string& a, const std::string& b)
+{
+    if (a == b) return true;
+    auto pref = [](const std::string& x, const std::string& y) {
+        return y.size() > x.size() && y.compare(0, x.size(), x) == 0 &&
+               y[x.size()] == '_';
+    };
+    return pref(a, b) || pref(b, a);
+}
+
+// 删除 name 在 s 中的所有出现并规整 '_' 分隔（归一化 chain.name 用）
+std::string transStripName(const std::string& s, const std::string& name)
+{
+    if (name.empty()) return s;
+    std::string raw;
+    size_t pos = 0;
+    while (true) {
+        size_t f = s.find(name, pos);
+        if (f == std::string::npos) { raw += s.substr(pos); break; }
+        raw += s.substr(pos, f - pos);
+        pos = f + name.size();
+    }
+    std::string out;
+    for (char c : raw) {
+        if (c == '_' && (out.empty() || out.back() == '_')) continue;
+        out += c;
+    }
+    while (!out.empty() && out.back() == '_') out.pop_back();
+    return out;
+}
+
+}  // namespace
+
 CouplingMatrixResult CouplingMatrixBuilder::buildWithTrans(
     const std::vector<std::vector<std::string>>& trans_names,
-    const std::vector<std::complex<double>>& trans_values) const
+    const std::vector<std::vector<double>>& trans_ratios) const
 {
     CouplingMatrixResult r;
     r.steps = steps_;
@@ -603,103 +646,232 @@ CouplingMatrixResult CouplingMatrixBuilder::buildWithTrans(
         if (it == chain_keys.end()) chain_keys.push_back(am.chain_key);
     }
 
-    // --- 应用 trans 约束: 逐对折叠 chain + 匹配步 ---
+    // chain_key → (chain.name, 元素表)。chain.name 自身可能含 '_'（如 R_Keta），
+    // 不能从 '[' 反推, 用已知链名（chain_step_order_ 的键）做最长前缀匹配。
+    auto parseKey = [&](const std::string& key) {
+        TransKeyParts p;
+        for (const auto& kv : chain_step_order_) {
+            const std::string& nm = kv.first;
+            if (key.size() >= nm.size() && key.compare(0, nm.size(), nm) == 0 &&
+                nm.size() > p.group.size())
+                p.group = nm;
+        }
+        size_t pos = p.group.size();
+        while (pos < key.size() && key[pos] == '_') {
+            size_t lb = key.find('[', pos);
+            if (lb == std::string::npos) break;
+            size_t rb = key.find(']', lb);
+            if (rb == std::string::npos) break;
+            p.elems.emplace_back(key.substr(pos + 1, lb - pos - 1),
+                                 key.substr(lb + 1, rb - lb - 1));
+            pos = rb + 1;
+        }
+        return p;
+    };
+
+    // --- 应用 trans 约束 ---
     std::map<int, std::pair<int, double>> step_fold_map;
     std::map<int, std::pair<int, double>> chain_fold_map;  // cB → {cA, ratio}
 
-    for (size_t ti = 0; ti < trans_names.size(); ++ti) {
-        if (trans_names[ti].size() < 2) continue;
-        double ratio = 1.0;
-        if (ti < trans_values.size()) ratio = std::real(trans_values[ti]);
-        const std::string& nameA = trans_names[ti][0];
-        const std::string& nameB = trans_names[ti][1];
-
-        // Helper: extract resonance name (after last '[')
-        auto resName = [](const std::string& key) -> std::string {
-            auto pos = key.rfind('[');
-            return (pos != std::string::npos) ? key.substr(pos) : key;
-        };
-
-        // Collect all chains matching A and B, indexed by resonance name
-        auto matchChains = [&](const std::string& name)
-            -> std::map<std::string, int> {
-            std::map<std::string, int> out;
-            // 1) 直接子串匹配（顶层中间态链名形式: decay1_R_Keta_0/1 等）
-            for (size_t ci = 0; ci < chain_keys.size(); ++ci) {
-                if (chain_keys[ci].find(name) != std::string::npos)
-                    out[resName(chain_keys[ci])] = (int)ci;
+    // 折叠一对链: chain_fold_map + 两组 step 按注册顺序逐位折叠
+    auto foldPair = [&](int cB, int cA, double ratio) -> bool {
+        if (cB == cA || chain_fold_map.count(cB)) return false;
+        chain_fold_map[cB] = {cA, ratio};
+        for (const auto& kvB : chain_step_order_) {
+            if (chain_keys[cB].compare(0, kvB.first.size(), kvB.first) != 0) continue;
+            for (const auto& kvA : chain_step_order_) {
+                if (chain_keys[cA].compare(0, kvA.first.size(), kvA.first) != 0) continue;
+                if (kvA.first == kvB.first) break;
+                const auto& sB_list = kvB.second;
+                const auto& sA_list = kvA.second;
+                for (size_t pi = 0; pi < sB_list.size() && pi < sA_list.size(); ++pi)
+                    if (!step_fold_map.count(sB_list[pi]))
+                        step_fold_map[sB_list[pi]] = {sA_list[pi], ratio};
+                break;
             }
-            if (!out.empty()) return out;
-            // 2) 实例语义: "<中间态名>_<出现序号>" —— 该中间态是深层
-            //    子中间态时链名不含此串, 按链前缀(chain.name)分组,
-            //    序号为含该中间态的链组在 chain_keys 中的出现次序。
-            std::string base = name;
-            int inst = -1;
-            auto us = name.rfind('_');
-            if (us != std::string::npos) {
-                std::string num = name.substr(us + 1);
-                if (!num.empty() && num.find_first_not_of("0123456789") == std::string::npos) {
-                    base = name.substr(0, us);
-                    inst = atoi(num.c_str());
-                }
-            }
-            if (inst < 0) return out;   // 无实例序号可解析
-            std::string tag = "_" + base + "[";
-            std::map<int, std::vector<int>> grp_chains; // 组序号 → [链 id…]
-            std::map<std::string, int> grp_of;          // 链前缀 → 组序号
-            for (size_t ci = 0; ci < chain_keys.size(); ++ci) {
-                if (chain_keys[ci].find(tag) == std::string::npos) continue;
-                auto first_br = chain_keys[ci].find('[');   // chain.name 段无 '['
-                if (first_br == std::string::npos) continue;
-                std::string prefix = chain_keys[ci].substr(0, first_br);
-                auto it = grp_of.find(prefix);
-                int gi;
-                if (it == grp_of.end()) {
-                    gi = (int)grp_chains.size();
-                    grp_of[prefix] = gi;
-                } else {
-                    gi = it->second;
-                }
-                grp_chains[gi].push_back((int)ci);
-            }
-            if (inst < (int)grp_chains.size()) {
-                for (int ci : grp_chains[inst]) out[resName(chain_keys[ci])] = ci;
-            }
-            return out;
-        };
-
-        std::map<std::string, int> chainsA = matchChains(nameA);
-        std::map<std::string, int> chainsB = matchChains(nameB);
-        if (chainsA.empty() || chainsB.empty()) {
-            fprintf(stderr,
-                "[ctpwa] warn: trans constraint [%s, %s] = %g matched no chains "
-                "(检查名字是否为链名或 <中间态名>_<出现序号>); 忽略\n",
-                nameA.c_str(), nameB.c_str(), ratio);
         }
+        return true;
+    };
 
-        // Pairwise fold: same resonance → B folds into A
-        for (const auto& [res, cB] : chainsB) {
-            auto itA = chainsA.find(res);
-            if (itA == chainsA.end()) continue;
-            int cA = itA->second;
-            chain_fold_map[cB] = {cA, ratio};
+    for (size_t ti = 0; ti < trans_names.size(); ++ti) {
+        const std::vector<std::string>& names = trans_names[ti];
+        if (names.size() < 2) {
+            if (!names.empty())
+                fprintf(stderr, "[ctpwa] warn: trans 约束至少需要 2 个链名, 跳过 [%s]\n",
+                        names[0].c_str());
+            continue;
+        }
+        // 比值: names[1..] 依次对应 trans_ratios[ti][0..]（names[0] 为基准, 比值 1）
+        const std::vector<double> no_ratio;
+        const std::vector<double>& vals =
+            (ti < trans_ratios.size()) ? trans_ratios[ti] : no_ratio;
+        std::vector<double> ratios(names.size(), 1.0);
+        for (size_t j = 1; j < names.size(); ++j)
+            if (j - 1 < vals.size()) ratios[j] = vals[j - 1];
+        if (vals.size() > names.size() - 1)
+            fprintf(stderr,
+                "[ctpwa] warn: trans 约束 [%s, ...] 有 %zu 个链名但给了 %zu 个比值; 多余的忽略\n",
+                names[0].c_str(), names.size(), vals.size());
 
-            // Fold steps by position for this pair
-            for (auto& [chainB_name, cB_steps] : chain_step_order_) {
-                if (chain_keys[cB].find(chainB_name) != 0) continue;
-                for (auto& [chainA_name, cA_steps] : chain_step_order_) {
-                    if (chain_keys[cA].find(chainA_name) != 0) continue;
-                    if (chainA_name == chainB_name) continue;
-                    for (size_t pi = 0; pi < cB_steps.size() && pi < cA_steps.size(); ++pi) {
-                        int sB = cB_steps[pi], sA = cA_steps[pi];
-                        if (step_fold_map.find(sB) == step_fold_map.end())
-                            step_fold_map[sB] = {sA, ratio};
+        struct Hit { int ci; std::string base; std::string tag; bool has_elem; };
+        std::vector<std::vector<Hit>> hits(names.size());
+
+        for (size_t j = 0; j < names.size(); ++j) {
+            const std::string& nm = names[j];
+            std::vector<int> matched;
+            for (size_t ci = 0; ci < chain_keys.size(); ++ci)
+                if (chain_keys[ci].find(nm) != std::string::npos)
+                    matched.push_back(static_cast<int>(ci));
+            if (matched.empty()) {
+                // 实例语义回退: "<中间态名>_<出现序号>" —— 该中间态是深层子中间态
+                // （链名不含此串）时, 按包含它的链组出现次序定位。
+                std::string base = nm;
+                int inst = -1;
+                auto us = nm.rfind('_');
+                if (us != std::string::npos) {
+                    std::string num = nm.substr(us + 1);
+                    if (!num.empty() && num.find_first_not_of("0123456789") == std::string::npos) {
+                        base = nm.substr(0, us);
+                        inst = atoi(num.c_str());
                     }
+                }
+                if (inst >= 0) {
+                    std::string tag = "_" + base + "[";
+                    std::map<int, std::vector<int>> grp_chains;  // 组序号 → [链 id…]
+                    std::map<std::string, int> grp_of;           // 链前缀 → 组序号
+                    for (size_t ci = 0; ci < chain_keys.size(); ++ci) {
+                        if (chain_keys[ci].find(tag) == std::string::npos) continue;
+                        auto first_br = chain_keys[ci].find('[');
+                        if (first_br == std::string::npos) continue;
+                        std::string prefix = chain_keys[ci].substr(0, first_br);
+                        auto git = grp_of.find(prefix);
+                        int gi;
+                        if (git == grp_of.end()) { gi = (int)grp_chains.size(); grp_of[prefix] = gi; }
+                        else gi = git->second;
+                        grp_chains[gi].push_back(static_cast<int>(ci));
+                    }
+                    if (inst < (int)grp_chains.size()) matched = grp_chains[inst];
+                }
+            }
+            if (matched.empty()) {
+                fprintf(stderr,
+                    "[ctpwa] warn: trans 约束 [%s, ...] 的名字 \"%s\" 未匹配到任何链; 忽略该名字\n",
+                    names[0].c_str(), nm.c_str());
+                continue;
+            }
+            for (int ci : matched) {
+                TransKeyParts p = parseKey(chain_keys[ci]);
+                Hit h;
+                h.ci = ci;
+                h.base = transStripName(p.group, nm);  // 归一化链名（去掉名字出现）
+                h.tag.clear();
+                h.has_elem = false;
+                for (const auto& e : p.elems) {
+                    if (transIdentEqual(e.first, nm)) {
+                        if (!h.has_elem) { h.tag = e.second; h.has_elem = true; }
+                        continue;   // 被约束点名的中间态不进组合键（B/C 与 A 各自独立）
+                    }
+                    h.base += "|" + e.first + "[" + e.second + "]";
+                }
+                hits[j].push_back(std::move(h));
+            }
+        }
+        if (hits[0].empty()) continue;
+
+        // 组合键分组（names[0]）
+        std::map<std::string, std::vector<int>> gA;
+        for (size_t a = 0; a < hits[0].size(); ++a) gA[hits[0][a].base].push_back((int)a);
+
+        int paired = 0, folded = 0;
+        std::vector<bool> noted_diff_tag(names.size(), false);  // 每个名字只提示一次
+        for (const auto& kv : gA) {
+            const std::string& base = kv.first;
+            const std::vector<int>& a_idx = kv.second;
+            for (size_t j = 1; j < names.size(); ++j) {
+                std::vector<int> b_idx;
+                for (size_t b = 0; b < hits[j].size(); ++b)
+                    if (hits[j][b].base == base) b_idx.push_back((int)b);
+                if (b_idx.empty()) continue;
+                std::vector<bool> usedA(a_idx.size(), false), usedB(b_idx.size(), false);
+                // ① 该中间态共振态名相同 → 同共振、不同电荷道/实例, 直接配对
+                for (size_t bi = 0; bi < b_idx.size(); ++bi) {
+                    const Hit& hb = hits[j][b_idx[bi]];
+                    if (!hb.has_elem || hb.tag.empty()) continue;
+                    for (size_t ai = 0; ai < a_idx.size(); ++ai) {
+                        if (usedA[ai]) continue;
+                        const Hit& ha = hits[0][a_idx[ai]];
+                        if (ha.has_elem && ha.tag == hb.tag) {
+                            usedA[ai] = usedB[bi] = true;
+                            ++paired;
+                            if (foldPair(hb.ci, ha.ci, ratios[j])) ++folded;
+                            break;
+                        }
+                    }
+                }
+                // ② 余下按顺序配对（两侧该中间态用了不同共振态定义时, 仍按组合次序对应）
+                std::vector<size_t> la, lb;
+                for (size_t ai = 0; ai < a_idx.size(); ++ai) if (!usedA[ai]) la.push_back(ai);
+                for (size_t bi = 0; bi < b_idx.size(); ++bi) if (!usedB[bi]) lb.push_back(bi);
+                if (!la.empty() && la.size() != lb.size())
+                    fprintf(stderr,
+                        "[ctpwa] warn: trans [%s, %s] 组合 \"%s\" 两侧链数不同 (%zu vs %zu); "
+                        "只折叠 %zu 对\n",
+                        names[0].c_str(), names[j].c_str(), base.c_str(),
+                        la.size(), lb.size(), std::min(la.size(), lb.size()));
+                for (size_t k = 0; k < la.size() && k < lb.size(); ++k) {
+                    const Hit& ha = hits[0][a_idx[la[k]]];
+                    const Hit& hb = hits[j][b_idx[lb[k]]];
+                    ++paired;
+                    if (foldPair(hb.ci, ha.ci, ratios[j])) {
+                        ++folded;
+                        if (!noted_diff_tag[j] && ha.has_elem && hb.has_elem &&
+                            ha.tag != hb.tag) {
+                            noted_diff_tag[j] = true;
+                            fprintf(stderr,
+                                "[ctpwa] note: trans [%s, %s] = %g: 折叠的链中该中间态用了不同"
+                                "共振态定义 (如 %s vs %s), 只共享耦合/步参数, 线形各自独立\n",
+                                names[0].c_str(), names[j].c_str(), ratios[j],
+                                hb.tag.c_str(), ha.tag.c_str());
+                        }
+                    }
+                }
+            }
+        }
+        if (paired == 0)
+            fprintf(stderr,
+                "[ctpwa] warn: trans 约束 [%s, ...] 匹配到链但未配成任何一对 "
+                "(检查链名/中间态名与共振组合是否对应); 忽略\n",
+                names[0].c_str());
+    }
+
+    // --- 跨约束链式折叠: [A,B] + [B,C] → C 折到 A（比值相乘）---
+    // 成环（约束自相矛盾）时断环: 环内最小下标保留为 origin, 环内其它条目删除,
+    // 保证解析后的 origin 一定不是被折叠链（否则 amp_chain 会拿到无效下标）。
+    auto resolveFolds = [](const std::map<int, std::pair<int, double>>& in)
+        -> std::map<int, std::pair<int, double>> {
+        std::map<int, std::pair<int, double>> out;
+        std::set<int> drop;
+        for (const auto& kv : in) {
+            int cur = kv.second.first;
+            double ratio = kv.second.second;
+            std::set<int> seen{kv.first};
+            while (in.count(cur)) {
+                if (!seen.insert(cur).second) {
+                    fprintf(stderr, "[ctpwa] warn: trans 折叠成环 (含下标 %d), 已断环\n", cur);
+                    for (int m : seen) if (in.count(m)) drop.insert(m);
+                    cur = *seen.begin();
                     break;
                 }
+                ratio *= in.at(cur).second;
+                cur = in.at(cur).first;
             }
+            out[kv.first] = {cur, ratio};
         }
-    }
+        for (int m : drop) out.erase(m);
+        return out;
+    };
+    chain_fold_map = resolveFolds(chain_fold_map);
+    step_fold_map = resolveFolds(step_fold_map);
 
     // --- 分配步级参数 (跳过被折叠的步) ---
     int sp_idx = 0;
