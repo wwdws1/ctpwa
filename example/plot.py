@@ -304,11 +304,11 @@ def create_legend_column(
 
 
 def plot_dalitz_histograms(dalitz_data_list, pdf_pages):
-    """绘制所有TH2F直方图，每个dalitz目录一张图（三列：Data, Fit, Pull）"""
+    """绘制所有TH2F直方图，每个dalitz目录一张图（三列：Data, Fit+Bkg, Pull）"""
     if not dalitz_data_list:
         return
 
-    n_cols = 3  # 固定3列：Data, Fit, Pull
+    n_cols = 3  # 固定3列：Data, Fit+Bkg, Pull
 
     for dir_name, histograms, xlabel, ylabel in dalitz_data_list:
         # 确保我们有需要的直方图
@@ -329,21 +329,26 @@ def plot_dalitz_histograms(dalitz_data_list, pdf_pages):
         else:
             bkg_values = np.zeros_like(data_values)
 
-        # 计算pull分布: (data - fit) / sqrt(fit)
+        # 总模型 = 信号 fit + 本底 bkg（无 hbkg 时 bkg 为 0，等价于只看 fit）。
+        # hfit 是信号产额（C++ normFactor 已扣本底），hbkg 是预期本底计数，
+        # 二者相加才与原始数据 hdata 同口径。
+        total_fit_values = fit_values + bkg_values
+
+        # 计算pull分布: (data - (fit+bkg)) / sqrt(fit+bkg)
         threshold = 1e-10
         pull_values = np.zeros_like(data_values)
-        mask = fit_values > threshold
-        pull_values[mask] = (data_values[mask] - fit_values[mask]) / np.sqrt(
-            fit_values[mask]
+        mask = total_fit_values > threshold
+        pull_values[mask] = (data_values[mask] - total_fit_values[mask]) / np.sqrt(
+            total_fit_values[mask]
         )
 
         x_min, x_max = x_edges[0], x_edges[-1]
         y_min, y_max = y_edges[0], y_edges[-1]
 
-        # 计算Data和Fit的颜色范围
+        # 计算Data和总模型(Fit+Bkg)的颜色范围
         data_max = np.max(data_values)
-        fit_max = np.max(fit_values)
-        vmax = max(data_max, fit_max)
+        total_fit_max = np.max(total_fit_values)
+        vmax = max(data_max, total_fit_max)
 
         # 为当前目录创建一张独立的图
         fig_dalitz = plt.figure(figsize=(12, 3))
@@ -395,9 +400,11 @@ def plot_dalitz_histograms(dalitz_data_list, pdf_pages):
             spine.set_alpha(0.6)
         # plt.colorbar(im_data, ax=ax_data, fraction=0.046, pad=0.04)
 
-        # 第二列: Fit
+        # 第二列: Fit+Bkg（总模型，与 Data 同口径；无本底时即 Fit）
         ax_fit = fig_dalitz.add_subplot(gs[0, 1])
-        masked_fit = np.ma.masked_where(fit_values.T <= threshold, fit_values.T)
+        masked_fit = np.ma.masked_where(
+            total_fit_values.T <= threshold, total_fit_values.T
+        )
         im_fit = ax_fit.imshow(
             masked_fit,
             extent=[x_min, x_max, y_min, y_max],
@@ -408,7 +415,11 @@ def plot_dalitz_histograms(dalitz_data_list, pdf_pages):
             vmax=vmax,
             zorder=1,
         )
-        ax_fit.set_title("Fit", fontsize=10, fontweight="bold")
+        ax_fit.set_title(
+            "Fit+Bkg" if bkg_hist is not None else "Fit",
+            fontsize=10,
+            fontweight="bold",
+        )
         ax_fit.set_xlabel(math_label(xlabel), fontsize=12)
         ax_fit.set_ylabel(math_label(ylabel), fontsize=12)
         ax_fit.xaxis.set_minor_locator(plt.MultipleLocator(0.2))
