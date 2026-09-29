@@ -89,7 +89,7 @@ __device__ inline double lookupHistTable(double m, const double* aux, int off)
     return vals[i] * (1.0 - frac) + vals[i + 1] * frac;
 }
 
-// 带 AD 的 breakup momentum q0
+// 带 AD 的 breakup momentum q0（m0 低于子粒子阈值时 q0=0，不产生 NaN）
 template <typename T>
 __host__ __device__ T computeQ0AD(T m0, T md1, T md2)
 {
@@ -99,6 +99,20 @@ __host__ __device__ T computeQ0AD(T m0, T md1, T md2)
     T q0sq = (m0sq - s_md * s_md) * (m0sq - d_md * d_md) / (T(4.0) * m0sq);
     if (q0sq < 0.0) q0sq = 0.0;
     return T(std::sqrt(q0sq));
+}
+
+// ONE（纯势垒因子/相空间项）专用参考 q0。
+//
+// Bf(L,q,q0,d) = sqrt(N_L(q0·d)/N_L(q·d))：q0 只出现在分子, 是一个与 q 无关的
+// 常数因子, 会被该链的耦合参数整体吸收 —— 所以 ONE 的"质量"占位参数对拟合
+// 结果没有影响。旧实现直接用该占位质量算 q0：写大 → z0=q0·d 的多项式上溢
+// （inf/inf → NaN）；写小（低于子粒子阈值）→ sqrt(负数) → NaN。
+// 这里改用固定参考 z0 = q0·d ≡ 1（形状与任意 q0 完全相同, 只差一个常数）,
+// 数值有界、与占位质量无关。d<=0 时 Bf≡1, 返回 0 即可。
+template <typename T>
+__host__ __device__ T oneRefQ0(double d)
+{
+    return (d > 0.0) ? T(1.0 / d) : T(0.0);
 }
 
 // 统一共振态因子计算
@@ -134,9 +148,11 @@ __device__ auto computeNodeFactor(
             return BW<T>(mm, m0, g0);
         }
         case ResModelType::ONE: {
-            // ONE = 无传播子（单位因子）; 有 Bf 时为 Bf，否则为 1
+            // ONE = 无传播子（单位因子）; 有 Bf 时为 Bf，否则为 1。
+            // 势垒因子的 q0 取固定参考（oneRefQ0），与占位"质量"参数无关：
+            // 占位质量写大/写小都不会再让 Bf 变成 NaN（见 oneRefQ0 注释）。
             if (has_bf) {
-                auto bf = Bf<T>(L, q_ad, q0_ad, bf_d);
+                auto bf = Bf<T>(L, q_ad, oneRefQ0<T>(bf_d), bf_d);
                 return ResResult<T>::make(bf, T(0.0));
             }
             return ResResult<T>::make(T(1.0), T(0.0));

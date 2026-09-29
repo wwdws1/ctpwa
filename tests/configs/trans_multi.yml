@@ -1,0 +1,99 @@
+# 三电荷道 trans 约束测试 config（宿主端即可校验, 不需要 GPU）
+# 与 trans_multi_none.yml 的唯一区别: 本文件带 Constraints.trans
+#
+# 结构: J/ψ → η + R, R 经三种电荷道衰变: ω 型 π⁰ρ⁰ / π⁺ρ⁻ / π⁻ρ⁺。
+# R 有两个共振态 → 每种电荷道 2 个链组合 = 6 个链耦合;
+# 约束 [rho0, rhop, rhom]: [-1, 1] 把 π⁺ρ⁻、π⁻ρ⁺ 两道的链折到 π⁰ρ⁰ 道
+# （比值 -1 / +1）→ 应只剩 π⁰ρ⁰ 的 2 个链耦合。
+Particles:
+  Jpsi:
+    J: 1
+    P: -1
+    mass: 3.0969
+    tex: ['J/\\psi']
+  eta:
+    J: 0
+    P: -1
+    mass: 0.5478
+    tex: ['\eta']
+  pi0:
+    J: 0
+    P: -1
+    mass: 0.1350
+    tex: ['\pi^{0}']
+  pip:
+    J: 0
+    P: -1
+    mass: 0.1396
+    tex: ['\pi^{+}']
+  pim:
+    J: 0
+    P: -1
+    mass: 0.1396
+    tex: ['\pi^{-}']
+
+Data:
+  order: [pip, pim, pi0, eta]
+  data: [dat, "./data/test_data.dat"]
+  phsp: [dat, "./data/test_phsp.dat"]
+
+DecayChains:
+  decay1:
+    Jpsi:
+      - [eta, R]
+    R:
+      - [pi0, rho0]
+      - [pip, rhom]
+      - [pim, rhop]
+    rho0: [pip, pim]
+    rhop: [pip, pi0]
+    rhom: [pim, pi0]
+
+    intermediates:
+      R:
+        - [J: 1, P: -1]: [phi1020, phi1680]
+      rho0:
+        - [J: 1, P: -1]: [rho_a]
+      rhop:
+        - [J: 1, P: -1]: [rho_b]
+      rhom:
+        - [J: 1, P: -1]: [rho_b]
+
+    legends:
+      - ['R', ' → ', 'eta']
+
+Constraints:
+  trans:
+    # A 为基准; 后面每个名字对应一个比值(-1 / +1)
+    - [rho0, rhop, rhom]: [-1, 1]
+
+Resonances:
+  phi1020:
+    J: 1
+    P: -1
+    model: BWR
+    parameters: [1.0195, 0.0045]
+    tex: ["\\phi(1020)"]
+
+  phi1680:
+    J: 1
+    P: -1
+    model: BWR
+    parameters: [1.66, 0.125]
+    tex: ["\\phi(1680)"]
+
+  # 两个不同的 ρ 定义: 模拟"π⁰ρ⁰ 与 π±ρ∓ 用了不同共振态"的写法,
+  # 检验按组合次序配对（不同共振态定义时仍能折叠）
+  rho_a:
+    J: 1
+    P: -1
+    model: BWR
+    parameters: [0.775, 0.149]
+    tex: ["\\rho(770)", "^{0}"]
+
+  rho_b:
+    J: 1
+    P: -1
+    model: BWR
+    parameters: [0.775, 0.149]
+    tex: ["\\rho(770)", "^{\\pm}"]

@@ -2,8 +2,25 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <stdexcept>
+#include <string>
 
 #include <ComputeBF.cuh>
+
+// 分配/启动失败一律抛异常（旧实现只 printf，调用方会拿着 nullptr 继续跑）
+static inline void bfCheckCuda(cudaError_t e, const char* what)
+{
+    if (e != cudaSuccess)
+        throw std::runtime_error(std::string("computeBranchingFractions: ") + what +
+                                 " 失败: " + cudaGetErrorString(e));
+}
+
+static inline void bfCheckCublas(cublasStatus_t s, const char* what)
+{
+    if (s != CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error(std::string("computeBranchingFractions: cuBLAS ") + what +
+                                 " 失败 (status " + std::to_string((int)s) + ")");
+}
 
 // 每事件/极化: 按nSLvectors分组SL分量到各粒子，累加模方和散射矩阵
 // 关键: 不除以total_result（与computeModWithInterference不同），产出原始散射矩阵
@@ -83,33 +100,36 @@ void computeBranchingFractions(
     double* d_total_integral,
     double* d_square_integral,
     int* d_nSLvectors,
-    int npartials, int nEvents, int ngls, int npolar)
+    int npartials, int nEvents, int ngls, int npolar,
+    ctComplex* d_complex_result,
+    ctComplex* d_result_matrix)
 {
+    if (nEvents <= 0 || ngls <= 0 || npolar <= 0) return;   // 空批：不碰 workspace
+    if (d_complex_result == nullptr || d_result_matrix == nullptr)
+        throw std::runtime_error("computeBranchingFractions: workspace 为 nullptr"
+                                 "（应由调用方预分配）");
+
     cublasHandle_t handle;
-    cublasCreate(&handle);
+    bfCheckCublas(cublasCreate(&handle), "cublasCreate");
 
     const ctComplex alpha = ctMake(1.0f, 0.0f);
     const ctComplex beta  = ctMake(0.0f, 0.0f);
 
-    // 1. cuBLAS gemv: 计算 S = A * v
-    ctComplex* d_complex_result = nullptr;
-    cudaMalloc(&d_complex_result, nEvents * npolar * sizeof(ctComplex));
-    CUBLAS_CGEMV(handle, CUBLAS_OP_T,
+    // 1. cuBLAS gemv: 计算 S = A * v（写入调用方 workspace）
+    bfCheckCublas(CUBLAS_CGEMV(handle, CUBLAS_OP_T,
         ngls, nEvents * npolar,
         &alpha, d_matrix, ngls,
         d_vector, 1,
-        &beta, d_complex_result, 1);
+        &beta, d_complex_result, 1), "gemv");
 
-    // 2. cuBLAS dgmm: A * diag(v) → result_matrix
-    ctComplex* d_result_matrix = nullptr;
-    cudaMalloc(&d_result_matrix, ngls * nEvents * npolar * sizeof(ctComplex));
-    CUBLAS_CDGMM(handle, CUBLAS_SIDE_LEFT,
+    // 2. cuBLAS dgmm: A * diag(v) → result_matrix（写入调用方 workspace）
+    bfCheckCublas(CUBLAS_CDGMM(handle, CUBLAS_SIDE_LEFT,
         ngls, nEvents * npolar,
         d_matrix, ngls,
         d_vector, 1,
-        d_result_matrix, ngls);
+        d_result_matrix, ngls), "dgmm");
 
-    cublasDestroy(handle);
+    bfCheckCublas(cublasDestroy(handle), "cublasDestroy");
 
     // 3. 启动kernel
     constexpr int kBlockSize = 128;
@@ -131,14 +151,10 @@ void computeBranchingFractions(
             d_total_integral, d_square_integral, d_nSLvectors,
             npartials, nEvents, ngls, npolar);
 
-    cudaError_t cuda_error = cudaGetLastError();
-    if (cuda_error != cudaSuccess)
-        printf("computeBFKernel error: %s\n", cudaGetErrorString(cuda_error));
-
-    cudaDeviceSynchronize();
-
-    cudaFree(d_complex_result);
-    cudaFree(d_result_matrix);
+    // 不再只 printf：启动/执行错误直接抛出，避免调用方拿着坏结果继续跑
+    bfCheckCuda(cudaGetLastError(), "computeBFKernel 启动");
+    bfCheckCuda(cudaDeviceSynchronize(), "computeBFKernel 执行");
+    // workspace 由调用方统一释放（跨 batch / 跨扰动方向复用）
 }
 
 #include <cmath>

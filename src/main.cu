@@ -151,6 +151,20 @@ PYBIND11_MODULE(ctpwa, m)
              "(totalweight/weight_<i>/interf_<i>_<j>/末态四动量); pairs=[[i,j],...]")
         .def("getDataTensor", &analysis::getDataTensor)
         .def("getPhspTensor", &analysis::getPhspTensor)
+        .def("getExtendedVector", [](analysis& a, const torch::Tensor& v) {
+                 // 折叠表在构造期上传到主 GPU，coupling kernel 固定在其上 →
+                 // 传别的卡的向量会跨卡读表（多卡下非法访问）。这里显式挡住。
+                 TORCH_CHECK(v.is_cuda(), "coupling_vector must be on CUDA");
+                 TORCH_CHECK(v.device().index() == a.getParams().primaryDevice(),
+                     "coupling_vector 必须位于主 GPU (cuda:",
+                     a.getParams().primaryDevice(), ")，当前在 cuda:",
+                     v.device().index(), "（折叠表固定在主卡）");
+                 return a.freeParamsToAmplitudes(v);
+             },
+             pybind11::arg("coupling_vector"),
+             "自由耦合向量 (complex [n_free], 主 GPU) → 扩展振幅耦合向量 v_ext "
+             "(complex [n_amps])。用于校验 trans/var_equal 折叠与链×步参数化："
+             "两模型的 v_ext 相同 ⇔ 拟合结果相同。")
         // .def("getTruthTensor", &analysis::getTruthTensor)
         .def("getFitFractions", pybind11::overload_cast<torch::Tensor>(
                  &analysis::getFitFractions),

@@ -1380,11 +1380,16 @@ public:
 // float2 A 段 → 新分配 double 临时（writeResult/hessian 输出等低频消费路径用；
 // 调用方负责 cudaFree 返回值。返回 nullptr 表示非 float 模式）
 static ctComplex* upcastAmpSegToDouble(const ctComplex* baseF /*实际为 float2 存储*/,
-                                       size_t nElem)
+                                       size_t nElem,
+                                       ctComplex* buf = nullptr /*可选: 复用缓冲*/)
 {
     if (nElem == 0) return nullptr;
-    ctComplex* dbl = nullptr;
-    cudaMalloc(&dbl, nElem * sizeof(ctComplex));
+    ctComplex* dbl = buf;
+    if (dbl == nullptr) {
+        cudaError_t e = cudaMalloc(&dbl, nElem * sizeof(ctComplex));
+        TORCH_CHECK(e == cudaSuccess, "upcastAmpSegToDouble: cudaMalloc 失败: ",
+                    cudaGetErrorString(e));
+    }
     int g = (int)((nElem + 255) / 256);
     castF2ToDouble2Kernel<<<g, 256>>>(reinterpret_cast<const float2*>(baseF),
         reinterpret_cast<cuDoubleComplex*>(dbl), (int)nElem);
@@ -4170,25 +4175,37 @@ public:
         double* out_partial,
         double* out_scattering,
         double* out_square,
-        int npartials) const
+        int npartials,
+        const std::vector<ctComplex*>& ws_complex,
+        const std::vector<ctComplex*>& ws_matrix,
+        const std::vector<ctComplex*>& ws_upcast) const
     {
         for (size_t gpu = 0; gpu < d_amps.size(); ++gpu) {
             int nt = ev_per_gpu[gpu];
             if (nt <= 0 || d_amps[gpu] == nullptr) continue;
 
-            int* d_nsl;
+            int* d_nsl = nullptr;
             cudaSetDevice(gpu);
-            cudaMalloc(&d_nsl, npartials * sizeof(int));
+            TORCH_CHECK(cudaMalloc(&d_nsl, npartials * sizeof(int)) == cudaSuccess,
+                        "computeTruthIntegrals: cudaMalloc(d_nsl) 失败");
             cudaMemcpy(d_nsl, nSLvectors_.data(), npartials * sizeof(int), cudaMemcpyHostToDevice);
 
-            double* d_p; cudaMalloc(&d_p, npartials * sizeof(double));
+            double* d_p = nullptr;
+            TORCH_CHECK(cudaMalloc(&d_p, npartials * sizeof(double)) == cudaSuccess,
+                        "computeTruthIntegrals: cudaMalloc(d_p) 失败");
             cudaMemset(d_p, 0, npartials * sizeof(double));
-            double* d_s; cudaMalloc(&d_s, npartials * npartials * sizeof(double));
+            double* d_s = nullptr;
+            TORCH_CHECK(cudaMalloc(&d_s, npartials * npartials * sizeof(double)) == cudaSuccess,
+                        "computeTruthIntegrals: cudaMalloc(d_s) 失败");
             cudaMemset(d_s, 0, npartials * npartials * sizeof(double));
-            double* d_t; cudaMalloc(&d_t, sizeof(double)); cudaMemset(d_t, 0, sizeof(double));
+            double* d_t = nullptr;
+            TORCH_CHECK(cudaMalloc(&d_t, sizeof(double)) == cudaSuccess,
+                        "computeTruthIntegrals: cudaMalloc(d_t) 失败");
+            cudaMemset(d_t, 0, sizeof(double));
             double* d_sq = nullptr;
             if (out_square != nullptr) {
-                cudaMalloc(&d_sq, npartials * sizeof(double));
+                TORCH_CHECK(cudaMalloc(&d_sq, npartials * sizeof(double)) == cudaSuccess,
+                            "computeTruthIntegrals: cudaMalloc(d_sq) 失败");
                 cudaMemset(d_sq, 0, npartials * sizeof(double));
             }
 
@@ -4198,14 +4215,19 @@ public:
             const ctComplex* d_mat = d_amps[gpu];
             ctComplex* d_amp_dbl = nullptr;
             if (float_amps_) {
+                // 复用调用方的 upcast workspace（旧实现每次都 cudaMalloc/cudaFree）
                 d_amp_dbl = upcastAmpSegToDouble(d_amps[gpu],
-                    (size_t)nt * n_polar_ * n_amplitudes_);
+                    (size_t)nt * n_polar_ * n_amplitudes_,
+                    (gpu < ws_upcast.size()) ? ws_upcast[gpu] : nullptr);
                 d_mat = d_amp_dbl;
             }
             computeBranchingFractions(d_mat,
                 reinterpret_cast<const ctComplex*>(vg.data_ptr()),
-                d_p, d_s, d_t, d_sq, d_nsl, npartials, nt, n_amplitudes_, n_polar_);
-            if (d_amp_dbl != nullptr) cudaFree(d_amp_dbl);
+                d_p, d_s, d_t, d_sq, d_nsl, npartials, nt, n_amplitudes_, n_polar_,
+                ws_complex[gpu], ws_matrix[gpu]);
+            if (d_amp_dbl != nullptr
+                && (gpu >= ws_upcast.size() || d_amp_dbl != ws_upcast[gpu]))
+                cudaFree(d_amp_dbl);
 
             std::vector<double> hp(npartials), hs(npartials * npartials); double ht;
             cudaMemcpy(hp.data(), d_p, npartials * sizeof(double), cudaMemcpyDeviceToHost);
@@ -4257,6 +4279,14 @@ public:
         std::vector<std::string> particles_names;
         for (const auto& p : particles_) particles_names.push_back(p.name);
 
+        // 每事件行数必须与读取器 readMomentaFromDat 一致：那边用
+        // particleNames.size()（= 传进去的 data_order 大小）作为"每事件行数"。
+        // 旧实现用 lines / particles_.size()——Particles 含初态时口径不一致
+        // （本例 4 vs 3），只会覆盖 data_order/Particles 比例的行，静默少算
+        // （issue #3 ②）。
+        const auto& data_order = config_parser_.getDataOrder();
+        const int ev_lines = data_order.empty() ? (int)particles_.size()
+                                               : (int)data_order.size();
         std::string file = data_files.at(file_key)[1];
         int total_events = 0;
         {
@@ -4264,14 +4294,48 @@ public:
             std::string line;
             int lines = 0;
             while (std::getline(f, line)) if (!line.empty()) ++lines;
-            total_events = lines / (int)particles_.size();
+            TORCH_CHECK(ev_lines > 0 && lines % ev_lines == 0,
+                "[", file_key, "] 行数 ", lines, " 不是每事件行数 ", ev_lines,
+                " 的整数倍（config 的 Data.order / Particles 与文件不匹配）");
+            total_events = lines / ev_lines;
         }
         std::cout << "[" << file_key << "] events: " << total_events << std::endl;
 
         // Batched accumulation
         const int batch_size = 100000;
-        const auto& data_order = config_parser_.getDataOrder();
         auto saved_ev = events_offsets_, saved_amp = amp_offsets_;
+
+        // workspace: 一次分配、跨 batch（及每个自由方向的 ± 扰动）复用。
+        // 旧实现在 computeBranchingFractions 内每次调用都 cudaMalloc/cudaFree
+        // 两个大缓冲（ngls×1e5×npolar×16B ≈ 139 MB）：15M 事件的 truth = 150 batch
+        // × (1+2·n_free) 次调用 → 上千次大块 alloc/free → 碎片化 → 分配失败
+        // → nullptr 进 kernel → illegal memory access（issue #3 ①）。
+        auto memprobe = [&](const char* tag, int start) {
+            if (std::getenv("CTPWA_MEMPROBE") == nullptr) return;
+            size_t mf = 0, mt = 0; cudaMemGetInfo(&mf, &mt);
+            printf("[memprobe] %-22s start=%7d free=%.1f MiB\n", tag, start,
+                   (double)mf / 1048576.0);
+        };
+        memprobe("enter", -1);
+        const size_t ws_cplx = (size_t)batch_size * (size_t)std::max(1, n_polar_);
+        const size_t ws_mat  = (size_t)std::max(1, n_amplitudes_) * ws_cplx;
+        std::vector<ctComplex*> ws_complex(n_gpus_, nullptr);
+        std::vector<ctComplex*> ws_matrix(n_gpus_, nullptr);
+        std::vector<ctComplex*> ws_upcast(n_gpus_, nullptr);
+        for (int g = 0; g < n_gpus_; ++g) {
+            cudaSetDevice(g);
+            TORCH_CHECK(cudaMalloc(&ws_complex[g], ws_cplx * sizeof(ctComplex)) == cudaSuccess,
+                "[", file_key, "] workspace cudaMalloc 失败 (",
+                ws_cplx * sizeof(ctComplex), " B)");
+            TORCH_CHECK(cudaMalloc(&ws_matrix[g], ws_mat * sizeof(ctComplex)) == cudaSuccess,
+                "[", file_key, "] workspace cudaMalloc 失败 (",
+                ws_mat * sizeof(ctComplex), " B)");
+            if (float_amps_) {
+                TORCH_CHECK(cudaMalloc(&ws_upcast[g], ws_mat * sizeof(ctComplex)) == cudaSuccess,
+                    "[", file_key, "] upcast workspace cudaMalloc 失败 (",
+                    ws_mat * sizeof(ctComplex), " B)");
+            }
+        }
 
         for (int start = 0; start < total_events; start += batch_size) {
             int n_batch = std::min(batch_size, total_events - start);
@@ -4303,27 +4367,41 @@ public:
             }
             events_offsets_ = t_ev_off; amp_offsets_ = t_amp_off;
             std::vector<ctComplex*> d_batch_amps = calculateAmplitudes(Vp4_tpg);
+            memprobe("after-amps", start);
 
             // Center (+ square)
             computeTruthIntegrals(ev_center, d_batch_amps, batch_ev_per_gpu,
-                out_partial, out_scattering, out_square, npartials);
+                out_partial, out_scattering, out_square, npartials,
+                ws_complex, ws_matrix, ws_upcast);
 
             // Jacobian perturbations (reuse same batch amplitudes)
             if (out_p_partial != nullptr) {
                 for (int j = 0; j < (int)ev_perturbed_p.size(); ++j) {
                     computeTruthIntegrals(ev_perturbed_p[j], d_batch_amps, batch_ev_per_gpu,
                         out_p_partial + j * npartials,
-                        out_p_scattering + j * npartials * npartials, nullptr, npartials);
+                        out_p_scattering + j * npartials * npartials, nullptr, npartials,
+                        ws_complex, ws_matrix, ws_upcast);
                     computeTruthIntegrals(ev_perturbed_m[j], d_batch_amps, batch_ev_per_gpu,
                         out_m_partial + j * npartials,
-                        out_m_scattering + j * npartials * npartials, nullptr, npartials);
+                        out_m_scattering + j * npartials * npartials, nullptr, npartials,
+                        ws_complex, ws_matrix, ws_upcast);
                 }
             }
 
+            memprobe("after-integrals", start);
             // Free batch amplitudes
             for (size_t g = 0; g < d_batch_amps.size(); ++g)
                 if (d_batch_amps[g]) { cudaSetDevice(static_cast<int>(g)); cudaFree(d_batch_amps[g]); }
+            memprobe("after-amp-free", start);
         }
+        // 统一释放 workspace（单次分配 → 单次释放，不再有上千次 alloc/free）
+        for (int g = 0; g < n_gpus_; ++g) {
+            cudaSetDevice(g);
+            if (ws_complex[g]) cudaFree(ws_complex[g]);
+            if (ws_matrix[g])  cudaFree(ws_matrix[g]);
+            if (ws_upcast[g])  cudaFree(ws_upcast[g]);
+        }
+        memprobe("exit(after ws free)", -1);
         events_offsets_ = saved_ev; amp_offsets_ = saved_amp;
         cudaSetDevice(primary_dev_);   // 恢复主设备（内部多 GPU 循环后 raw 停在最后卡）
         return total_events;

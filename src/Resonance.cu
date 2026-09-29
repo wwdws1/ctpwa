@@ -42,7 +42,9 @@ class ONEModel : public ResonanceModel
     std::string name() const override { return "ONE"; }
     ResModelType type() const override { return ResModelType::ONE; }
     std::vector<ParamSpec> paramSpecs() const override {
-        return {{"mass", 0.0, false}};
+        // mass 只是占位（Bf 的 q0 已固定参考, 占位值不参与振幅, 见 ResModel.cuh
+        // oneRefQ0），因此允许省略；写了也只是记录/显示用。
+        return {{"mass", 1.0, /*optional=*/true}};
     }
     std::vector<double> buildAuxData(const std::map<std::string,std::string>&,
         const std::vector<std::pair<double,double>>&) const override { return {}; }
