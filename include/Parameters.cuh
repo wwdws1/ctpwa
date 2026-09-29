@@ -126,6 +126,7 @@ public:
     bool hasCouplingMatrix() const { return has_coupling_matrix_; }
     // 主设备（表上传与 coupling kernel 固定在其上，防多卡错卡读写）
     void setPrimaryDevice(int d) { primary_dev_ = d; }
+    int primaryDevice() const { return primary_dev_; }
 
     // 拟合参数 → 旧格式: d_in[Re_p, Im_p, θ] → d_out[Re_v, Im_v, θ]
     void extendCouplingParams(const double* d_in, double* d_out, int ncf, int nt) const;
@@ -241,10 +242,15 @@ public:
 
     CouplingMatrixResult build() const { return buildWithTrans({}, {}); }
 
-    // trans_pairs[i] = {chainA_substr, chainB_substr} with value ratio
+    // trans 约束: trans_names[i] = {name0, name1, ...}（name0 为基准），
+    // trans_ratios[i][j-1] = name_j 相对 name0 的实数比值（缺省 1.0）。
+    // name_j 匹配到的每条链折叠进 name0 中"同一共振组合"的链；"同一组合"
+    // 指除 name0/name_j 所指中间态之外，各层共振态逐一相同（实现注释详述）。
+    // 支持 N 个名字（B/C/... 各自带比值折向 A），也支持跨约束链式折叠
+    // （[A,B] + [B,C] → C 折到 A，比值相乘）。
     CouplingMatrixResult buildWithTrans(
         const std::vector<std::vector<std::string>>& trans_names,
-        const std::vector<std::complex<double>>& trans_values) const;
+        const std::vector<std::vector<double>>& trans_ratios) const;
 
 private:
     std::vector<StepCouplingDef> steps_;

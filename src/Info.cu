@@ -98,6 +98,10 @@ void DecayInfo::buildDecayChains(
                             for (size_t pi = 0; pi < pnames.size(); ++pi)
                                 resonance_param_names_.push_back(rname + "_" + pnames[pi]);
                         } else if (!it->second.free.empty()) {
+                            if (it->second.type == "ONE" || it->second.type == "one")
+                                std::cerr << "Warning: ONE 模型 \"" << rname
+                                          << "\" 的占位质量不参与振幅（Bf 的 q0 取固定参考, "
+                                             "见 ResModel.cuh oneRefQ0），float 它没有意义\n";
                             const auto& pnames = rlist.back().getOrderedParamNames();
                             bool all_free = (it->second.free.size() == 1 && it->second.free[0] == -1);
                             for (size_t pi = 0; pi < pnames.size(); ++pi) {
@@ -334,14 +338,17 @@ void DecayInfo::buildDecayChains(
     // --- Build coupling matrix & apply trans constraints ---
     if (!amplitude_names_.empty()) {
         // Build trans data from constraints
+        //   trans_names[i]  = {name0, name1, ...}（name0 为基准）
+        //   trans_ratios[i] = {ratio1, ratio2, ...}（name_j 相对 name0；只取实部）
         std::vector<std::vector<std::string>> trans_names;
-        std::vector<std::complex<double>> trans_vals;
+        std::vector<std::vector<double>> trans_vals;
         for (const auto& c : constraints_) {
-            if (c.type == "trans") {
-                trans_names.push_back(c.names);
-                trans_vals.push_back(c.values.empty()
-                    ? std::complex<double>(1.0, 0.0) : c.values[0]);
-            }
+            if (c.type != "trans") continue;
+            trans_names.push_back(c.names);
+            std::vector<double> vals;
+            vals.reserve(c.values.size());
+            for (const auto& v : c.values) vals.push_back(std::real(v));
+            trans_vals.push_back(std::move(vals));
         }
         coupling_matrix_ = coupling_matrix_builder_.buildWithTrans(
             trans_names, trans_vals);

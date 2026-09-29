@@ -223,7 +223,7 @@ except Exception:
 
 setup(
     name="ctpwa",
-    version="0.3.8",
+    version="0.3.9",
     author="Benhou Xiang",
     description="CUDA-Torch Partial Wave Analysis",
     long_description=_long_desc,
