@@ -1,8 +1,8 @@
-# CHANGELOG（`example/` 本地维护）
+# CHANGELOG（`example/`）
 
-本文件记录本 fork 对上游 `BHXiang/ctpwa` 的改动中、**`example/` 目录内**各文件的内容
-（PR #1–#15 及本次；本地 / `origin` / `ihep` 三处同步）。其它目录随上游，不在本表。
-日期 = 合并进我方 `main` 的日期；“PR #n”指 `wwdws1/ctpwa` 的合并请求。
+本文件记录对上游 `BHXiang/ctpwa` 的改动中、**`example/` 目录内**各文件的内容变化
+（PR #1–#16）。其它目录随上游维护，不在本表；上游同步见文末。
+日期 = 合并进 `main` 的日期；“PR #n”指 `wwdws1/ctpwa` 的合并请求。
 
 > 只列**行为/接口/文档**变化；纯格式（ruff-format/空白）只在首次记录。
 
@@ -62,8 +62,7 @@
   `err_mode=strict` 时的警告措辞；参数矩阵输出复用 best 误差（去掉重复 `[param-err]` 与重复 eigh）。
 
 ### 文档引用清理
-- 2026-09-25（PR #11 `4b6b3a9`）去掉指向本地私有/不存在文档的引用（`doc/*.md`、`AGENT.md`、
-  `reparam_analysis`）与注释里内部 `B*` 编号。
+- 2026-09-25（PR #11 `4b6b3a9`）去掉注释中指向仓库外/不存在的文档引用，以及内部编号标注。
 
 ---
 
@@ -87,26 +86,22 @@
 - 2026-09-25（PR #9 `4d24aa6`）`--cal-ff`/`--cal-eff` 参数表与说明。
 - 2026-09-25（PR #12 `279e5e8`）`--seed`/`FIT_SEED`、输出文件表加参数矩阵、seed 说明。
 - 2026-09-25（PR #13 `2d9c761`）`--warm-start auto` 目录修正 + 输出/日志约定。
-- 2026-09-29（本 PR）末尾新增 **§8 `plot.py` 使用说明**。
+- 2026-09-29（PR #16）末尾新增 **§8 `plot.py` 使用说明**。
 
 ---
 
 ## `example/.pre-commit-config.yaml`
 
 - 2026-09-22（PR #2 `fdbf26f`/`af0e72b`）新增：仅作用于 `example/`；含 ruff-format 等会改文件的
-  hook，本地全自动；`ruff` 仅 `--select E9,F63,F7,F82`。
-- 2026-09-25（PR #11 `4b6b3a9`）去掉指向 `example/AGENT.md` 的引用。
-
-## `example/.gitignore`
-
-- 2026-09-22（PR #2 `95f8167`）本地私有文件忽略规则移入 `example/.gitignore`
-  （忽略 `AGENT.md`、`tests/`），保证与上游分歧仅限 `example/`。
+  hook；`ruff` 仅 `--select E9,F63,F7,F82`。
+- 2026-09-25（PR #11 `4b6b3a9`）清理注释中指向仓库外文档的引用。
 
 ---
 
-## 本地私有（不 track）
+## 上游同步
 
-- `example/AGENT.md`、`example/tests/`（均被 `example/.gitignore` 忽略）：本地维护说明与 CPU 单测，
-  随上述改动同步更新。
-- 备注：`tests/` 单测为本地私有；PR 只包含 `example/` 内 tracked 文件（`fit.py`/`plot.py`/`README.md`/
-  `.pre-commit-config.yaml`/`.gitignore`）与本 `CHANGELOG.md`。
+- 2026-09-29（PR #16）并入上游 `BHXiang/ctpwa`（`a3946d5` → `68e0d0c`），**不涉及 `example/`**：
+  - `68e0d0c` 修大 `phsp_truth` 下 `getFitFractions`/`getEfficiency` 崩溃与内存泄漏（issue #3）；
+  - `7c59d36` trans 支持 N 个链名 + 每名字一个比值；ONE 占位质量不进振幅；
+  - `754cd98` 发布 v0.3.9（`setup.py`）。
+  - 涉及文件：`include/*`、`src/*`、`tests/configs/trans_multi*.yml`、`tests/test_trans_host.py`、`setup.py`。
