@@ -1,7 +1,7 @@
 # CHANGELOG（`example/`）
 
 本文件记录对上游 `BHXiang/ctpwa` 的改动中、**`example/` 目录内**各文件的内容变化
-（PR #1–#16）。其它目录随上游维护，不在本表；上游同步见文末。
+（PR #1–#17）。其它目录随上游维护，不在本表；上游同步见文末。
 日期 = 合并进 `main` 的日期；“PR #n”指 `wwdws1/ctpwa` 的合并请求。
 
 > 只列**行为/接口/文档**变化；纯格式（ruff-format/空白）只在首次记录。
@@ -74,6 +74,10 @@
 - 2026-09-29（PR #15 `1f66ceb`）**Dalitz(2D) pull/Fit 加入本底**：`total_fit_values = hfit+hbkg`；
   Pull 用 `(data-total)/√total`；Fit 面板画 total、标题有本底时 `Fit+Bkg`；`vmax=max(data,total)`。
   与 1D（`plot_combined_histogram_with_pull`）口径一致。
+- 2026-09-29（PR #17，https://github.com/wwdws1/ctpwa/pull/17 ）修 `--params N` 路径：
+  原先调用不存在的 `analysis.writeWeightFile`，且参数文件名/解析都不对 → 改为从
+  `results/parameters.txt` 按 `# RUN: run_N` 分块正确解析（耦合 `±`/`(fixed)` 与共振态行），
+  拼 `[Re, Im, θ]`（float64）后调 `analysis.writeResult`；失败**明确报错**、不再静默回退。
 
 ---
 
@@ -87,6 +91,7 @@
 - 2026-09-25（PR #12 `279e5e8`）`--seed`/`FIT_SEED`、输出文件表加参数矩阵、seed 说明。
 - 2026-09-25（PR #13 `2d9c761`）`--warm-start auto` 目录修正 + 输出/日志约定。
 - 2026-09-29（PR #16）末尾新增 **§8 `plot.py` 使用说明**。
+- 2026-09-29（PR #17）开头注明 `plot.py` 见 §8、变更历史见 `CHANGELOG.md`。
 
 ---
 
