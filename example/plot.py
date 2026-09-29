@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import numpy as np
 import os
+import re
 import argparse
 from math import ceil
 from matplotlib.backends.backend_pdf import PdfPages
@@ -930,76 +931,76 @@ def plot_nll_history(run_id):
 
 
 def generate_weight_file_from_params(run_id):
-    """从optimized_parameters.txt读取指定run的参数，生成权重文件"""
+    """从 `results/parameters.txt` 读取指定 run 的参数，重新生成权重文件。
+
+    `parameters.txt` 由 fit.py 写出：以 `# RUN: run_N` 分块；每块含耦合行
+    （`idx name real ± rerr imag ± ierr mag phase_rad phase_deg`；固定参考行为
+    `idx name real (fixed) imag (fixed) ...`）与共振态行
+    （`idx name value ± err bounds=[lo, hi]`）。拼成统一向量
+    `[Re(c) | Im(c) | θ]`（float64）后调 `analysis.writeResult`。
+    """
     import ctpwa
-    import numpy as np
     import torch
 
     output_file = f"results/weight_run_{run_id}.root"
-    if output_file is not None and os.path.exists(output_file):
+    if os.path.exists(output_file):
         print(f"权重文件已存在: {output_file}")
         return output_file
 
-    params_file = "results/optimized_parameters.txt"
+    params_file = "results/parameters.txt"
     if not os.path.exists(params_file):
-        print(f"参数文件不存在: {params_file}")
-        return "results/weight_best.root"
+        print(f"参数文件不存在: {params_file}（需先跑 fit.py）")
+        return None
 
-    # 读取参数文件，提取指定run的参数
-    params_list = []
-    in_target_run = False
-    amplitudes_count = 0
-
+    coupling = {}  # index -> complex
+    theta = {}  # index -> float
+    in_run = False
     with open(params_file, "r") as f:
         for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
+            s = line.strip()
+            if s.startswith("# RUN:"):
+                m = re.search(r"run_(\d+)", s)
+                in_run = bool(m) and int(m.group(1)) == run_id
                 continue
+            if not s or s.startswith("#") or not in_run:
+                continue
+            parts = s.split()
+            if len(parts) < 4 or not parts[0].isdigit():
+                continue
+            idx = int(parts[0])
+            if "bounds=" in s:  # 共振态行
+                theta[idx] = float(parts[2])
+            elif parts[3] == "±":  # 耦合行（带误差）
+                coupling[idx] = complex(float(parts[2]), float(parts[5]))
+            elif parts[3] == "(fixed)":  # 固定参考耦合
+                coupling[idx] = complex(float(parts[2]), float(parts[4]))
 
-            parts = line.split()
-            if len(parts) >= 7:
-                current_run = int(parts[0])
+    if not coupling:
+        print(f"未找到第 {run_id} 次运行的耦合参数（检查 run 号或 parameters.txt）")
+        return None
 
-                # 检查是否进入目标run
-                if current_run == run_id:
-                    in_target_run = True
-                elif in_target_run:
-                    # 已经离开目标run，停止读取
-                    break
+    nc = max(coupling) + 1
+    if set(coupling) != set(range(nc)):
+        print(f"耦合参数下标不连续（0..{nc - 1}），无法拼参数向量")
+        return None
+    re_part = [coupling[i].real for i in range(nc)]
+    im_part = [coupling[i].imag for i in range(nc)]
+    th_part = [theta[i] for i in sorted(theta)]
+    n_res = len(th_part)
+    params_tensor = torch.tensor(
+        re_part + im_part + th_part, dtype=torch.float64, device="cuda"
+    )
 
-                if in_target_run:
-                    # 解析参数：RealPart和ImagPart
-                    real_part = float(parts[3])
-                    imag_part = float(parts[4])
-                    params_list.append(complex(real_part, imag_part))
-                    amplitudes_count += 1
-
-    if not params_list:
-        print(f"未找到第 {run_id} 次运行的参数")
-        return "results/weight_best.root"
-
-    print(f"找到第 {run_id} 次运行的 {len(params_list)} 个参数")
-
-    # 创建ctpwa分析对象
     try:
         ana = ctpwa.analysis()
-
-        # 将参数转换为torch张量；复数 dtype 须匹配 .so 编译精度（double→complex128），
-        # 否则 writeWeightFile 会报 "vector dtype must match .so complex precision"。
-        _cdt = (
-            torch.complex128
-            if ctpwa.DeviceManager().compiledPrecision() == "double"
-            else torch.complex64
-        )
-        params_tensor = torch.tensor(params_list, dtype=_cdt, device="cuda")
-
-        # 生成权重文件
-        ana.writeWeightFile(params_tensor, output_file, 0)
-        print(f"权重文件已生成: {output_file}")
+        # writeResult(params, filename, is_saved_weight, waves)；
+        # params 为 float64 统一向量 [Re, Im, θ]（与 fit.py.save_weight_file 同约定）。
+        ana.writeResult(params_tensor, output_file, 0, [])
+        print(f"权重文件已生成: {output_file}（run {run_id}, nc={nc}, n_res={n_res}）")
         return output_file
     except Exception as e:
         print(f"生成权重文件时出错: {e}")
-        return "results/weight_best.root"
+        return None
 
 
 def main(args=None):
@@ -1020,6 +1021,9 @@ def main(args=None):
     # 如果指定了--params参数，使用指定run的参数生成权重文件
     if args.params is not None:
         weight_file = generate_weight_file_from_params(args.params)
+        if weight_file is None:
+            print("未能生成权重文件，退出。")
+            return
     else:
         # 默认使用最佳权重文件
         weight_file = "results/weight_best.root"
