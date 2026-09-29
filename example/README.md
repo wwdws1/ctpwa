@@ -332,3 +332,41 @@ FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
    （旧版恒指向 `results/`，在非默认 `--output-dir` 下会找错）。
 8. **输出约定**：`print` 输出结果（配置/进度/结果表/落盘提示/可复现 tag），
    `log`（含 `-v/-q` 级别控制）输出内部诊断（`[pLBFGS]`/`[polish]` 迭代与统计）。
+
+---
+
+## 8. `plot.py` 使用说明
+
+从 `<output-dir>/weight_best.root`（或指定 run 的参数）读取直方图并生成 PDF 图集。
+
+### 运行
+
+```bash
+python plot.py                # 读 results/weight_best.root → results/results_plot.pdf
+python plot.py --params 3     # 用 parameters.txt 第 3 个 run 参数经 GPU 重新生成权重 → results/results_plot_run_3.pdf
+python plot.py --nll 3        # 画第 3 个 run 的 NLL 历史
+```
+
+### 输入直方图（由 fit.py / C++ 写入 `weight_best.root`）
+
+| 对象 | 含义 |
+|---|---|
+| `hdata` | 原始数据计数 |
+| `hfit` | 信号模型（振幅²×phsp）× `normFactor`（即信号产额） |
+| `hbkg` | 预期本底计数（本底事件 × `bkg_weights`，不 Scale） |
+| `h_<分波名>` | 各分波形状（`|A_i|²` 加权） |
+| `interference` | 干涉矩阵（`TMatrixD`，完整对称矩阵） |
+| `legends` | 分波图例 |
+
+### 输出内容
+- **1D 页**：每个观测（质量 / cosβ / obs-1d）一组合图——上方：数据点 + 各分波形状 +
+  **Fit+Bkg** + 本底填充；下方：**pull** `(data-(hfit+hbkg))/√(hfit+hbkg)`，并标注 `χ²/ndf`。
+- **2D Dalitz 页**：每个 2D 观测（dalitz / obs-2d）三列 **Data / Fit+Bkg / Pull**，
+  pull 口径同上（含本底）。
+
+> 口径说明：`data ≈ hfit+hbkg`（`hfit` 已按“数据−本底”归一，`hbkg` 为预期本底）。
+> 因此 Fit 面板与 Pull 都必须用 `hfit+hbkg`；无 `hbkg` 时退化为只看 `hfit`。
+
+### 依赖
+- `uproot` 读取 ROOT 文件；`--params` 需要 GPU + `ctpwa`。
+- 复数 dtype 按 `ctpwa` `.so` 编译精度自动选择（`complex128`/`complex64`）。
