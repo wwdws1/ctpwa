@@ -486,36 +486,45 @@ __global__ void hessianFullTransformKernel(
             }
         }
 
-        // ---- second-order gradient term: Σ_a g_v[a] × ∂²v_a/(∂p_j ∂p_k) ----
-        // Only non-zero for mixed chain×step derivatives
-        if (d_g_v && jCh != kCh) {
+        // ---- 二阶项: Σ_a g_v[a] · ∂²v_a/(∂p_j ∂p_k) ----
+        // v_a = ratio_a · Π_{f ∈ factors(a)} p_f   (每个因子幂次 1) ⇒
+        //   · j == k, 或 j/k 中有一个不是 a 的因子  →  0;
+        //   · j ≠ k 且都是 a 的因子  →  ∂²v_a/∂p_j∂p_k = v_a / (p_j · p_k)
+        //     (复数; trans 的 ratio 已经含在 v_a 里, 不需要额外处理)
+        // 统一处理 chain×step **与 step×step**; 旧版只做前者、把后者整类跳过,
+        // 并把 z = v_a/(p_j p_k) 硬编码成 1 —— 只在"每个振幅恰 2 个因子且 ratio=1"
+        // 时才正确, 这就是 >=3 因子 / ratio≠1 时 Hessian 错的原因。
+        // (VSPACE 下每个振幅只有 1 个因子 → 这里自动恒为 0, 与真值一致。)
+        if (d_g_v && j != k) {
             double gt = 0.0;
-            int chain_j = jCh ? jc : kc;     // which is the chain
-            int step_j  = jCh ? kc : jc;     // which is the step
-            bool row_is_chain = jCh;
             for (int a = 0; a < na; ++a) {
-                if (d_amp_chain[a] != chain_j) continue;
-                bool uses_step = false;
-                for (int ss = d_step_offsets[a]; ss < d_step_offsets[a + 1]; ++ss)
-                    if (d_step_data[ss] == step_j) { uses_step = true; break; }
-                if (!uses_step) continue;
-                double g_re = d_g_v[a], g_im = d_g_v[na + a];
-                // ∂²v/∂p_j∂p_k in Re/Im grouped format:
-                // ∂²Re/∂Re(c)∂Re(s)=1, ∂²Im/∂Re(c)∂Im(s)=1,
-                // ∂²Im/∂Im(c)∂Re(s)=1, ∂²Re/∂Im(c)∂Im(s)=-1
-                // All other combos = 0
-                if (row_is_chain) {
-                    if (cr == 0 && cc == 0) gt += g_re;        // Re_c×Re_s → +g_re
-                    else if (cr == 0 && cc == 1) gt += g_im;   // Re_c×Im_s → +g_im
-                    else if (cr == 1 && cc == 0) gt += g_im;   // Im_c×Re_s → +g_im
-                    else if (cr == 1 && cc == 1) gt -= g_re;   // Im_c×Im_s → -g_re
-                } else {
-                    // row is step, col is chain — symmetric
-                    if (cr == 0 && cc == 0) gt += g_re;
-                    else if (cr == 1 && cc == 0) gt += g_im;
-                    else if (cr == 0 && cc == 1) gt += g_im;
-                    else if (cr == 1 && cc == 1) gt -= g_re;
-                }
+                auto is_factor = [&](int pidx) -> bool {
+                    if (pidx < nch) return d_amp_chain[a] == pidx;
+                    int sc = pidx - nch;            // step_data 存的是去掉 nch 的偏移
+                    for (int ss = d_step_offsets[a]; ss < d_step_offsets[a + 1]; ++ss)
+                        if (d_step_data[ss] == sc) return true;
+                    return false;
+                };
+                if (!is_factor(j) || !is_factor(k)) continue;
+                // z = v_a / (p_j · p_k)
+                double pr = d_p_re[j], pi = d_p_im[j];
+                double qr = d_p_re[k], qi = d_p_im[k];
+                double dr = pr * qr - pi * qi;
+                double di = pr * qi + pi * qr;
+                double dsq = dr * dr + di * di;
+                if (dsq < 1e-300) dsq = 1e-300;
+                double vr = d_v_re[a], vi = d_v_im[a];
+                double zr = (vr * dr + vi * di) / dsq;
+                double zi = (vi * dr - vr * di) / dsq;
+                // 实坐标 8 块, 系数 = Re/Im(z) (j==k 已排除)
+                //   ∂²V_r: (Re,Re)=+zr (Re,Im)=-zi (Im,Re)=-zi (Im,Im)=-zr
+                //   ∂²V_i: (Re,Re)=+zi (Re,Im)=+zr (Im,Re)=+zr (Im,Im)=-zi
+                double d2Vr, d2Vi;
+                if (cr == 0 && cc == 0)      { d2Vr =  zr; d2Vi =  zi; }
+                else if (cr == 0 && cc == 1) { d2Vr = -zi; d2Vi =  zr; }
+                else if (cr == 1 && cc == 0) { d2Vr = -zi; d2Vi =  zr; }
+                else                         { d2Vr = -zr; d2Vi = -zi; }
+                gt += d_g_v[a] * d2Vr + d_g_v[na + a] * d2Vi;
             }
             sum += gt;
         }
@@ -594,18 +603,6 @@ struct TransKeyParts {
     std::string group;                                       // chain.name
     std::vector<std::pair<std::string, std::string>> elems;  // (中间态名, 共振态名)
 };
-
-// 中间态名等价判定: 完全相同, 或一个是另一个的 "<name>_<序号>" 实例形式
-// （如 "R_Keta" 与 "R_Keta_0"）
-bool transIdentEqual(const std::string& a, const std::string& b)
-{
-    if (a == b) return true;
-    auto pref = [](const std::string& x, const std::string& y) {
-        return y.size() > x.size() && y.compare(0, x.size(), x) == 0 &&
-               y[x.size()] == '_';
-    };
-    return pref(a, b) || pref(b, a);
-}
 
 // 删除 name 在 s 中的所有出现并规整 '_' 分隔（归一化 chain.name 用）
 std::string transStripName(const std::string& s, const std::string& name)
@@ -713,8 +710,24 @@ CouplingMatrixResult CouplingMatrixBuilder::buildWithTrans(
                 "[ctpwa] warn: trans 约束 [%s, ...] 有 %zu 个链名但给了 %zu 个比值; 多余的忽略\n",
                 names[0].c_str(), names.size(), vals.size());
 
-        struct Hit { int ci; std::string base; std::string tag; bool has_elem; };
+        // 每条匹配链: group（chain.name）/ groupKey（去掉被约束点名部分后的归一化
+        // 链名, 作为"同一拓扑"的配对键）/ elems（各层 (中间态, 共振态)）
+        struct Hit {
+            int ci;
+            std::string groupKey;
+            std::vector<std::pair<std::string, std::string>> elems;
+        };
         std::vector<std::vector<Hit>> hits(names.size());
+
+        // 去掉链名的 "_<序号>" 实例后缀（深层子中间态的实例语义用）
+        auto stripInstanceSuffix = [](std::string s) {
+            auto us = s.rfind('_');
+            if (us == std::string::npos || us + 1 >= s.size()) return s;
+            std::string num = s.substr(us + 1);
+            if (num.find_first_not_of("0123456789") != std::string::npos) return s;
+            s.erase(us);
+            return s;
+        };
 
         for (size_t j = 0; j < names.size(); ++j) {
             const std::string& nm = names[j];
@@ -763,78 +776,102 @@ CouplingMatrixResult CouplingMatrixBuilder::buildWithTrans(
                 TransKeyParts p = parseKey(chain_keys[ci]);
                 Hit h;
                 h.ci = ci;
-                h.base = transStripName(p.group, nm);  // 归一化链名（去掉名字出现）
-                h.tag.clear();
-                h.has_elem = false;
-                for (const auto& e : p.elems) {
-                    if (transIdentEqual(e.first, nm)) {
-                        if (!h.has_elem) { h.tag = e.second; h.has_elem = true; }
-                        continue;   // 被约束点名的中间态不进组合键（B/C 与 A 各自独立）
-                    }
-                    h.base += "|" + e.first + "[" + e.second + "]";
-                }
+                // 配对键 = 链名去掉被约束点名的部分（约束名可能是中间态名, 也可能是
+                // "omega_Rx_rho0" 这类链名/子链片段）。名字没出现在链名里（深层子中
+                // 间态的实例语义）时, 再去掉 "_<序号>" 实例后缀。
+                h.groupKey = transStripName(p.group, nm);
+                if (p.group.find(nm) == std::string::npos)
+                    h.groupKey = stripInstanceSuffix(h.groupKey);
+                h.elems = p.elems;
                 hits[j].push_back(std::move(h));
             }
         }
         if (hits[0].empty()) continue;
 
-        // 组合键分组（names[0]）
+        // groupKey → names[0] 的下标（保持 chain_keys 顺序）
         std::map<std::string, std::vector<int>> gA;
-        for (size_t a = 0; a < hits[0].size(); ++a) gA[hits[0][a].base].push_back((int)a);
+        for (size_t a = 0; a < hits[0].size(); ++a) gA[hits[0][a].groupKey].push_back((int)a);
+
+        // 逐位比较两条链的共振组合差异（长度不同每缺一位记 2, 更贵）
+        auto elemDiff = [](const std::vector<std::pair<std::string, std::string>>& a,
+                           const std::vector<std::pair<std::string, std::string>>& b) {
+            int d = 0;
+            size_t n = std::max(a.size(), b.size());
+            for (size_t i = 0; i < n; ++i) {
+                if (i >= a.size() || i >= b.size()) { d += 2; continue; }
+                if (a[i].first != b[i].first || a[i].second != b[i].second) ++d;
+            }
+            return d;
+        };
+        struct Cand { int diff; size_t ai, bi; };
+        auto candLess = [](const Cand& x, const Cand& y) {
+            if (x.diff != y.diff) return x.diff < y.diff;
+            if (x.ai != y.ai) return x.ai < y.ai;
+            return x.bi < y.bi;
+        };
 
         int paired = 0, folded = 0;
-        std::vector<bool> noted_diff_tag(names.size(), false);  // 每个名字只提示一次
+        std::vector<bool> noted_diff(names.size(), false);  // 每个名字只提示一次
         for (const auto& kv : gA) {
-            const std::string& base = kv.first;
+            const std::string& gk = kv.first;
             const std::vector<int>& a_idx = kv.second;
             for (size_t j = 1; j < names.size(); ++j) {
                 std::vector<int> b_idx;
                 for (size_t b = 0; b < hits[j].size(); ++b)
-                    if (hits[j][b].base == base) b_idx.push_back((int)b);
+                    if (hits[j][b].groupKey == gk) b_idx.push_back((int)b);
                 if (b_idx.empty()) continue;
+                // 最小差异贪心配对: 同共振组合（差异 0/1, 差异处就是被约束点名的
+                // 那一层）优先一一对应, 不会把 f0_2020 配到 f2_2340 上。
+                std::vector<Cand> cand;
+                for (size_t ai = 0; ai < a_idx.size(); ++ai)
+                    for (size_t bi = 0; bi < b_idx.size(); ++bi)
+                        cand.push_back({elemDiff(hits[0][a_idx[ai]].elems,
+                                                 hits[j][b_idx[bi]].elems), ai, bi});
+                std::sort(cand.begin(), cand.end(), candLess);
                 std::vector<bool> usedA(a_idx.size(), false), usedB(b_idx.size(), false);
-                // ① 该中间态共振态名相同 → 同共振、不同电荷道/实例, 直接配对
-                for (size_t bi = 0; bi < b_idx.size(); ++bi) {
-                    const Hit& hb = hits[j][b_idx[bi]];
-                    if (!hb.has_elem || hb.tag.empty()) continue;
-                    for (size_t ai = 0; ai < a_idx.size(); ++ai) {
-                        if (usedA[ai]) continue;
-                        const Hit& ha = hits[0][a_idx[ai]];
-                        if (ha.has_elem && ha.tag == hb.tag) {
-                            usedA[ai] = usedB[bi] = true;
-                            ++paired;
-                            if (foldPair(hb.ci, ha.ci, ratios[j])) ++folded;
-                            break;
-                        }
-                    }
-                }
-                // ② 余下按顺序配对（两侧该中间态用了不同共振态定义时, 仍按组合次序对应）
-                std::vector<size_t> la, lb;
-                for (size_t ai = 0; ai < a_idx.size(); ++ai) if (!usedA[ai]) la.push_back(ai);
-                for (size_t bi = 0; bi < b_idx.size(); ++bi) if (!usedB[bi]) lb.push_back(bi);
-                if (!la.empty() && la.size() != lb.size())
-                    fprintf(stderr,
-                        "[ctpwa] warn: trans [%s, %s] 组合 \"%s\" 两侧链数不同 (%zu vs %zu); "
-                        "只折叠 %zu 对\n",
-                        names[0].c_str(), names[j].c_str(), base.c_str(),
-                        la.size(), lb.size(), std::min(la.size(), lb.size()));
-                for (size_t k = 0; k < la.size() && k < lb.size(); ++k) {
-                    const Hit& ha = hits[0][a_idx[la[k]]];
-                    const Hit& hb = hits[j][b_idx[lb[k]]];
+                for (const auto& c : cand) {
+                    if (usedA[c.ai] || usedB[c.bi]) continue;
+                    usedA[c.ai] = usedB[c.bi] = true;
+                    const Hit& ha = hits[0][a_idx[c.ai]];
+                    const Hit& hb = hits[j][b_idx[c.bi]];
                     ++paired;
+                    if (c.diff > 1)
+                        fprintf(stderr,
+                            "[ctpwa] warn: trans [%s, %s] 配对的两条链差异较大 (%d 处不同): "
+                            "%s ↔ %s\n",
+                            names[0].c_str(), names[j].c_str(), c.diff,
+                            chain_keys[ha.ci].c_str(), chain_keys[hb.ci].c_str());
                     if (foldPair(hb.ci, ha.ci, ratios[j])) {
                         ++folded;
-                        if (!noted_diff_tag[j] && ha.has_elem && hb.has_elem &&
-                            ha.tag != hb.tag) {
-                            noted_diff_tag[j] = true;
+                        if (!noted_diff[j] && c.diff > 0) {
+                            std::string da, db;
+                            size_t n = std::max(ha.elems.size(), hb.elems.size());
+                            for (size_t k = 0; k < n; ++k) {
+                                const std::string ea = k < ha.elems.size()
+                                    ? ha.elems[k].first + "[" + ha.elems[k].second + "]" : "-";
+                                const std::string eb = k < hb.elems.size()
+                                    ? hb.elems[k].first + "[" + hb.elems[k].second + "]" : "-";
+                                if (ea == eb) continue;
+                                if (!da.empty()) { da += ", "; db += ", "; }
+                                da += ea; db += eb;
+                            }
+                            noted_diff[j] = true;
                             fprintf(stderr,
-                                "[ctpwa] note: trans [%s, %s] = %g: 折叠的链中该中间态用了不同"
-                                "共振态定义 (如 %s vs %s), 只共享耦合/步参数, 线形各自独立\n",
+                                "[ctpwa] note: trans [%s, %s] = %g: 配对链在 %s vs %s 处不同 "
+                                "（只共享耦合/步参数, 该层线形各自独立）\n",
                                 names[0].c_str(), names[j].c_str(), ratios[j],
-                                hb.tag.c_str(), ha.tag.c_str());
+                                da.c_str(), db.c_str());
                         }
                     }
                 }
+                size_t leftA = 0, leftB = 0;
+                for (bool u : usedA) if (!u) ++leftA;
+                for (bool u : usedB) if (!u) ++leftB;
+                if (leftA || leftB)
+                    fprintf(stderr,
+                        "[ctpwa] warn: trans [%s, %s] 链组 \"%s\" 两侧组合数不同 (剩 %zu vs %zu); "
+                        "未配对的链保持独立\n",
+                        names[0].c_str(), names[j].c_str(), gk.c_str(), leftA, leftB);
             }
         }
         if (paired == 0)

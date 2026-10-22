@@ -1,7 +1,7 @@
 # CHANGELOG（`example/`）
 
 本文件记录对上游 `BHXiang/ctpwa` 的改动中、**`example/` 目录内**各文件的内容变化
-（PR #1–#17）。其它目录随上游维护，不在本表；上游同步见文末。
+（PR #1–#18）。其它目录随上游维护，不在本表；上游同步见文末。
 日期 = 合并进 `main` 的日期；“PR #n”指 `wwdws1/ctpwa` 的合并请求。
 
 > 只列**行为/接口/文档**变化；纯格式（ruff-format/空白）只在首次记录。
@@ -25,6 +25,25 @@
   优化器相关）。
 - 2026-09-22（PR #2 `3ea973c`）`final_nll` 取**最终接受点**真实 NLL；`parameters.txt` 第 0 行
   固定参考统一标 `(fixed)`；`getHessian` 耦合块顺序经有限差分确认为 **BLOCK**。
+- 2026-10-22（PR #18，并入上游 `bc70a79`）**非正定时改走有效秩截断**（新开关
+  `--no-errors-truncate` 可退回旧的 pinv）：`--err-mode auto` 且 Hessian 不定时，保留
+  `λ_i > τ·λmax` 的方向做误差传播 `σ²_m = Σ_{i∈keep} E[m,i]²/λ_i`，**每个参数仍有有限误差**，
+  被冻结的线性组合（未测定方向）单独列出并记录在 `_last_error_truncation`；
+  `strict/pinv/psd` 显式指定时语义不变。非正定警告措辞同步更新。
+
+### 参数削减 / 边界诊断（并入上游 `bc70a79`）
+- 2026-10-22（PR #18）新增 `--fit-mode {0,1}`：`0`=FREEPARAMS chain×step（默认）、
+  `1`=VSPACE 逐振幅（Hessian 二阶项恒为 0 → 精确）。fit_mode 只能在 `ctpwa.analysis()`
+  构造期决定，故在 **import 期**用 `_fit_mode_from_argv()` 从 argv/`FIT_MODE` 取出并传给
+  `ctpwa.analysis(cfg, _FIT_MODE)`（需 ctpwa ≥ 0.3.10）。
+- 2026-10-22（PR #18）新增 `--reduce-params`（配合 `--rank-tau`/`--rank-iters`/
+  `--rank-fixed-point`/`--rank-scale`）：用精确 Hessian 的**有效秩**构造降维基
+  `p = p0 + E·y`，在保留子空间做降维重拟合，输出冻结组合与全参数误差到
+  `param_reduction.txt` / `best_params_reduced.pt`；采用降维解时会打印并置
+  `_err_full=None`（协方差/相关矩阵 CSV 在最终点重算）。
+- 2026-10-22（PR #18）新增 `--bound-margin`（默认 0.02）：列出贴住 `free_range` 的 θ
+  （边距 + `|∂NLL/∂θ|`），标注“边界/非驻点评估 → 假非正定”。
+- 摘要 `optimization_summary.txt` 增 `fit_mode` / `err_mode`+截断 / 参数削减 `k` 三行。
 
 ### 可观测性 / 方法学
 - 2026-09-23（PR #4）去掉静默降级（polish/FF/保存失败改 `log.exception` + `polish_status`）；
@@ -92,6 +111,8 @@
 - 2026-09-25（PR #13 `2d9c761`）`--warm-start auto` 目录修正 + 输出/日志约定。
 - 2026-09-29（PR #16）末尾新增 **§8 `plot.py` 使用说明**。
 - 2026-09-29（PR #17）开头注明 `plot.py` 见 §8、变更历史见 `CHANGELOG.md`。
+- 2026-10-22（PR #18）新增 **§9 参数削减 / 误差截断 / 边界诊断 / `--fit-mode`** 参数表与
+  使用建议（含 `--reduce-params` 会替换最终解、生产默认不开的说明）。
 
 ---
 
@@ -110,3 +131,16 @@
   - `7c59d36` trans 支持 N 个链名 + 每名字一个比值；ONE 占位质量不进振幅；
   - `754cd98` 发布 v0.3.9（`setup.py`）。
   - 涉及文件：`include/*`、`src/*`、`tests/configs/trans_multi*.yml`、`tests/test_trans_host.py`、`setup.py`。
+- 2026-10-22（PR #18）并入上游 `BHXiang/ctpwa`（`68e0d0c` → `0e452a1`，13 个提交，
+  tag v0.3.10–v0.3.14）：
+  - `77b2bd6` trans 约束名可为链名/子链片段；配对改最小差异匹配（v0.3.10）；
+  - `98ed8f2`/`970c77b` phsp Hessian 大 n 回退（n² 共享内存超限）+ `CTPWA_PHSP_HESS_DEBUG`（v0.3.11）；
+  - `63e8206`/`7b2cd2c` identical 每-σ 四动量缓冲被提前释放修复 + ident4 回归（v0.3.12）；
+  - `c997a3f` Hessian 乘法链二阶项用 `v_a/(p_j·p_k)`、补齐 step×step 项（v0.3.13）；
+  - `50259f2` Info.cu 同一 intermediate 下重复 `[J,P]` 块被覆盖 → 共振态丢失 + 重复列两次（v0.3.14）；
+  - `bc70a79` `example/fit.py` 新功能（见上两节），唯一与我们的冲突点，按“双方都保留”手工合并；
+  - 涉及文件：`include/AmpGen.cuh`、`src/{AmpGen,ComputeHessian,Info,Parameters}.cu`、
+    `setup.py`、`tests/*`（新增 ident4 / trans_multi_step / dupjp / hess_mult 等回归）、`example/fit.py`。
+  - 环境：`ctpwa` pip 包需 ≥ 0.3.10（`analysis(config, fit_mode)`）；本机 0.3.13
+    （含全部 v0.3.13 C++）。`50259f2` 只在生产配置存在“重复 `[J,P]` 块”时才影响结果，
+    经查 `jlsp/pwa/all/single` 无此结构 → 现有结果不受影响。
