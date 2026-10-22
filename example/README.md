@@ -3,7 +3,8 @@
 `example/fit.py` 是 ctpwa 的拟合驱动脚本：读取 `config.yml` → 构建振幅 → 多次优化 →
 Hessian / 参数误差 → 保存结果与摘要。
 
-本文主要说明**可选参数**和**三种优化器的区别**；画图脚本 `plot.py` 见 §8。
+本文主要说明**可选参数**和**三种优化器的区别**；画图脚本 `plot.py` 见 §8，
+参数削减/误差截断/边界诊断/`--fit-mode` 见 §9。
 各文件的变更历史见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ---
@@ -209,16 +210,20 @@ python fit.py --optimizer projected --runs 5
 ### 误差估计（Hessian 非正定回退）
 | 参数 | 说明 | 默认 | 环境变量 |
 |---|---|---|---|
-| `--err-mode` | `auto`=PD 直接求逆、否则伪逆；`strict`=原行为(非PD不给)；`pinv`=伪逆(丢 `λ<τλmax` 方向)；`psd`=把 `λ` 截到 `τλmax` 后求逆(更保守) | `reparam`→`auto`，其它→`strict` | `FIT_ERR_MODE` |
+| `--err-mode` | `auto`=PD 直接求逆，否则**有效秩截断**（见下）；`strict`=原行为(非PD不给)；`pinv`=伪逆(丢 `λ<τλmax` 方向)；`psd`=把 `λ` 截到 `τλmax` 后求逆(更保守) | `reparam`→`auto`，其它→`strict` | `FIT_ERR_MODE` |
 | `--err-tau` | 相对阈值 `τ`（`λ<τ·λmax` 视为平坦/不可测） | `1e-6` | `FIT_ERR_TAU` |
+| `--no-errors-truncate` | 关闭“非正定时按有效秩截断传播误差”，退回旧的 `pinv` | 开启截断 | `FIT_ERRORS_TRUNCATE=0` |
 
 > **默认策略**：显式 `--err-mode` > `FIT_ERR_MODE` > **优化器相关**（`reparam`→`auto`，
 > 其它→`strict`）。即：只有选 `reparam` 时默认才自动回退给误差；`projected`/`lbfgs`
 > 默认与上游一致（非正定就不给误差）。
 > 当精确 Hessian 近奇异/非正定（本模型常见，存在 ~20–30 维近平坦子空间）时，`auto`
-> 自动退化为伪逆并给出参数误差，同时在日志打印 `mode=... / λmin / λmax / flat=N`；
+> 保留 `λ_i > τ·λmax` 的方向做误差传播 `σ²_m = Σ_{i∈keep} E[m,i]²/λ_i`：
+> **每个参数仍有有限误差**（只有被冻结的线性组合没有），日志打印保留维数/λmin/cond 与
+> 冻结方向数（`--reduce-params` 可看这些组合的物理内容）；
 > 输出会标注这是**秩亏下的可行估计，非严格统计误差**。
-> `--err-mode strict` 可恢复“非正定就不给误差”的旧行为。
+> `--no-errors-truncate` 退回旧的伪逆（`σ=0` 的“无误差”口径）；
+> `--err-mode strict` 恢复“非正定就不给误差”的行为。
 
 ### Warm start
 | 参数 | 说明 | 默认 | 环境变量 |
@@ -247,6 +252,17 @@ python fit.py --optimizer projected --runs 5
 |---|---|---|---|
 | `--output-dir` | 结果输出目录 | `results` | — |
 
+### 参数化 / 参数削减 / 边界诊断（见 §9）
+| 参数 | 说明 | 默认 | 环境变量 |
+|---|---|---|---|
+| `--fit-mode` | `0`=FREEPARAMS chain×step；`1`=VSPACE 逐振幅（Hessian 二阶项恒为 0 → 精确）。**只能在构造期决定**，故由 import 期读取 | 0 | `FIT_MODE` |
+| `--reduce-params` | 拟合后用 Hessian 有效秩降维并**降维重拟合**，输出冻结组合与全参数误差 | False | `FIT_REDUCE_PARAMS=1` |
+| `--rank-tau` | 有效秩门槛 `λ_i > tau·λmax` | `1e-3` | `FIT_RANK_TAU` |
+| `--rank-iters` | 降维重拟合的 LBFGS 迭代上限 | 300 | `FIT_RANK_ITERS` |
+| `--rank-fixed-point` | 降维基重算次数（基依赖拟合点） | 1 | `FIT_RANK_FIXED_POINT` |
+| `--rank-scale` | 有效秩尺度基准：`max`/`median`/`p90`（病态/跑飞解用 `median`） | `max` | `FIT_RANK_SCALE` |
+| `--bound-margin` | θ 贴边告警阈值（占 `free_range` 宽度比例） | 0.02 | `FIT_BOUND_MARGIN` |
+
 ---
 
 ## 5. 环境变量
@@ -258,6 +274,8 @@ FIT_RUNS  FIT_NITER  FIT_LR  FIT_TOL_GRAD  FIT_TOL_CHANGE  FIT_HISTORY_SIZE
 FIT_VMAX  FIT_AMP_MAX  FIT_AMP_LAMBDA  FIT_PROJECT  FIT_OPTIMIZER  FIT_OPT_VERBOSE
 FIT_ERR_MODE  FIT_ERR_TAU  FIT_POLISH  FIT_WARM  FIT_WAVES  FIT_EVENT_DATA
 FIT_CHECKPOINT_INTERVAL  FIT_SEED
+FIT_MODE  FIT_REDUCE_PARAMS  FIT_RANK_TAU  FIT_RANK_ITERS  FIT_RANK_FIXED_POINT
+FIT_RANK_SCALE  FIT_ERRORS_TRUNCATE  FIT_BOUND_MARGIN
 # 诊断 / 复现实验 / projected A/B 开关（默认=当前行为，一般不用设）：
 FIT_OPT_PROF  FIT_DETERMINISTIC  FIT_OPT_M  FIT_OPT_TWOLOOP  FIT_OPT_HONEST
 FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
@@ -288,11 +306,14 @@ FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
 | `weight_best.root` | 最佳解的权重文件（供 `plot.py` 画图） |
 | `param_covariance.csv` | **最佳点**的参数协方差矩阵（完整 N×N，`--err-mode` 回退口径） |
 | `param_correlation.csv` | **最佳点**的参数关联系数矩阵 `ρ_ij=C_ij/(σ_iσ_j)`（完整 N×N；`σ=0` 处置 `nan`） |
+| `param_reduction.txt` | 仅 `--reduce-params`：参数削减报告（保留维度 k / 条件数 / 被冻结线性组合 / 全参数 σ） |
+| `best_params_reduced.pt` | 仅 `--reduce-params` 且采用降维解时：降维重拟合后的参数 |
 
 > 参数协方差/相关矩阵只在**正常拟合**时输出（`--ff-only` 不输出），且只对 **best** 点；
 > log 里有一行 `[param-err] 参数协方差/相关矩阵已保存: ...` 提醒。矩阵覆盖**全部非固定参数**
-> （排除固定参考 `idx 0/nc`，含贴边 `active`）。因本模型常见 `PD=False`、`err_mode=auto→pinv`，
-> 这是**秩亏下的可行估计、非严格统计误差**（CSV 头部亦有注明）。
+> （排除固定参考 `idx 0/nc`，含贴边 `active`）。因本模型常见 `PD=False`、`err_mode=auto`
+> 走有效秩截断（`--no-errors-truncate` 则退回伪逆），这是**秩亏下的可行估计、非严格统计误差**
+> （CSV 头部亦有注明）。
 
 > `plot.py` 另外生成 `results_plot.pdf` 等图形，不属于 `fit.py`。
 
@@ -315,8 +336,10 @@ FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
    Hessian、误差全部基于**真实 NLL**，不受罚项影响。
 3. 结果普遍 `正定性=False`：精确 Hessian 存在 ~20–30 维近平坦/简并子空间（诊断显示
    沿负特征值方向 NLL 两侧都不下降，说明是数值/秩亏而非真鞍点）。**用 `reparam` 时**
-   参数误差默认由 `--err-mode auto` 自动回退到伪逆给出，并标注为“可行估计、非严格统计
-   误差”；`projected`/`lbfgs` 默认 `strict`（非正定不给误差）。**拟合分数/效率不再以真 PD
+   参数误差默认由 `--err-mode auto` **按有效秩截断传播**（保留 `λ>τλmax` 方向，
+   `σ²_m=Σ E[m,i]²/λ_i`，被冻结组合单独列出），并标注为“可行估计、非严格统计误差”；
+   `--no-errors-truncate` 退回旧的伪逆口径；`projected`/`lbfgs` 默认 `strict`（非正定不给
+   误差）。`--bound-margin` 可列出贴边 θ（常见的“假非正定”来源）。**拟合分数/效率不再以真 PD
    为门控**：非正定时用与 `--err-mode` 一致的回退曲率传播误差（中心值恒输出）。
 4. `--lr` 只对 `reparam`/`lbfgs` 有意义；`projected` 不用 `lr`，其停机由
    `--tol-grad`（gtol）控制。
@@ -371,3 +394,65 @@ python plot.py --nll 3        # 画第 3 个 run 的 NLL 历史
 ### 依赖
 - `uproot` 读取 ROOT 文件；`--params` 需要 GPU + `ctpwa`。
 - 复数 dtype 按 `ctpwa` `.so` 编译精度自动选择（`complex128`/`complex64`）。
+
+---
+
+## 9. 参数化 / 参数削减 / 误差截断 / 边界诊断（上游 `bc70a79` 并入）
+
+四组开关，**默认都保持既有行为**，按需开启。
+
+### 9.1 `--fit-mode {0,1}`：参数化
+
+| 值 | 含义 |
+|---|---|
+| `0`（默认） | `FREEPARAMS`：chain×step 参数化（与历史结果一致） |
+| `1` | `VSPACE`：逐振幅（每个振幅只有 1 个因子 → Hessian 二阶项恒为 0 → 精确） |
+
+```bash
+python -u fit.py --fit-mode 1 --runs 5 --niter 500
+```
+
+⚠ `fit_mode` **只能在 `ctpwa.analysis()` 构造期决定**（构造后 `setFitMode` 改不了参数化）。
+`fit.py` 因此在 **import 期**用 `_fit_mode_from_argv()` 从 argv / `FIT_MODE` 取出该值与
+`--config` 一起传给 `ctpwa.analysis()`；需要 `ctpwa ≥ 0.3.10`。
+
+### 9.2 `--reduce-params`：有效秩降维 + 降维重拟合
+
+动机：乘积参数化下数据往往只约束住 Hessian 的一部分方向，其余方向近平坦甚至微负 →
+直接求逆给出天文数字误差。把弱方向**冻结**、只保留 stiff 子空间：
+
+```bash
+python -u fit.py --reduce-params                  # 默认 tau=1e-3、iters=300
+python -u fit.py --reduce-params --rank-scale median   # 谱病态/跑飞解
+```
+
+- 用精确 Hessian 的有效秩构造降维基 `p = p0 + E·y`，在 `y` 空间（Hessian 按构造正定、
+  条件数从 ~1e7 降到 ~1e3）重新拟合；
+- 输出 `param_reduction.txt`：保留维度 `k`、条件数、**被冻结的线性组合**（≈本数据未测定
+  的方向，给出前 3 个主要分量）与每个参数由保留子空间传播的 σ；
+- 若降维解 NLL 不差于原解（`≤ +1e-6`），**采用降维解作为最终结果**并另存
+  `best_params_reduced.pt`，同时 `best_params.pt`/`weight_best.root` 用新解；
+- 采用降维解时对角误差改为降维基传播，协方差/相关矩阵 CSV 在**最终点**重算。
+- 相关旋钮：`--rank-tau`（门槛 `λ_i > tau·λmax`，默认 `1e-3`）、`--rank-iters`、
+  `--rank-fixed-point`（降维基重算次数）、`--rank-scale {max,median,p90}`。
+
+> 生产作业默认**不开**（会改变最终解与 `best_params.pt`）；用于诊断“误差给不出来”的原因。
+
+### 9.3 `--no-errors-truncate`：非正定误差口径
+
+`--err-mode auto`（`reparam` 默认）下 Hessian 不定时，默认改为**有效秩截断**：
+只保留 `λ_i > τ·λmax` 的方向做误差传播 `σ²_m = Σ_{i∈keep} E[m,i]²/λ_i` →
+**每个参数仍有有限误差**，被冻结的只是那些线性组合。加 `--no-errors-truncate` 退回旧的
+伪逆口径（未测定方向 σ=0）。`--err-mode strict/pinv/psd` 显式指定时不受影响。
+
+### 9.4 `--bound-margin`：贴边参数诊断
+
+```bash
+python -u fit.py --bound-margin 0.02 --runs 1 --niter 200
+# [bounds] ⚠ 1 个参数贴住边界 (边距 < 2% 宽度):
+# [bounds]   phi1680_width: 1.5 ∈ [0.1, 1.5] 边距=  0.0% |∂NLL/∂θ|=3527
+```
+
+θ 顶到 `free_range` 边界后 reparam 的 sigmoid 梯度→0、优化器按容差停机，但物理空间梯度
+很大 → Hessian 是在**边界/非驻点**上评估的，容易得到“假非正定”。该诊断会算出
+`|∂NLL/∂θ|` 提示应放宽范围或加先验。
