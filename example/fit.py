@@ -92,8 +92,25 @@ def _config_path_from_argv(default: str = "config.yml") -> str:
     return os.path.abspath(default)
 
 
+def _fit_mode_from_argv(default=0):
+    """在 argparse 之前取出 --fit-mode。
+
+    ⚠ 分析对象在**模块导入期**构造，而 fit_mode 只能在构造期决定
+    （构造后 setFitMode 改不了参数化）→ 必须在这里取。
+    0=FREEPARAMS(chain×step), 1=VSPACE(逐振幅, Hessian 二阶项恒为 0 → 精确)。
+    """
+    argv = sys.argv[1:]
+    for i, a in enumerate(argv):
+        if a == "--fit-mode" and i + 1 < len(argv):
+            return int(argv[i + 1])
+        if a.startswith("--fit-mode="):
+            return int(a.split("=", 1)[1])
+    return int(os.environ.get("FIT_MODE", default))
+
+
+_FIT_MODE = _fit_mode_from_argv()
 int_time1 = int(time.time())
-ana = ctpwa.analysis(_config_path_from_argv())
+ana = ctpwa.analysis(_config_path_from_argv(), _FIT_MODE)
 int_time2 = int(time.time())
 print(f"振幅初始化耗时: {int_time2 - int_time1} 秒")
 
@@ -815,6 +832,22 @@ class UnifiedPWAOptimizer:
         # 后续（正定性判定/参数误差/分支比误差）直接复用。
         self._hess_cache = None  # (params.clone(), hessian_full)
 
+        # ---- 参数削减 (--reduce-params): 用精确 Hessian 的有效秩构造降维基 ----
+        # rank_tau: 有效秩门槛 λ_i > tau·λmax (默认 1e-3 → 保留子空间条件数 ~1e3)
+        # errors_truncate: Hessian 不定时不再"拒绝给误差", 改为在有效秩子空间上做
+        #                  误差传播 σ²_m = Σ_{i∈keep} E[m,i]²/λ_i (冻结组合单独列出)
+        self.rank_tau = float(os.environ.get("FIT_RANK_TAU", "1e-3"))
+        self.rank_iters = _env_int("FIT_RANK_ITERS", 300)
+        self.rank_fixed_point = _env_int("FIT_RANK_FIXED_POINT", 1)
+        self.errors_truncate = _env_bool("FIT_ERRORS_TRUNCATE", True)
+        self.bound_margin = float(os.environ.get("FIT_BOUND_MARGIN", "0.02"))
+        # 有效秩的尺度: max(默认) / median / p90 —— 病态点(跑飞解 λmax 被抬高几个
+        # 量级)应改用 median, 否则 tau·λmax 门槛过高会把有效秩压得过小。
+        self.rank_scale = str(os.environ.get("FIT_RANK_SCALE", "max")).lower()
+        self._last_reduction = None
+        self._last_error_truncation = None
+        self.fit_mode = int(os.environ.get("FIT_MODE", "0"))
+
         # 共振态参数bounds (GPU)
         if self.has_free_res:
             self._lower = free_res_info[1].to(dtype=torch.float64, device=self.device)
@@ -1483,11 +1516,14 @@ class UnifiedPWAOptimizer:
 
         与 polish 共用「非活跃子空间」判据：去掉固定参考(0/nc) + 活跃集剔除，
         对剩余子空间做对称特征分解，按 mode 构造协方差：
-          auto(默认): 真 PD → 直接求逆；否则 → pinv
+          auto(默认): 真 PD → 直接求逆；否则 → 有效秩截断传播误差
+                     （σ²_m = Σ_{i∈keep} E[m,i]²/λ_i；--no-errors-truncate 可退回 pinv）
           strict    : 真 PD → 直接求逆；否则不给误差(None)
           pinv      : 强制伪逆（丢掉 λ<τλmax 的方向）
           psd       : 强制把 λ 截到 τλmax 后求逆（更保守）
         被 free_range 钉住的参数返回 NaN。
+        非 PD 走截断时，被冻结的线性组合记录在 self._last_error_truncation
+        （供 --reduce-params 报告与摘要使用）。
 
         索引映射按分块布局（与 params 一致）:
           red = [Re_1..Re_{nc-1}, Im_1..Im_{nc-1}, θ_0..θ_{n_res-1}]
@@ -1496,6 +1532,7 @@ class UnifiedPWAOptimizer:
         注：日志标签 `[param-err]` 中的 error 指**参数不确定度 (error bar)**，
         不是程序报错；它报告误差在哪个 mode / 多大简并子空间下算出。
         """
+        self._last_error_truncation = None
         nc = self.n_coupling_free
         if mode is None:
             mode = self.err_mode
@@ -1559,9 +1596,18 @@ class UnifiedPWAOptimizer:
         out["is_pd"] = is_pd
         n_flat = int((eig < tau * lmax).sum().item())
         out["n_flat"] = n_flat
+        tail = f"λmin={lmin:.3e}, λmin/λmax={lmin / lmax.item():.2e}"
 
+        eff_rank = int((eig > tau * lmax).sum().item())
         if mode == "auto":
-            eff = "inv" if is_pd else "pinv"
+            if is_pd:
+                eff = "inv"
+            elif self.errors_truncate:
+                # 不定 → 有效秩截断：只保留 λ_i > tau·λmax 的方向，再把误差传播到
+                # **所有**自由参数（被冻结的线性组合才是"未测定方向"）
+                eff = "trunc"
+            else:
+                eff = "pinv"
         elif mode == "strict":
             if not is_pd:
                 log.warning(
@@ -1574,13 +1620,18 @@ class UnifiedPWAOptimizer:
         else:
             eff = mode  # pinv / psd 强制
 
+        if eff == "trunc" and eff_rank == 0:
+            log.warning(f"有效秩为 0 (全部方向不定): {tail} → 无法给出误差")
+            out["mode_used"] = "trunc(rank-0)"
+            return out
+
         try:
             if eff == "inv":
                 cov = torch.linalg.inv(H_k)
             elif eff == "psd":
                 eig2 = torch.clamp(eig, min=tau * lmax)
                 cov = (vec * (1.0 / eig2)) @ vec.t()
-            else:  # pinv
+            else:  # pinv / trunc
                 inv_eig = torch.where(
                     eig > tau * lmax, 1.0 / eig, torch.zeros_like(eig)
                 )
@@ -1589,6 +1640,31 @@ class UnifiedPWAOptimizer:
         except Exception as e:
             log.exception(f"参数误差协方差求逆失败: {e}")
             return out
+
+        if eff == "trunc":
+            lam_min_ret = float(eig[eig > tau * lmax][0].item())
+            self._last_error_truncation = {
+                "k": eff_rank,
+                "n": int(eig.numel()),
+                "lam_min_ret": lam_min_ret,
+                "lam_min": lmin,
+                "lam_max": float(eig[-1].item()),
+                "tau": float(tau),
+            }
+            print(
+                f"[param-err] ⚠ 非活跃子空间 Hessian 不定 ({tail}) "
+                "→ 改用有效秩截断传播误差:"
+            )
+            print(
+                f"[param-err]   保留 {eff_rank}/{int(eig.numel())} 维, "
+                f"保留子空间 λmin={lam_min_ret:.3e}, "
+                f"cond={eig[-1].item() / lam_min_ret:.3e}"
+            )
+            print(
+                f"[param-err]   被冻结的 {int(eig.numel()) - eff_rank} 个线性组合"
+                "(=未测定方向) 没有有限误差; 其余每个参数都有误差(由保留子空间传播)"
+            )
+            print("[param-err]   想看冻结组合的物理内容: 加 --reduce-params")
 
         out["mode_used"] = eff
         sd_red = torch.full(
@@ -1609,12 +1685,13 @@ class UnifiedPWAOptimizer:
                 "[param-err]   这表示数据想把它们推到范围外 → 放宽该 free_range，"
                 "或按单侧限制报告"
             )
-        print(
-            f"[param-err] mode={eff} (请求 {mode}), λmin={lmin:.3e} "
-            f"λmax={eig[-1].item():.3e} λmin/λmax={lmin / lmax.item():.2e}, "
-            f"flat(λ<τ·λmax)={n_flat}/{len(eig)}, "
-            f"active={int(active_full.sum())}, keep={int(keep.sum())}"
-        )
+        if self._last_error_truncation is None:
+            print(
+                f"[param-err] mode={eff} (请求 {mode}), λmin={lmin:.3e} "
+                f"λmax={eig[-1].item():.3e} λmin/λmax={lmin / lmax.item():.2e}, "
+                f"flat(λ<τ·λmax)={n_flat}/{len(eig)}, "
+                f"active={int(active_full.sum())}, keep={int(keep.sum())}"
+            )
 
         # ---- 参数协方差矩阵（tf-pwa 口径）: 在**全部非固定参数** red 子空间上，
         # 含贴边 active（不额外剔除），供 save_param_matrices 输出 CSV。
@@ -1629,12 +1706,12 @@ class UnifiedPWAOptimizer:
                 _eig2 = torch.clamp(eig_r, min=tau * lmax_r)
                 cov_r = (vec_r * (1.0 / _eig2)) @ vec_r.t()
                 cov_mode = "psd"
-            else:  # pinv
+            else:  # pinv / trunc
                 _inv = torch.where(
                     eig_r > tau * lmax_r, 1.0 / eig_r, torch.zeros_like(eig_r)
                 )
                 cov_r = (vec_r * _inv) @ vec_r.t()
-                cov_mode = "pinv"
+                cov_mode = "trunc" if eff == "trunc" else "pinv"
             out["cov"] = cov_r
             out["cov_labels"] = [_label(int(j)) for j in red_idx.tolist()]
             out["cov_mode"] = cov_mode
@@ -1661,13 +1738,335 @@ class UnifiedPWAOptimizer:
         return out
 
     # --------------------------------------------------------
+    # 参数削减 (--reduce-params): 有效秩降维 + 降维重拟合 + 全参数误差
+    # --------------------------------------------------------
+    def _coord_name(self, full_idx):
+        """统一参数下标 -> 可读名字 (Re(c)/Im(c)/θ 通用: 名字段都是 full_idx-nc)。"""
+        j = full_idx - self.n_coupling_free
+        if j < 0:
+            return f"Re({self.params_names[full_idx]})"
+        if j < len(self.params_names):
+            tag = (
+                "Re"
+                if full_idx < self.n_coupling_free
+                else ("Im" if full_idx < 2 * self.n_coupling_free else "θ")
+            )
+            return f"{tag}({self.params_names[j]})"
+        return f"idx{full_idx}"
+
+    def compute_reduction(self, params_phys, tau=None, exclude_active=True):
+        """用精确 Hessian 的**有效秩**构造降维基 p = p0 + E·y。
+
+        动机: 乘积(chain×step)参数化下数据往往只约束住 Hessian 的一部分方向,
+        其余方向 (λ_i ≲ tau·λmax) 近平坦甚至微负 → 直接求逆给出天文数字误差,
+        `_errors_from_hessian` 干脆拒绝给误差。把它们**冻结**在拟合值上、只保留
+        stiff 子空间, 则:
+          * 参数数从 n_free 降到 k (实测可到 40%~50%);
+          * 保留子空间按构造正定、条件数从 ~1e7 降到 ~1e3;
+          * **每个参数仍有有限误差**(由保留子空间传播), 只有被冻结的线性组合没有。
+
+        返回 dict(k, E, p0, lam, idx, keep, cond, frozen, n_free, tau, lam_max)。
+        """
+        tau = self.rank_tau if tau is None else float(tau)
+        hessian_full = self._get_hessian_cached(params_phys)
+        nc = self.n_coupling_free
+        fixed = torch.ones(self.n_params, dtype=torch.bool, device=self.device)
+        fixed[0] = False
+        if self.n_params > nc:
+            fixed[nc] = False
+        if exclude_active and self.has_free_res:
+            # 与 compute_param_errors 同一条活跃集规则: 贴边且梯度朝外的 θ 不算自由
+            p = params_phys.detach()
+            q = p.clone().requires_grad_(True)
+            g = torch.autograd.grad(self.analysis.getNLL(q), q)[0].detach()
+            lo, hi = self.bounds(p)
+            w = (hi - lo).clamp(min=1e-30)
+            at_lo = (p - lo) <= 1e-8 * w
+            at_hi = (hi - p) <= 1e-8 * w
+            active = ((at_lo & (g > 0)) | (at_hi & (g < 0))) & fixed
+            fixed = fixed & ~active
+        idx = torch.nonzero(fixed, as_tuple=False).flatten()
+        Hr = hessian_full[fixed][:, fixed].double()
+        ev, evec = torch.linalg.eigh(Hr)  # 升序
+        lmax = abs(float(ev[-1].item())) or 1e-30
+        if self.rank_scale == "median":
+            _pos = ev[ev > 0]
+            scale = float(_pos.median().item()) if int(_pos.numel()) else lmax
+        elif self.rank_scale == "p90":
+            scale = (
+                abs(float(torch.quantile(ev.clamp(min=0).double(), 0.9).item())) or lmax
+            )
+        else:
+            scale = lmax
+        _med = abs(float(ev.median().item())) or 1e-30
+        if self.rank_scale == "max" and lmax / _med > 1e4:
+            print(
+                f"[reduce] ⚠ 谱病态: λmax={lmax:.3e}, λ 中位数={float(ev.median().item()):.3e} "
+                f"(比 {lmax / max(abs(float(ev.median().item())), 1e-30):.1e}) → 可能有跑飞/撞边界的"
+                f"自由度; 建议先看 [bounds] 或用 --rank-scale median"
+            )
+        keep = ev > tau * scale
+        k = int(keep.sum().item())
+        E = torch.zeros((self.n_params, k), dtype=torch.float64, device=self.device)
+        if k > 0:
+            # 保留 k 个特征向量 (evec[:, keep] 的行 = 全部自由坐标),
+            # 嵌回统一参数空间(idx 给出这些自由坐标在 [Re|Im|θ] 里的位置)
+            E[idx] = evec[:, keep]
+        frozen = []
+        for j in torch.nonzero(~keep, as_tuple=False).flatten().tolist():
+            v = evec[:, j]
+            top = torch.argsort(-v.abs())[:3].tolist()
+            frozen.append(
+                {
+                    "lam": float(ev[j].item()),
+                    "lam_ratio": float(ev[j].item() / lmax),
+                    "top": [
+                        (self._coord_name(int(idx[t].item())), float(v[t].item()))
+                        for t in top
+                    ],
+                }
+            )
+        red = {
+            "k": k,
+            "E": E,
+            "p0": params_phys.detach().clone(),
+            "lam": ev,
+            "idx": idx,
+            "keep": keep,
+            "n_free": int(idx.numel()),
+            "lam_max": lmax,
+            "tau": tau,
+            "frozen": frozen,
+            "scale": scale,
+            "rank_scale": self.rank_scale,
+            "cond": (float(lmax / ev[keep][0].item()) if k else float("inf")),
+            "lam_min_ret": (float(ev[keep][0].item()) if k else float("nan")),
+        }
+        self._last_reduction = red
+        return red
+
+    def reduced_param_errors(self, red):
+        """降维基下的**全参数**误差传播: σ²_m = Σ_{i∈keep} E[m,i]² / λ_i。
+
+        返回 (coupling_real_errors, coupling_imag_errors, res_errors, sd_all)。
+        冻结方向不进入 σ, 但每个参数坐标通常都有 stiff 分量 → 都有有限误差。
+        """
+        E, lam, keep, k = red["E"], red["lam"], red["keep"], red["k"]
+        if k == 0:
+            return None, None, None, None
+        sd2 = (E[:, :k] ** 2) @ (1.0 / lam[keep])
+        sd_all = torch.zeros(self.n_params, dtype=torch.float64, device=self.device)
+        sd_all[red["idx"]] = sd2[red["idx"]].clamp(min=0.0).sqrt()
+        nc = self.n_coupling_free
+        cre = torch.full((nc,), float("nan"), dtype=torch.float32, device=self.device)
+        cim = torch.full((nc,), float("nan"), dtype=torch.float32, device=self.device)
+        if nc > 0:
+            cre[0] = 0.0
+            cim[0] = 0.0
+        if nc > 1:
+            cre[1:] = sd_all[1:nc].float()
+            cim[1:] = sd_all[nc + 1 : 2 * nc].float()
+        res_e = sd_all[2 * nc :].float() if self.has_free_res else None
+        return cre, cim, res_e, sd_all
+
+    def optimize_reduced(
+        self, red, max_iter=None, lr=0.5, amp_lambda=None, verbose=True
+    ):
+        """在降维坐标 y (k 维) 里重新拟合: p = p0 + E·y。
+
+        y 空间 Hessian = diag(保留 λ) → 按构造正定、良态, LBFGS 收敛很快。
+        """
+        max_iter = self.rank_iters if max_iter is None else int(max_iter)
+        lam_pen = self.amp_lambda if amp_lambda is None else float(amp_lambda)
+        E, p0, k = red["E"], red["p0"], red["k"]
+        nc = self.n_coupling_free
+        if k == 0:
+            return {
+                "final_params": p0.clone(),
+                "final_nll": float(self.analysis.getNLL(p0).item()),
+                "iterations": 0,
+                "k": 0,
+                "nll_history": [],
+            }
+        y = torch.zeros(k, dtype=torch.float64, device=self.device, requires_grad=True)
+        opt = torch.optim.LBFGS(
+            [y],
+            lr=lr,
+            max_iter=max_iter,
+            tolerance_grad=1e-7,
+            tolerance_change=1e-11,
+            history_size=50,
+            line_search_fn="strong_wolfe",
+        )
+        hist = []
+
+        def closure():
+            opt.zero_grad()
+            p = p0 + E @ y
+            nll = self.analysis.getNLL(p)
+            loss = nll
+            if lam_pen and lam_pen > 0 and nc > 1:
+                re_c = p[1:nc]
+                im_c = p[nc + 1 : 2 * nc]
+                loss = nll + lam_pen * (re_c * re_c + im_c * im_c).sum()
+            loss.backward()
+            hist.append(float(nll.item()))
+            return loss
+
+        opt.step(closure)
+        with torch.no_grad():
+            p_new = (p0 + E @ y).detach()
+            nll_new = float(self.analysis.getNLL(p_new).item())
+        if verbose:
+            print(
+                f"[reduce] 降维重拟合: k={k} 实维 (≈{k / 2:.1f} 复参数), "
+                f"{len(hist)} 步, NLL={nll_new:.6f}"
+            )
+        return {
+            "final_params": p_new,
+            "final_nll": nll_new,
+            "k": k,
+            "iterations": len(hist),
+            "nll_history": hist,
+        }
+
+    def print_reduction_report(self, red, result=None):
+        """打印参数削减报告: k / 条件数 / 冻结组合的物理内容 / 全参数误差。"""
+        nc = self.n_coupling_free
+        print("=" * 78)
+        print("参数削减报告 (有效秩降维, --reduce-params)")
+        print("=" * 78)
+        print(f"  统一参数: {self.n_params} 实维 (复耦合 {nc} + θ {self.n_res_free})")
+        print(
+            f"  自由(非活跃)坐标: {red['n_free']} 实维; 有效秩门槛 tau={red['tau']:g}·λmax"
+        )
+        print(
+            f"  => 保留 {red['k']} 实维 (≈{red['k'] / 2:.1f} 复参数, "
+            f"原自由维度的 {100.0 * red['k'] / max(red['n_free'], 1):.0f}%)  "
+            f"[尺度={red.get('rank_scale', 'max')}: {red.get('scale', red['lam_max']):.4g}]"
+        )
+        print(
+            f"  保留子空间: λmin={red['lam_min_ret']:.4g}, λmax={red['lam_max']:.4g}, "
+            f"cond={red['cond']:.3g}"
+        )
+        if result is not None:
+            print(
+                f"  降维重拟合: NLL={result['final_nll']:.6f}, {result['iterations']} 步 "
+                f"(k={result['k']})"
+            )
+        print(f"  被冻结的 {len(red['frozen'])} 个线性组合 (= 本数据未测定的方向):")
+        for i, fr in enumerate(red["frozen"][:8]):
+            comps = ", ".join(f"{c:+.3f}·{nm}" for nm, c in fr["top"])
+            print(
+                f"    [{i}] λ={fr['lam']:+.4g} (λ/λmax={fr['lam_ratio']:.1e}): {comps}"
+            )
+        if len(red["frozen"]) > 8:
+            print(f"    ... 其余 {len(red['frozen']) - 8} 个从略")
+        cre, cim, res_e, sd_all = self.reduced_param_errors(red)
+        if sd_all is None:
+            print("  (有效秩为 0, 无法传播误差)")
+            print("=" * 78)
+            return
+        print(
+            "  每个参数仍有有限误差(由保留子空间传播 σ²_m=Σ E[m,i]²/λ_i); "
+            "只有上面那些组合没有:"
+        )
+        order = sorted(
+            range(red["n_free"]), key=lambda i: -float(sd_all[red["idx"][i]])
+        )
+        for i in order[:10]:
+            fi = int(red["idx"][i].item())
+            print(f"    σ({self._coord_name(fi)}) = {float(sd_all[fi]):.4g}")
+        if self.has_free_res:
+            s = 2 * nc
+            for j in range(self.n_res_free):
+                print(
+                    f"    σ(θ {self.params_names[nc + j]}) = {float(sd_all[s + j]):.4g}"
+                )
+        if self._last_error_truncation is not None:
+            t = self._last_error_truncation
+            print(
+                f"  [注] 参数误差也走了有效秩截断: 保留 {t['k']}/{t['n']} 维, "
+                f"λmin={t['lam_min']:.3e} → λmin_ret={t['lam_min_ret']:.3e}"
+            )
+        print("=" * 78)
+
+    def report_bound_margins(self, params_phys, margin=None):
+        """边界诊断: 列出贴住 free_range 的 θ (含 |∂NLL/∂θ|)。
+
+        这是"假非正定"的头号来源: θ 顶到边界后 reparam 的 sigmoid 梯度→0,
+        优化器容差停机, 但物理空间梯度很大 → Hessian 在非驻点/边界上被评估。
+        """
+        margin = self.bound_margin if margin is None else float(margin)
+        p = params_phys.detach()
+        q = p.clone().requires_grad_(True)
+        g = torch.autograd.grad(self.analysis.getNLL(q), q)[0].detach()
+        flag = []
+        if self.has_free_res:
+            s = 2 * self.n_coupling_free
+            lo, hi = self._lower, self._upper
+            for j in range(self.n_res_free):
+                v = float(p[s + j].item())
+                l = float(lo[j].item())
+                u = float(hi[j].item())
+                mg = min(v - l, u - v) / max(u - l, 1e-30)
+                if mg < margin:
+                    flag.append(
+                        (
+                            self.params_names[self.n_coupling_free + j],
+                            v,
+                            l,
+                            u,
+                            mg,
+                            abs(float(g[s + j].item())),
+                        )
+                    )
+        if self.n_coupling_free > 1:
+            cmax = float(p[1 : self.n_coupling_free].abs().max().item())
+            if cmax > 0.99 * self.v_max:
+                flag.append(
+                    (
+                        "coupling |c| (对照 v_max)",
+                        cmax,
+                        -self.v_max,
+                        self.v_max,
+                        0.0,
+                        0.0,
+                    )
+                )
+        if not flag:
+            print(f"[bounds] 没有 θ 贴住 free_range (阈值 {100 * margin:.0f}% 宽度)")
+            return []
+        print(
+            f"[bounds] ⚠ {len(flag)} 个参数贴住边界 (边距 < {100 * margin:.0f}% 宽度):"
+        )
+        for nm, v, l, u, mg, gj in flag:
+            print(
+                f"[bounds]   {nm}: {v:.6g} ∈ [{l:.6g}, {u:.6g}] 边距={100 * mg:5.1f}% "
+                f"|∂NLL/∂θ|={gj:.4g}"
+            )
+        print(
+            "[bounds]   → 这些自由度上的 Hessian 是在边界/非驻点评估的 → '假非正定'; "
+            "报告误差时应剔除/放宽范围, 或加高斯先验"
+        )
+        return flag
+
+    # --------------------------------------------------------
+    def extract_coupling_complex(self, params):
+        """从统一参数中提取复数耦合向量 (complex64, n_coupling_free)"""
+        real = params[: self.n_coupling_free].float()
+        imag = params[self.n_coupling_free : 2 * self.n_coupling_free].float()
+        return torch.complex(real, imag)
+
+    # --------------------------------------------------------
     def _propagation_curvature(self, params, mode=None, tau=None):
         """构造用于 FF/效率误差传播的曲率（PSD 化/回退），传给 C++。
 
         C++ getFitFractions/getEfficiency 只取耦合块 [0:n2]，且**只排除固定参考**
         idx 0 与 n；本函数用**与 C++ 完全相同的 free 索引**做 eigh，再按 err_mode
         重构曲率，使 inv(H_free) 等于目标协方差：
-          inv（真 PD）/ pinv（丢 λ<τλmax，协方差≈0）/ psd（λ 截到 τλmax，更保守）；
+          inv（真 PD）/ pinv（丢 λ<τλmax，协方差≈0；与 `_errors_from_hessian`
+          的有效秩截断数值等价）/ psd（λ 截到 τλmax，更保守）；
           strict 非 PD → 返回 None（调用方退回原 Hessian，C++ 误差自然为 0）。
         返回 (H_out 或 None, info)：H_out 为全尺寸 float64 CUDA 张量。
 
@@ -2335,6 +2734,18 @@ class UnifiedPWAOptimizer:
             f.write(f"耦合参数数量: {self.n_coupling_free}\n")
             f.write(f"自由共振态参数: {self.n_res_free}\n")
             f.write(f"总参数维度: {self.n_params}\n")
+            f.write(
+                f"参数化模式: fit_mode={self.fit_mode} (0=FREEPARAMS chain×step, 1=VSPACE 逐振幅)\n"
+            )
+            f.write(
+                f"误差: err_mode={self.err_mode}, τ={self.err_tau:.1e}, "
+                f"非正定有效秩截断={'on' if self.errors_truncate else 'off'}\n"
+            )
+            if self.best_result and self.best_result.get("reduced_k") is not None:
+                f.write(
+                    f"参数削减: 采用有效秩降维解 k={self.best_result['reduced_k']} 实维 "
+                    f"(详见 param_reduction.txt)\n"
+                )
             f.write(f"最佳NLL: {self.best_nll:.6f}\n")
             f.write(f"参数文件: parameters.txt\n")
             if self.best_result and self.best_result.get("ff_only"):
@@ -2569,6 +2980,62 @@ def build_parser():
         help="LBFGS history 大小 (env: FIT_HISTORY_SIZE, 默认: 200)",
     )
 
+    # --- 参数削减 / 误差截断 / 边界诊断 ---
+    g_red = p.add_argument_group("参数削减 / 误差截断 / 边界诊断")
+    g_red.add_argument(
+        "--fit-mode",
+        type=int,
+        choices=(0, 1),
+        default=None,
+        help="0=FREEPARAMS chain×step (默认), 1=VSPACE 逐振幅 "
+        "(Hessian 二阶项恒为 0 → 精确; env FIT_MODE)。"
+        "⚠ 只能在构造期决定, 所以由模块导入期读取本参数",
+    )
+    g_red.add_argument(
+        "--reduce-params",
+        action="store_true",
+        default=None,
+        help="拟合后在 Hessian 有效秩子空间里重新拟合(参数更少)并报告冻结组合",
+    )
+    g_red.add_argument(
+        "--rank-tau",
+        type=float,
+        default=None,
+        help="有效秩门槛 λ_i > tau·λmax (env FIT_RANK_TAU, 默认 1e-3)",
+    )
+    g_red.add_argument(
+        "--rank-iters",
+        type=int,
+        default=None,
+        help="降维重拟合 LBFGS 迭代上限 (env FIT_RANK_ITERS, 默认 300)",
+    )
+    g_red.add_argument(
+        "--rank-fixed-point",
+        type=int,
+        default=None,
+        help="降维基重算次数(基依赖拟合点; env FIT_RANK_FIXED_POINT, 默认 1)",
+    )
+    g_red.add_argument(
+        "--no-errors-truncate",
+        dest="errors_truncate",
+        action="store_false",
+        default=None,
+        help="Hessian 不定时不改用有效秩截断传播误差(默认开启截断)",
+    )
+    g_red.add_argument(
+        "--rank-scale",
+        type=str,
+        default=None,
+        choices=("max", "median", "p90"),
+        help="有效秩的尺度基准 (env FIT_RANK_SCALE, 默认 max; 病态点/跑飞解用 median)",
+    )
+    g_red.add_argument(
+        "--bound-margin",
+        type=float,
+        default=None,
+        help="θ 贴边告警阈值(相对 free_range 宽度; env FIT_BOUND_MARGIN, 默认 0.02)",
+    )
+
     # --- 约束 / 数值稳定 ---
     p.add_argument(
         "--vmax",
@@ -2743,6 +3210,14 @@ class FitConfig(Mapping):
     amp_lambda: float
     err_mode: str
     err_tau: float
+    # 参数削减 / 误差截断 / 边界诊断（PR: 上游 0e452a1 合并）
+    reduce_params: bool
+    rank_tau: float
+    rank_iters: int
+    rank_fixed_point: int
+    errors_truncate: bool
+    bound_margin: float
+    rank_scale: str
     polish: bool
     warm_start_path: Optional[str]
     waves: list
@@ -2875,6 +3350,40 @@ def resolve_args(args):
         if args.checkpoint_interval is not None
         else _env_int("FIT_CHECKPOINT_INTERVAL", 1)
     )
+
+    cfg["reduce_params"] = (
+        bool(args.reduce_params)
+        if args.reduce_params is not None
+        else _env_bool("FIT_REDUCE_PARAMS", False)
+    )
+    cfg["rank_tau"] = (
+        args.rank_tau if args.rank_tau is not None else _env_float("FIT_RANK_TAU", 1e-3)
+    )
+    cfg["rank_iters"] = (
+        args.rank_iters
+        if args.rank_iters is not None
+        else _env_int("FIT_RANK_ITERS", 300)
+    )
+    cfg["rank_fixed_point"] = (
+        args.rank_fixed_point
+        if args.rank_fixed_point is not None
+        else _env_int("FIT_RANK_FIXED_POINT", 1)
+    )
+    cfg["errors_truncate"] = (
+        args.errors_truncate
+        if args.errors_truncate is not None
+        else _env_bool("FIT_ERRORS_TRUNCATE", True)
+    )
+    cfg["bound_margin"] = (
+        args.bound_margin
+        if args.bound_margin is not None
+        else _env_float("FIT_BOUND_MARGIN", 0.02)
+    )
+    cfg["rank_scale"] = (
+        args.rank_scale
+        if args.rank_scale is not None
+        else os.environ.get("FIT_RANK_SCALE", "max")
+    ).lower()
 
     cfg["resume"] = args.resume
     cfg["ff_only"] = (
@@ -3019,6 +3528,15 @@ def main():
     print(f"  waves={cfg['waves'] if cfg['waves'] else '(all)'}")
     print(f"  event_data={cfg['event_data']}")
     print(f"  checkpoint_interval={cfg['checkpoint_interval']}")
+    print(f"  fit_mode={_FIT_MODE} (0=FREEPARAMS chain×step, 1=VSPACE 逐振幅)")
+    print(
+        f"  reduce_params={cfg['reduce_params']} (tau={cfg['rank_tau']:g}, "
+        f"iters={cfg['rank_iters']}, fixed_point={cfg['rank_fixed_point']})"
+    )
+    print(
+        f"  errors_truncate={cfg['errors_truncate']}, "
+        f"bound_margin={cfg['bound_margin']:g}"
+    )
     print(f"  resume={cfg['resume']}")
     print(f"  cal_ff={cfg['cal_ff']}, cal_eff={cfg['cal_eff']}")
     print(f"  output_dir={output_dir}")
@@ -3041,6 +3559,13 @@ def main():
         err_mode=cfg["err_mode"],
         err_tau=cfg["err_tau"],
     )
+    optimizer.rank_tau = cfg["rank_tau"]
+    optimizer.rank_iters = cfg["rank_iters"]
+    optimizer.rank_fixed_point = cfg["rank_fixed_point"]
+    optimizer.errors_truncate = cfg["errors_truncate"]
+    optimizer.bound_margin = cfg["bound_margin"]
+    optimizer.rank_scale = cfg["rank_scale"]
+    optimizer.fit_mode = _FIT_MODE
 
     # ---- P4.4: Resume ----
     resume_from = None
@@ -3210,14 +3735,87 @@ def main():
                 log.exception(f"抛光失败: {e}")
         print(f"polish 状态 = {best_res.get('polish_status')}")
 
+    # ---- 参数削减: 有效秩降维 + 降维重拟合 (--reduce-params) ----
+    if cfg["reduce_params"]:
+        try:
+            red = optimizer.compute_reduction(best_res["final_params"])
+            rr = None
+            for _it in range(max(1, cfg["rank_fixed_point"])):
+                rr = optimizer.optimize_reduced(red, max_iter=cfg["rank_iters"])
+                red = optimizer.compute_reduction(rr["final_params"])
+            optimizer.print_reduction_report(red, rr)
+            cre, cim, res_e, sd_all = optimizer.reduced_param_errors(red)
+            if cre is not None:
+                best_res["coupling_real_errors"] = cre
+                best_res["coupling_imag_errors"] = cim
+                best_res["res_errors"] = res_e
+                # 保留子空间上按构造正定 → 后续 FF/效率/误差报告可以正常走
+                best_res["is_positive_definite"] = True
+                best_res["reduced_k"] = red["k"]
+                # 误差口径已换成降维基传播 → 协方差 CSV 在最终点重算（避免新旧混用）
+                best_res["_err_full"] = None
+                log.info(
+                    "[reduce] 对角误差改为有效秩降维基传播；"
+                    "协方差/相关矩阵 CSV 在最终点重算"
+                )
+            if rr is not None and rr["final_nll"] <= best_res["final_nll"] + 1e-6:
+                print(
+                    f"[reduce] 采用降维解作为最终结果: k={red['k']} 实维 "
+                    f"(≈{red['k'] / 2:.1f} 复参数), NLL {best_res['final_nll']:.6f} → "
+                    f"{rr['final_nll']:.6f}"
+                )
+                best_res["final_params"] = rr["final_params"]
+                best_res["final_nll"] = rr["final_nll"]
+                optimizer.best_params = rr["final_params"].clone()
+                optimizer.best_nll = rr["final_nll"]
+                torch.save(
+                    rr["final_params"].cpu(),
+                    os.path.join(output_dir, "best_params_reduced.pt"),
+                )
+            rp = os.path.join(output_dir, "param_reduction.txt")
+            with open(rp, "w") as f:
+                f.write(f"cfg={config_path} fit_mode={_FIT_MODE} tau={red['tau']:g}\n")
+                f.write(
+                    f"n_params={optimizer.n_params} n_free={red['n_free']} k={red['k']}\n"
+                )
+                f.write(
+                    f"lambda_min_ret={red['lam_min_ret']:.8e} "
+                    f"lambda_max={red['lam_max']:.8e} cond={red['cond']:.8e}\n"
+                )
+                f.write(f"NLL={best_res['final_nll']:.10f}\n")
+                f.write("frozen_combinations (未测定方向; 无有限误差):\n")
+                for i, fr in enumerate(red["frozen"]):
+                    f.write(
+                        f"  [{i}] lambda={fr['lam']:+.8e} ratio={fr['lam_ratio']:.3e} : "
+                        + ", ".join(f"{c:+.5f}*{nm}" for nm, c in fr["top"])
+                        + "\n"
+                    )
+                if sd_all is not None:
+                    f.write("parameter_sigma (由保留子空间传播):\n")
+                    for i in range(red["n_free"]):
+                        fi = int(red["idx"][i].item())
+                        f.write(
+                            f"  {optimizer._coord_name(fi)} {float(sd_all[fi]):.8e}\n"
+                        )
+            print(f"[reduce] 完整报告: {rp}")
+        except Exception as e:
+            log.exception(f"参数削减失败（保持原拟合结果）: {e}")
+
+    # ---- 边界诊断 (θ 贴 free_range → 假非正定) ----
+    try:
+        optimizer.report_bound_margins(best_res["final_params"])
+    except Exception as e:
+        log.debug(f"边界诊断失败: {e}")
+
     # ---- 打印最佳参数 ----
     if best_res["coupling_real_errors"] is not None:
         if not best_res.get("is_positive_definite", False):
             log.warning(
-                "Hessian 在非活跃子空间非正定；以下误差来自 PSD 回退"
-                f"（err_mode={cfg['err_mode']}, τ={cfg['err_tau']:.1e}）"
+                "Hessian 在非活跃子空间非正定；以下误差来自有效秩截断/PSD 回退"
+                f"（err_mode={cfg['err_mode']}, τ={cfg['err_tau']:.1e}, "
+                f"errors_truncate={cfg['errors_truncate']}）"
                 "，是秩亏/近平坦方向下的可行估计，非严格统计误差。"
-                "详见 [param-err] 日志的 λmin/λmax 与平坦方向数。"
+                "详见 [param-err] 日志的 λmin/λmax、保留维度与平坦方向数。"
             )
         optimizer.print_optimized_parameters(
             best_res["final_params"],
