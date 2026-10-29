@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import time
 import os
+import re
 import sys
 import csv
 import argparse
@@ -88,11 +89,10 @@ _RES_NOISE_FRAC = 0.1  # 共振态初值噪声幅度（占 free_range 区间的�
 # 初始化分析对象
 # ============================================================
 def _config_path_from_argv(default: str = "config.yml") -> str:
-    """在 argparse 之前取出 --config 的值。
+    """在 argparse 之前取出 --config 的值（绝对路径）。
 
     ⚠ 分析对象在**模块导入期**构建（早于 main() 解析参数），因此必须在这里就
-    取出 --config，否则 ctpwa 只会读 cwd 下的 config.yml，
-    `--config /path/to/other.yml` 会静默失效（只影响 chdir）。
+    取出 --config，否则 ctpwa 只会读 cwd 下的 config.yml，`--config` 会静默失效。
     """
     argv = sys.argv[1:]
     for i, a in enumerate(argv):
@@ -101,6 +101,59 @@ def _config_path_from_argv(default: str = "config.yml") -> str:
         if a.startswith("--config="):
             return os.path.abspath(a.split("=", 1)[1])
     return os.path.abspath(default)
+
+
+# 调用者**原始** cwd：`--output-dir` / `--warm-start` / `--resume` 这类 CLI 路径按它固化
+# （import 期我们会切到 config 目录，见下面的 `_CFG_DIR`；那时 `os.path.abspath` 就不对了）。
+_ORIG_CWD = os.getcwd()
+
+
+def _config_data_paths(config_path: str) -> dict:
+    """粗读 config 的 `Data` 段各键的文件路径（**仅供启动自检打印**，不做 YAML 解析）。
+
+    只认本仓库的两种写法，其它一律跳过（`{}` 或缺某些键），不会抛异常：
+
+        key:  [dat, "path"]        # 单行 flow（也支持 [ROOT, "/x.root", ...]）
+        key:                       # 块式
+          [
+            dat,
+            "path",
+          ]
+    """
+    keys = ("data", "phsp", "phsp_truth", "bkg", "bkg_weights")
+    out: dict = {}
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return out
+    i0 = next((i for i, ln in enumerate(lines) if re.match(r"^Data:\s*$", ln)), None)
+    if i0 is None:
+        return out
+    i1 = len(lines)
+    for i in range(i0 + 1, len(lines)):
+        ln = lines[i]
+        if ln.strip() and not ln[0].isspace() and not ln.lstrip().startswith("#"):
+            i1 = i
+            break
+    for i in range(i0 + 1, i1):
+        m = re.match(r"^\s*(" + "|".join(keys) + r")\s*:(.*)$", lines[i])
+        if not m:
+            continue
+        key, rest = m.group(1), m.group(2).strip()
+        if rest:
+            mm = re.search(r'"([^"]+)"', rest)
+            if mm:
+                out[key] = mm.group(1)
+            continue
+        for j in range(i + 1, min(i + 8, i1)):
+            if lines[j].lstrip().startswith("#"):
+                continue
+            mm = re.search(r'"([^"]+)"', lines[j])
+            if mm:
+                out[key] = mm.group(1)
+                break
+    return out
 
 
 def _fit_mode_from_argv(default=0):
@@ -119,9 +172,21 @@ def _fit_mode_from_argv(default=0):
     return int(os.environ.get("FIT_MODE", default))
 
 
+# ---- config 目录：**在构造 analysis 之前**切过去 ----
+# 为什么必须在构造前：C++ 在**构造期**就按 **cwd** 打开 data/phsp/bkg（Analysis.cu），
+# 而 phsp_truth 是 FF/效率时才打开、Resonances/Constraints.chains 等外部文件由 C++ 按
+# **config 目录**解析（Config.cu 的 parent_path）。提前 chdir 后三类口径统一为
+# 「config 内的相对路径 = 相对 config 目录」，避免同一个 config 在不同目录下跑出
+# 「数据读到了、效率却是 0 事件」这类不一致。
+_CFG_PATH = _config_path_from_argv()
+_CFG_DIR = os.path.dirname(_CFG_PATH)
+if os.path.isdir(_CFG_DIR) and os.getcwd() != _CFG_DIR:
+    print(f"切换到配置目录: {_CFG_DIR}")
+    os.chdir(_CFG_DIR)
+
 _FIT_MODE = _fit_mode_from_argv()
 int_time1 = int(time.time())
-ana = ctpwa.analysis(_config_path_from_argv(), _FIT_MODE)
+ana = ctpwa.analysis(_CFG_PATH, _FIT_MODE)
 int_time2 = int(time.time())
 print(f"振幅初始化耗时: {int_time2 - int_time1} 秒")
 
@@ -3371,6 +3436,31 @@ class FitConfig(Mapping):
         return self.__dataclass_fields__.keys()
 
 
+def _absolutize_io_paths(cfg, base: Optional[str] = None):
+    """把 CLI 给的文件系统路径固化成**绝对路径**（锚在调用者原始 cwd）。
+
+    ⚠ 这里**不能**直接用 `os.path.abspath`：`resolve_args()` 是在 import 期
+    chdir 到 config 目录**之后**才被调用的，用当前 cwd 会把 `--output-dir results`
+    锚到 config 目录下——那正是本函数要修掉的老行为。所以显式用 `_ORIG_CWD`
+    （或调用方传的 `base`，便于单测）。
+
+    处理 `config` / `output_dir` / `warm_start_path`（`--warm-start auto` 与
+    `FIT_WARM` 派生的那条也已在上游 join 过 `output_dir`，这里等价地固化）。
+    """
+    base = _ORIG_CWD if base is None else base
+
+    def _abs(p):
+        if not p:
+            return p
+        return p if os.path.isabs(p) else os.path.normpath(os.path.join(base, p))
+
+    cfg["config"] = _abs(cfg["config"])
+    cfg["output_dir"] = _abs(cfg["output_dir"])
+    if cfg.get("warm_start_path"):
+        cfg["warm_start_path"] = _abs(cfg["warm_start_path"])
+    return cfg
+
+
 def resolve_args(args):
     """将 argparse Namespace 与环境变量合并，返回最终配置 FitConfig。
     优先级: CLI 显式传入 > FIT_* 环境变量 > 硬编码默认值。"""
@@ -3518,6 +3608,10 @@ def resolve_args(args):
     cfg["quiet"] = args.quiet
     cfg["output_dir"] = args.output_dir
 
+    # 把 CLI 路径固化成绝对路径（锚在**调用者原始 cwd**，见 `_absolutize_io_paths`：
+    # import 期已经 chdir 到 config 目录，这里不能再用当前 cwd）
+    _absolutize_io_paths(cfg, _ORIG_CWD)
+
     return FitConfig(**cfg)
 
 
@@ -3597,6 +3691,8 @@ def main():
         _apply_determinism()
 
     # ---- P4.2: 配置文件路径 ----
+    # config 已在 import 期解析成绝对路径、并已 chdir 到 config 目录（见模块顶部），
+    # 这里只做存在性校验 + 兜底（若有人在 import 之后又改了 cwd）。
     config_path = os.path.abspath(cfg["config"])
     if not os.path.isfile(config_path):
         log.error(f"配置文件不存在: {config_path}")
@@ -3672,6 +3768,11 @@ def main():
     print(f"  resume={cfg['resume']}")
     print(f"  cal_ff={cfg['cal_ff']}, cal_eff={cfg['cal_eff']}")
     print(f"  output_dir={output_dir}")
+    # 路径自检：config 里 Data 段各键的**解析结果**（相对 config 目录）+ 是否存在。
+    # 语义：config 内的相对路径 = 相对 config 目录；CLI 路径（--output-dir/--warm-start）= 相对你调用 fit.py 的目录。
+    for _k, _p in _config_data_paths(config_path).items():
+        _ap = os.path.abspath(_p)
+        print(f"  {_k}: {_ap}{'' if os.path.exists(_ap) else '   ← 不存在!'}")
     print("=" * 60)
 
     # 复用模块级已初始化的分析对象（避免二次初始化浪费显存）
