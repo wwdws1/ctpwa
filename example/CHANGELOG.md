@@ -1,7 +1,7 @@
 # CHANGELOG（`example/`）
 
 本文件记录对上游 `BHXiang/ctpwa` 的改动中、**`example/` 目录内**各文件的内容变化
-（PR #1–#20）。其它目录随上游维护，不在本表；上游同步见文末。
+（PR #1–#21）。其它目录随上游维护，不在本表；上游同步见文末。
 日期 = 合并进 `main` 的日期；“PR #n”指 `wwdws1/ctpwa` 的合并请求。
 
 > 只列**行为/接口/文档**变化；纯格式（ruff-format/空白）只在首次记录。
@@ -103,6 +103,29 @@
 
 ### 文档引用清理
 - 2026-09-25（PR #11 `4b6b3a9`）去掉注释中指向仓库外/不存在的文档引用，以及内部编号标注。
+
+### 路径口径（PR #21）
+- 2026-10-29（PR #21）**统一路径锚点**，`fit.py` 三条改动：
+  1. **import 期 chdir 到 config 目录**（在构造 `ctpwa.analysis()` **之前**）：C++ 在构造期
+     就按 **cwd** 打开 `data`/`phsp`/`bkg`，而 `phsp_truth` 是 FF/效率时才打开、
+     `Resonances`/`Constraints.chains(_exact)` 由 C++ 按 config 目录解析（`src/Config.cu`
+     的 `parent_path()`）→ 提前 chdir 后三类口径统一为「config 内相对路径 = 相对 config 目录」。
+  2. 新增 `_absolutize_io_paths(cfg, base=_ORIG_CWD)`：把 `config`/`output_dir`/`warm_start_path`
+     （含 `--warm-start auto` 与 `FIT_WARM` 派生的那条）固化为**绝对路径**，锚在**调用者原始
+     cwd**（`resolve_args()` 跑的时候 cwd 已经变成 config 目录，所以不能直接用
+     `os.path.abspath`）。
+  3. 新增 `_config_data_paths()` + 启动 dump：打印 config 里 `data/phsp/phsp_truth/bkg/bkg_weights`
+     的**解析结果**（绝对路径 + 是否存在；缺失标 `← 不存在!`）；只做文本粗读，不做 YAML 解析。
+  - **行为变化**：`--output-dir`/`--warm-start`/`--resume` 由「相对 config 目录」（反直觉、会把
+    结果写到 config 目录下）改为「相对调用目录」；`data/phsp/bkg` 的相对路径由「相对启动目录」
+    改为「相对 config 目录」（与 `phsp_truth` 一致）。**cwd == config 目录时（生产作业的用法）
+    全部是 no-op。**
+  - 新增 `_ORIG_CWD`（记录 chdir 前的 cwd）；`_config_path_from_argv` 的 docstring 同步更正
+    （原文那句"只影响 chdir"已过期）。
+  - 本地单测 `example/tests/test_paths.py`（8 项，CPU）；GPU smoke 见 `../test16/`。
+  - ⚠ 与上游分歧：上游 1fda180 仍是「main() 里 chdir」+ Data 段路径原样存字符串（`src/Config.cu`
+    `parseData` 不做 `parent_path()`），因此上游没有"config 内相对路径统一"这一口径；将来合并
+    上游时注意这一点。
 
 ---
 

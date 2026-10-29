@@ -4,7 +4,7 @@
 Hessian / 参数误差 → 保存结果与摘要。
 
 本文主要说明**可选参数**和**三种优化器的区别**；画图脚本 `plot.py` 见 §8，
-参数削减/误差截断/边界诊断/`--fit-mode` 见 §9。
+参数削减/误差截断/边界诊断/`--fit-mode` 见 §9，MC 生成见 §11。
 各文件的变更历史见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ---
@@ -33,9 +33,18 @@ python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-4  # 显式�
   slurm 作业里设，避免静默退 CPU）。详见 §10。当前后端在启动 dump 里打印
   （`backend=… build_info=…`）。
 - **配置由 `--config` 指定**（默认 `./config.yml`）。`fit.py` 在 **import 时**用
-  `_config_path_from_argv()` 从 `sys.argv` 取出 `--config`，再传给 `ctpwa.analysis()`，
-  因此 `--config /path/to/other.yml` **真正生效**（无需 cd 到配置目录）。
-  注意：`config.yml` 内的相对路径按**该 config 文件所在目录**解析。
+  `_config_path_from_argv()` 从 `sys.argv` 取出 `--config`（转绝对路径），**并在构造
+  `ctpwa.analysis()` 之前 `chdir` 到 config 目录**，因此 `--config /path/to/other.yml`
+  **真正生效**（无需 cd 到配置目录）。
+- **路径口径（PR #21 起，两条规则）**：
+  - **config 内**的相对路径（`data` / `phsp` / `phsp_truth` / `bkg` / `bkg_weights`，以及
+    `Resonances` / `Constraints.chains(_exact)` 引用的外部文件）= **相对 config 文件所在目录**；
+  - **命令行**给的路径（`--config`、`--output-dir`、`--warm-start`、`--resume` 指向的
+    `checkpoint.pt`）= **相对你调用 `fit.py` 的目录**。
+  启动 dump 会打印 `output_dir=` / `warm_start=` 以及 config 里各数据文件的**解析结果**
+  （绝对路径 + 是否存在，缺失会标 `← 不存在!`），便于一眼核对。
+  （改动前：`data/phsp/bkg` 跟**启动目录**、`phsp_truth` 跟 config 目录、CLI 路径跟 config
+  目录 —— 三者不一致；跨目录调用会出现「数据读到了、效率却是 0 事件」或结果落到 config 目录下。）
 - 建议用 `python -u`（无缓冲）以便实时看日志。
 - ⚠ **不要在仓库根目录 `import ctpwa`**：仓库根自带上游的 `ctpwa/` 门面包（源码目录，
   没有 `_cuda.so`/`_cpu.so`），在 `python -m pytest`/`python -c`（cwd 进 `sys.path`）时会
@@ -345,7 +354,8 @@ FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
 ## 7. 已知问题与备注
 
 1. **配置由 `--config` 指定**（见 §1）：`--config /path/to/other.yml` 现在**真正生效**
-   （import 期解析）；`config.yml` 内的相对路径按该文件所在目录解析。
+   （import 期解析成绝对路径，并在构造 analysis 前 chdir 到 config 目录）。
+   路径口径见 §1 的两条规则（config 内相对路径 → config 目录；CLI 路径 → 调用目录）。
 2. `reparam` 的 `--amp-lambda` 是作用在**优化 loss** 上的弱先验；报告/保存的 NLL、
    Hessian、误差全部基于**真实 NLL**，不受罚项影响。
 3. 结果普遍 `正定性=False`：精确 Hessian 存在 ~20–30 维近平坦/简并子空间（诊断显示
