@@ -720,7 +720,8 @@ __device__ void addBfQ0HessianTerms(
     double m0_q0, double md1_q0, double md2_q0,
     double* dln_re, double* dln_im, double* d2ln_re, double* d2ln_im,
     const DeviceResonance* d_resonances, int R,
-    const int* res_off, const int* res_cnt, const int* pm)
+    const int* res_off, const int* res_cnt, const int* pm,
+    bool skip_model_q0_daughters = false)
 {
     double lq0 = dlnBf_dq0(L, q0, node.bf_d);
     double l2q0 = d2lnBf_dq0q0(L, q0, node.bf_d);
@@ -729,6 +730,21 @@ __device__ void addBfQ0HessianTerms(
     for (int r = 0; r < R; ++r) {
         const DeviceResonance& res = d_resonances[r];
         if (res.param_count <= 0) continue;
+        // 本节点若以该共振态为子粒子且其 mass 是自由槽，则 ∂F/∂m 的**整项**
+        // （含 aux 里的 Bf 与 γ 的 q0 链）已由 addModelQ0HessianTerms 用数值扰动
+        // 补齐；这里再补 Bf 那一半会重复计数。
+        if (skip_model_q0_daughters) {
+            bool covered = false;
+            for (int side = 0; side < 2 && !covered; ++side) {
+                const double dmass = (side == 0) ? node.mass[1] : node.mass[2];
+                const int didx = (side == 0) ? node.daug1_idx : node.daug2_idx;
+                if (dmass > 0.0 || didx != res.particle_idx) continue;
+                const int o2 = res_off[r], c2 = res_cnt[r];
+                for (int j2 = 0; j2 < c2; ++j2)
+                    if ((pm ? pm[o2 + j2] : (o2 + j2)) == 0) { covered = true; break; }
+            }
+            if (covered) continue;
+        }
         double dq0 = 0.0, d2q0 = 0.0;
         if (node.mass[1] <= 0 && node.daug1_idx == res.particle_idx) {
             dq0 += breakup_dq_dm(1, m0_q0, md1_q0, md2_q0);
@@ -780,6 +796,151 @@ __device__ void addBfQ0HessianTerms(
 }
 
 // ============================================================
+// 模型线形内部 q0 对"自由共振态子质量"的一阶/二阶对数导数（跨共振）
+// BWR/GS/Flatte 的 F 里 γ = g0·(q/q0)^(2L+1)·(m0/m)·Bf²，q0 = breakup(m0,md1,md2)
+// 依赖子粒子质量；当子粒子是本块内的自由共振态时，aux 里 md1/md2 是
+// CVAR_MD1/2（VAR，对参数导数为 0）→ ∂F/∂m_child、∂²F/∂m_child∂θ、∂²F/∂m²
+// 全部缺失（addBfQ0HessianTerms 只覆盖顶点 Bf，不覆盖模型线形）。
+//
+// 这里对子质量做数值扰动（解释器与 JIT 数值一致）取:
+//   A_d = ∂F/∂m_d,  B_d = ∂²F/∂m_d²,  C_dp = ∂²F/(∂m_d∂θ_p)
+// 再转成对数导数（与 d2ln 的定义一致：∂²lnF = ∂²F/F − ∂lnF·∂lnF）累加。
+// 只在"本节点确有两个自由共振态子粒子"时触发，Hessian 路径不受影响时零开销。
+// ============================================================
+__device__ void addModelQ0HessianTerms(
+    const DeviceResonance& res, const double* aux,
+    const double* rp, int P_r,
+    double mm, double qq, double q0, int L, double bf_d,
+    double md1_q0, double md2_q0,
+    double p1_P, double p1_E, double p1_ct, double p1_phi,
+    double p2_P, double p2_E, double p2_ct, double p2_phi,
+    const DecayNode& node, int match_r,
+    double Fr, double Fi,
+    const double* dFr, const double* dFi,
+    const DeviceResonance* d_res, int R,
+    const int* res_off, const int* res_cnt, const int* pm,
+    double* dln_re, double* dln_im, double* d2ln_re, double* d2ln_im)
+{
+    if (res.type == ResModelType::BW || res.type == ResModelType::ONE)
+        return;
+    const double den = Fr * Fr + Fi * Fi;
+    if (den <= 0.0) return;
+
+    // 收集"自由共振态子粒子"：side（true=daug1）、质量值、位置下标
+    int n_d = 0, pos[2] = { -1, -1 };
+    double mdv[2] = { 0.0, 0.0 };
+    bool side1[2] = { false, false };
+    for (int s = 0; s < 2; ++s) {
+        if ((s == 0 ? node.mass[1] : node.mass[2]) > 0.0) continue;   // 固定质量
+        const int d_idx = (s == 0) ? node.daug1_idx : node.daug2_idx;
+        for (int r2 = 0; r2 < R; ++r2) {
+            if (r2 == match_r || d_res[r2].param_count <= 0) continue;
+            if (d_res[r2].particle_idx != d_idx) continue;
+            const int off2 = res_off[r2], cnt2 = res_cnt[r2];
+            int pos2 = -1;
+            for (int j = 0; j < cnt2; ++j)
+                if ((pm ? pm[off2 + j] : j) == 0) { pos2 = off2 + j; break; }
+            if (pos2 < 0) break;          // mass 不是自由参数，无槽位可写
+            side1[n_d] = (s == 0);
+            mdv[n_d] = (s == 0) ? md1_q0 : md2_q0;
+            pos[n_d] = pos2;
+            n_d++;
+            break;
+        }
+    }
+    if (n_d == 0) return;
+
+    const int off = res_off[match_r];
+    const int cnt = res_cnt[match_r];
+    double l_re[2], l_im[2];
+    for (int d = 0; d < n_d; ++d) {
+        const double m = mdv[d];
+        const double h = 1e-6 * (m > 0.05 ? m : 0.05);
+        const double md1p = md1_q0 + (side1[d] ? h : 0.0);
+        const double md2p = md2_q0 + (side1[d] ? 0.0 : h);
+        const double md1m = md1_q0 - (side1[d] ? h : 0.0);
+        const double md2m = md2_q0 - (side1[d] ? 0.0 : h);
+
+        double Fp_r, Fp_i, Fm_r, Fm_i;
+        double dFpr[16], dFpi[16], dFmr[16], dFmi[16];
+        double d2r[16 * 16], d2i[16 * 16];
+        evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, bf_d,
+            md1p, md2p, p1_P, p1_E, p1_ct, p1_phi,
+            p2_P, p2_E, p2_ct, p2_phi,
+            rp, P_r, Fp_r, Fp_i, dFpr, dFpi, d2r, d2i, false);
+        evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, bf_d,
+            md1m, md2m, p1_P, p1_E, p1_ct, p1_phi,
+            p2_P, p2_E, p2_ct, p2_phi,
+            rp, P_r, Fm_r, Fm_i, dFmr, dFmi, d2r, d2i, false);
+
+        const double A_re = (Fp_r - Fm_r) / (2.0 * h);
+        const double A_im = (Fp_i - Fm_i) / (2.0 * h);
+        const double B_re = (Fp_r - 2.0 * Fr + Fm_r) / (h * h);
+        const double B_im = (Fp_i - 2.0 * Fi + Fm_i) / (h * h);
+
+        l_re[d] = (A_re * Fr + A_im * Fi) / den;
+        l_im[d] = (A_im * Fr - A_re * Fi) / den;
+        dln_re[pos[d]] += l_re[d];
+        dln_im[pos[d]] += l_im[d];
+
+        // 对角项 ∂²lnF/∂m_d²
+        const double t = (B_re * Fr + B_im * Fi) / den;
+        const double u = (B_im * Fr - B_re * Fi) / den;
+        d2ln_re[pos[d] * 16 + pos[d]] += t - (l_re[d] * l_re[d] - l_im[d] * l_im[d]);
+        d2ln_im[pos[d] * 16 + pos[d]] += u - 2.0 * l_re[d] * l_im[d];
+
+        // 与自身参数 θ_p 的交叉项 ∂²lnF/(∂m_d∂θ_p)
+        for (int j = 0; j < cnt; ++j) {
+            const int p = pm ? pm[off + j] : j;
+            if (p < 0 || p >= P_r) continue;
+            const double c_re = (dFpr[p] - dFmr[p]) / (2.0 * h);
+            const double c_im = (dFpi[p] - dFmi[p]) / (2.0 * h);
+            const double own_l_re = (dFr[p] * Fr + dFi[p] * Fi) / den;
+            const double own_l_im = (dFi[p] * Fr - dFr[p] * Fi) / den;
+            const double tt = (c_re * Fr + c_im * Fi) / den;
+            const double uu = (c_im * Fr - c_re * Fi) / den;
+            const double v_re = tt - (l_re[d] * own_l_re - l_im[d] * own_l_im);
+            const double v_im = uu - (l_re[d] * own_l_im + l_im[d] * own_l_re);
+            const int jj = off + j, kk = pos[d];
+            d2ln_re[jj * 16 + kk] += v_re;
+            d2ln_im[jj * 16 + kk] += v_im;
+            d2ln_re[kk * 16 + jj] += v_re;
+            d2ln_im[kk * 16 + jj] += v_im;
+        }
+    }
+
+    // 两个自由子质量之间的交叉项 ∂²lnF/(∂m_1∂m_2)（四角差分）
+    if (n_d == 2) {
+        const double h1 = 1e-6 * (mdv[0] > 0.05 ? mdv[0] : 0.05);
+        const double h2 = 1e-6 * (mdv[1] > 0.05 ? mdv[1] : 0.05);
+        double Fv_r[4], Fv_i[4];
+        for (int c = 0; c < 4; ++c) {          // bit0 = m1 符号, bit1 = m2 符号
+            const double s1 = (c & 1) ? -1.0 : 1.0;
+            const double s2 = (c & 2) ? -1.0 : 1.0;
+            const double m1v = md1_q0 + (side1[0] ? s1 * h1 : 0.0)
+                                     + (side1[1] ? s2 * h2 : 0.0);
+            const double m2v = md2_q0 + (side1[0] ? 0.0 : s1 * h1)
+                                     + (side1[1] ? 0.0 : s2 * h2);
+            double dFa[16], dFb[16], d2a[16 * 16], d2b[16 * 16];
+            evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, bf_d,
+                m1v, m2v, p1_P, p1_E, p1_ct, p1_phi,
+                p2_P, p2_E, p2_ct, p2_phi,
+                rp, P_r, Fv_r[c], Fv_i[c], dFa, dFb, d2a, d2b, false);
+        }
+        const double D_re = (Fv_r[0] - Fv_r[1] - Fv_r[2] + Fv_r[3]) / (4.0 * h1 * h2);
+        const double D_im = (Fv_i[0] - Fv_i[1] - Fv_i[2] + Fv_i[3]) / (4.0 * h1 * h2);
+        const double t = (D_re * Fr + D_im * Fi) / den;
+        const double u = (D_im * Fr - D_re * Fi) / den;
+        const double v_re = t - (l_re[0] * l_re[1] - l_im[0] * l_im[1]);
+        const double v_im = u - (l_re[0] * l_im[1] + l_im[0] * l_re[1]);
+        d2ln_re[pos[0] * 16 + pos[1]] += v_re;
+        d2ln_im[pos[0] * 16 + pos[1]] += v_im;
+        d2ln_re[pos[1] * 16 + pos[0]] += v_re;
+        d2ln_im[pos[1] * 16 + pos[0]] += v_im;
+    }
+}
+
+// ============================================================
 // Custom 模型 Hessian（标量路径，参数数 P 运行时无上限；多共振态）
 // F_total = Π 共振态因子 × Π Bf；log-derivative 累积（与梯度 kernel R>1 一致）:
 //   dln[j]  = Σ_n ∂ln F_n/∂θ_j
@@ -802,146 +963,6 @@ __device__ void addBfQ0HessianTerms(
 // 全链对 m0 求导: q0 → N → γ → y → s → 商;  g0 仅经 γ 线性出现。
 // ============================================================================
 
-// N_L(z) = Σ_k c_k z^{2k} 及其对 z 的一/二阶（系数与 ResModel bfPolyCoeffs 一致）
-__device__ void bwrN(int L, double z, double& n, double& np, double& npp) {
-    n = 1.0; np = 0.0; npp = 0.0;
-    if (L < 0 || L > 5) return;
-    static const double C[6][6] = {
-        {1,0,0,0,0,0}, {1,1,0,0,0,0}, {9,3,1,0,0,0},
-        {225,45,6,1,0,0}, {11025,1575,135,10,1,0},
-        {893025,99225,6300,210,15,1}};
-    double z2 = z * z;
-    n = 0.0;
-    double pw = 1.0;    // z^{2k}
-    double pw2 = 1.0;   // z^{2k-2}（k=1 时 = z^0）
-    for (int k = 0; k <= L; ++k) {
-        double c = C[L][k];
-        if (k == 0) {
-            n += c;
-        } else {
-            pw *= z2;
-            n += c * pw;
-            np += c * (2.0 * k) * pw2 * z;              // 2k·c·z^{2k-1}
-            npp += c * (2.0 * k) * (2.0 * k - 1.0) * pw2; // 2k(2k-1)·c·z^{2k-2}
-            pw2 *= z2;
-        }
-    }
-}
-
-// 解析 F/dF/d²F: dF[0]=∂m0, dF[1]=∂g0; d2F[j*2+k]（对称 2×2, 与 evalCustomAll 同布局）
-__device__ void bwrSpecEval(double m0, double g0, double m, double q,
-                            double q0m1, double q0m2, double dd,
-                            int Lmin, int Lvtx, bool has_bf,
-                            double& Fr, double& Fi,
-                            double* dFr, double* dFi,
-                            double* d2Fr, double* d2Fi) {
-    // ---- q0 = breakup(m0, q0m1, q0m2) 及其对 m0 的一/二阶 ----
-    double A = (q0m1 + q0m2) * (q0m1 + q0m2);
-    double B = (q0m1 - q0m2) * (q0m1 - q0m2);
-    double m02 = m0 * m0, m03 = m02 * m0, m04 = m02 * m02;
-    double Q2 = ((m02 - A) * (m02 - B)) / (4.0 * m02);   // q0²
-    // Q2' = (m0⁴−AB)/(2m0³);  Q2'' = (m0⁴+3AB)/(2m0⁴)
-    double q0 = Q2 > 0.0 ? sqrt(Q2) : 0.0;
-    double q0p = 0.0, q0pp = 0.0;
-    if (q0 > 1e-9) {
-        double Q2p = (m04 - A * B) / (2.0 * m03);
-        double Q2pp = (m04 + 3.0 * A * B) / (2.0 * m04);
-        q0p = Q2p / (2.0 * q0);
-        q0pp = (Q2pp - 2.0 * q0p * q0p) / (2.0 * q0);
-    }
-    double u = q0p / q0;                       // d(ln q0)/dm0
-
-    // ---- 内部 Bf² = N(q0·di)/N(q·di); di = has_bf? dd : 0（di=0 → Bf≡1）----
-    double di = has_bf ? dd : 0.0;
-    double Ni_v, Ni_p, Ni_pp, N0i_v, N0i_p, N0i_pp;
-    bwrN(Lmin, q * di, Ni_v, Ni_p, Ni_pp);
-    bwrN(Lmin, q0 * di, N0i_v, N0i_p, N0i_pp);
-    double I2 = N0i_v / Ni_v;
-    double N0i_m = N0i_p * di * q0p;                       // dN0i/dm0
-    double N0i_mm = N0i_pp * (di * q0p) * (di * q0p) + N0i_p * di * q0pp;
-    double lI = N0i_m / N0i_v;                             // (ln Bf²)'
-    double lIp = (N0i_mm * N0i_v - N0i_m * N0i_m) / (N0i_v * N0i_v);  // 二阶 ln 导
-
-    // ---- 顶点 Bv = √(N(q0·dd)/N(q·dd))（has_bf 时）----
-    double Bv = 1.0, lB = 0.0, lBp = 0.0;      // Bv 数值 + ln 导数(对 m0)
-    if (has_bf) {
-        double Nv_v, Nv_p, Nv_pp, Nv0_v, Nv0_p, Nv0_pp;
-        bwrN(Lvtx, q * dd, Nv_v, Nv_p, Nv_pp);
-        bwrN(Lvtx, q0 * dd, Nv0_v, Nv0_p, Nv0_pp);
-        Bv = sqrt(Nv0_v / Nv_v);
-        double Nv0_m = Nv0_p * dd * q0p;
-        double Nv0_mm = Nv0_pp * (dd * q0p) * (dd * q0p) + Nv0_p * dd * q0pp;
-        lB = 0.5 * Nv0_m / Nv0_v;
-        lBp = 0.5 * (Nv0_mm / Nv0_v - (Nv0_m / Nv0_v) * (Nv0_m / Nv0_v));
-    }
-
-    // ---- P = (q/q0)^n, n = 2Lmin+1（q 与 m0 无关）----
-    int nP = 2 * Lmin + 1;
-    double lP = -nP * u;                       // P'/P
-    double lPp = nP * (u * u - q0pp / q0);     // (P'/P)'
-    double pP = 1.0;
-    for (int k = 0; k < nP; ++k) pP *= (q / q0);
-
-    // ---- γ 组: γ = g0·P·(m0/m)·Bf² ----
-    double Lg = lP + 1.0 / m0 + lI;
-    double Lgp = lPp - 1.0 / (m0 * m0) + lIp;
-    double gamma = g0 * pP * (m0 / m) * I2;
-    double g_m = gamma * Lg;
-    double g_mm = gamma * (Lg * Lg + Lgp);
-    double g_g = gamma / g0;
-    double g_mg = g_m / g0;
-    double g_gg = 0.0;
-
-    // ---- x, y, s: 对 (m0, g0) 与混合的一二阶 ----
-    double x = m02 - m * m;
-    double x_m = 2.0 * m0, x_mm = 2.0;
-    double x_g = 0.0, x_mg = 0.0, x_gg = 0.0;   // x 与 g0 无关
-    double y = m0 * gamma;
-    double y_m = gamma + m0 * g_m;
-    double y_mm = 2.0 * g_m + m0 * g_mm;
-    double y_g = m0 * g_g;
-    double y_gg = m0 * g_gg;
-    double y_mg = g_g + m0 * g_mg;
-    double s = x * x + y * y;
-    double s_m = 2.0 * x * x_m + 2.0 * y * y_m;
-    double s_mm = 2.0 * x_m * x_m + 2.0 * x * x_mm + 2.0 * y_m * y_m + 2.0 * y * y_mm;
-    double s_g = 2.0 * y * y_g;
-    double s_gg = 2.0 * y_g * y_g;
-    double s_mg = 2.0 * y_m * y_g + 2.0 * y * y_mg;
-
-    // ---- 商 z/s 的一二阶（z = x 或 y; g0 与 x 无关但公式通用）----
-    double invs = 1.0 / s, invs2 = invs * invs, invs3 = invs2 * invs;
-    double Rm = (x_m * s - x * s_m) * invs2;
-    double Rg = (-x * s_g) * invs2;
-    double Rmm = (2.0 * s - x * s_mm) * invs2 - 2.0 * s_m * (x_m * s - x * s_m) * invs3;
-    double Rgg = (-x * s_gg) * invs2 - 2.0 * s_g * (-x * s_g) * invs3;
-    double Rmg = (x_mg * s + x_g * s_m - x_m * s_g - x * s_mg) * invs2
-               - 2.0 * s_m * (x_g * s - x * s_g) * invs3;
-    double Im = (y_m * s - y * s_m) * invs2;
-    double Ig = (y_g * s - y * s_g) * invs2;
-    double Imm = (y_mm * s - y * s_mm) * invs2 - 2.0 * s_m * (y_m * s - y * s_m) * invs3;
-    double Igg = (y_gg * s - y * s_gg) * invs2 - 2.0 * s_g * (y_g * s - y * s_g) * invs3;
-    double Img = (y_mg * s + y_g * s_m - y_m * s_g - y * s_mg) * invs2
-               - 2.0 * s_m * (y_g * s - y * s_g) * invs3;
-
-    // ---- 乘顶点 Bv: (z·Bv)' = Bv(z' + z·lB); 二阶 = Bv(z'' + 2z'·lB + z(lB²+lBp)) ----
-    double R = x * invs, I = y * invs;
-    Fr = R * Bv;
-    Fi = I * Bv;
-    dFr[0] = (Rm + R * lB) * Bv;
-    dFi[0] = (Im + I * lB) * Bv;
-    dFr[1] = Rg * Bv;                        // Bv 与 g0 无关
-    dFi[1] = Ig * Bv;
-    double b2 = lB * lB + lBp;
-    d2Fr[0] = (Rmm + 2.0 * Rm * lB + R * b2) * Bv;
-    d2Fi[0] = (Imm + 2.0 * Im * lB + I * b2) * Bv;
-    d2Fr[1] = (Rmg + Rg * lB) * Bv;          // ∂m∂g
-    d2Fi[1] = (Img + Ig * lB) * Bv;
-    d2Fr[2] = d2Fr[1];                       // ∂g∂m（对称）
-    d2Fi[2] = d2Fi[1];
-    d2Fr[3] = Rgg * Bv;
-    d2Fi[3] = Igg * Bv;
-}
 CTPWA_KERNEL void computeCustomHessianKernel(
     const thrust::complex<double>* d_slamp_tab,
     const ctComplex* d_v,
@@ -1097,6 +1118,14 @@ CTPWA_KERNEL void computeCustomHessianKernel(
                     if (P_r > 16) P_r = 16;
                     int off = d_res_off[match_r];
                     int cnt = d_res_cnt[match_r];
+                    // 极角量提前算：模型 q0 跨共振项（addModelQ0HessianTerms）
+                    // 在特化/JIT/解释器三条分支上都要用
+                    const double p1_P = pD1.P(), p1_E = pD1.E;
+                    const double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
+                    const double p1_phi = atan2(pD1.Py, pD1.Px);
+                    const double p2_P = pD2.P(), p2_E = pD2.E;
+                    const double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
+                    const double p2_phi = atan2(pD2.Py, pD2.Px);
 
                     double Fr, Fi, dFr[16], dFi[16], d2Fr[16 * 16], d2Fi[16 * 16];
                     if (d_jit_out_full && nodeIdx == jit_target_node) {
@@ -1127,12 +1156,6 @@ CTPWA_KERNEL void computeCustomHessianKernel(
                                     res.bwr_has_bf != 0,
                                     Fr, Fi, dFr, dFi, d2Fr, d2Fi);
                     } else {
-                        double p1_P = pD1.P(), p1_E = pD1.E;
-                        double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
-                        double p1_phi = atan2(pD1.Py, pD1.Px);
-                        double p2_P = pD2.P(), p2_E = pD2.E;
-                        double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
-                        double p2_phi = atan2(pD2.Py, pD2.Px);
                         // P_r=0（固定/ONE 模型）: 只读值段（dF/d2F 段不存在）
                         evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, node.bf_d,
                             md1_q0, md2_q0,
@@ -1175,7 +1198,18 @@ CTPWA_KERNEL void computeCustomHessianKernel(
                     if (node.has_bf && res.type != ResModelType::BW)
                         addBfQ0HessianTerms(node, L, q0, m0_q0, md1_q0, md2_q0,
                             dln_re, dln_im, d2ln_re, d2ln_im,
-                            d_resonances, R, d_res_off, d_res_cnt, pm);
+                            d_resonances, R, d_res_off, d_res_cnt, pm,
+                            /*skip_model_q0_daughters=*/(res.type != ResModelType::ONE));
+                    // 模型线形内部 q0 的跨共振项（顶点 Bf 之外的那一半）：
+                    // q0 里"自由共振态子粒子"的质量 → 该子共振态 mass 槽位的一二阶
+                    // 对数导数。特化/解释器/JIT 三条分支都补（特化只保证 q0 与
+                    // 自身 θ 的关系正确，子粒子质量同样缺失）。
+                    addModelQ0HessianTerms(res, aux, rp, P_r,
+                        mm, qq, q0, L, node.bf_d, md1_q0, md2_q0,
+                        p1_P, p1_E, p1_ct, p1_phi, p2_P, p2_E, p2_ct, p2_phi,
+                        node, match_r, Fr, Fi, dFr, dFi,
+                        d_resonances, R, d_res_off, d_res_cnt, pm,
+                        dln_re, dln_im, d2ln_re, d2ln_im);
 
                     double nr = Ftr * Fr - Fti * Fi;
                     double ni = Ftr * Fi + Fti * Fr;
