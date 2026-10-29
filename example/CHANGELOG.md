@@ -1,35 +1,21 @@
 # CHANGELOG（`example/`）
 
 本文件记录对上游 `BHXiang/ctpwa` 的改动中、**`example/` 目录内**各文件的内容变化
-（PR #1–#21）。其它目录随上游维护，不在本表；上游同步见文末。
-日期 = 合并进 `main` 的日期；“PR #n”指 `wwdws1/ctpwa` 的合并请求。
+（PR #1–#22）。其它目录随上游维护，不在本表。
+**组织方式：先按合并进 `main` 的日期（`##`）分组，日期内再按文件（`###`）分组**；
+不涉及 `example/` 的上游同步提交也按日期归入各日期的「上游同步」小节。
+“PR #n”指 `wwdws1/ctpwa` 的合并请求。
 
 > 只列**行为/接口/文档**变化；纯格式（ruff-format/空白）只在首次记录。
 
 ---
 
-## `example/fit.py`
+## 2026-10-29
 
-### 优化器
-- 2026-09-22（PR #1 `b7865bc`）新增 `reparam` 有界优化器并设为默认：S1 幅度软墙
-  `amp=amp_max·sigmoid(u)`、S2 幅度罚项 `λ·Σ|A|²`、S4 polish 加固（步长夹/硬帽/噪声底停机）。
-- 2026-09-22（并入上游 `4e5e5e5`，含上游 `a3946d5`）上游采纳我方 reparam；并入 projected
-  闭式 two-loop + `FIT_OPT_PROF` 诊断、`--config` 修复、`reparam-tol-stop` 更名 +
-  polish `cand_best is None` 保护。
-- 2026-09-22（PR #3 `4a29b3f`）恢复上游默认 `optimizer=projected`；`reparam` 改为可选/推荐；
-  `err_mode` 默认随优化器（reparam→auto，其它→strict）。
+### `example/fit.py`
 
-### 参数误差 / Hessian
-- 2026-09-22（PR #2 `41c2de0`）Hessian 非正定时的参数误差回退：
-  `--err-mode {auto,strict,pinv,psd}` + `--err-tau`（默认策略 C：显式 > `FIT_ERR_MODE` >
-  优化器相关）。
-- 2026-09-22（PR #2 `3ea973c`）`final_nll` 取**最终接受点**真实 NLL；`parameters.txt` 第 0 行
-  固定参考统一标 `(fixed)`；`getHessian` 耦合块顺序经有限差分确认为 **BLOCK**。
-- 2026-10-22（PR #18，并入上游 `bc70a79`）**非正定时改走有效秩截断**（新开关
-  `--no-errors-truncate` 可退回旧的 pinv）：`--err-mode auto` 且 Hessian 不定时，保留
-  `λ_i > τ·λmax` 的方向做误差传播 `σ²_m = Σ_{i∈keep} E[m,i]²/λ_i`，**每个参数仍有有限误差**，
-  被冻结的线性组合（未测定方向）单独列出并记录在 `_last_error_truncation`；
-  `strict/pinv/psd` 显式指定时语义不变。非正定警告措辞同步更新。
+#### 参数误差 / Hessian
+
 - 2026-10-29（PR #19，并入上游 `fa40d41`）**正定性改为“可行子空间”判据（KKT 二阶条件）**：
   `_errors_from_hessian` 内部改用 `ctpwa.diagnostics.analyze_hessian`——
   剔固定参考（Re_0/Im_0）→ 剔**活跃**参数（贴边且梯度朝外、不计入判别且误差标 NaN）→
@@ -45,19 +31,8 @@
   `build_info()['complex_bytes']` 优先、`DeviceManager().compiledPrecision()` 探针兜底、
   再按 params 精度兜底；并删掉一处重复定义的旧 `extract_coupling_complex`（PR #18 合并残留死代码）。
 
-### 参数削减 / 边界诊断（并入上游 `bc70a79`）
-- 2026-10-22（PR #18）新增 `--fit-mode {0,1}`：`0`=FREEPARAMS chain×step（默认）、
-  `1`=VSPACE 逐振幅（Hessian 二阶项恒为 0 → 精确）。fit_mode 只能在 `ctpwa.analysis()`
-  构造期决定，故在 **import 期**用 `_fit_mode_from_argv()` 从 argv/`FIT_MODE` 取出并传给
-  `ctpwa.analysis(cfg, _FIT_MODE)`（需 ctpwa ≥ 0.3.10）。
-- 2026-10-22（PR #18）新增 `--reduce-params`（配合 `--rank-tau`/`--rank-iters`/
-  `--rank-fixed-point`/`--rank-scale`）：用精确 Hessian 的**有效秩**构造降维基
-  `p = p0 + E·y`，在保留子空间做降维重拟合，输出冻结组合与全参数误差到
-  `param_reduction.txt` / `best_params_reduced.pt`；采用降维解时会打印并置
-  `_err_full=None`（协方差/相关矩阵 CSV 在最终点重算）。
-- 2026-10-22（PR #18）新增 `--bound-margin`（默认 0.02）：列出贴住 `free_range` 的 θ
-  （边距 + `|∂NLL/∂θ|`），标注“边界/非驻点评估 → 假非正定”。
-- 摘要 `optimization_summary.txt` 增 `fit_mode` / `err_mode`+截断 / 参数削减 `k` 三行。
+#### 参数削减 / 边界诊断
+
 - 2026-10-29（PR #19）新增**后端自检**：header 打印
   `backend=… precision=… complex_bytes=… has_cuda=…`（`ctpwa.build_info()`），
   非 `cuda` 时 `log.warning`（新门面 0.3.15+ 会在 GPU 不可用时**静默退 CPU**）。
@@ -66,45 +41,8 @@
   `_err_fields`（err dict → 字段的唯一出口）；`compute_reduction` 的活跃集改用
   `_hessian_diagnosis`（与误差/抛光同一条可行子空间规则）。
 
-### 可观测性 / 方法学
-- 2026-09-23（PR #4）去掉静默降级（polish/FF/保存失败改 `log.exception` + `polish_status`）；
-  reparam profile（`FIT_OPT_PROF`）；`optimization_summary.txt` 增 `eval数/n_iter` 列；
-  all-runs 系综统计（best/median/IQR/std/worst）；`FIT_DETERMINISTIC`；等价微优化
-  （`_reparam_unpack` 预分配、polish 免 n×n 分配、初始化向量化，数值逐位一致）。
+#### 路径口径
 
-### FF（拟合分数）/ 分波效率
-- 2026-09-24（PR #6）放开 FF/效率：非 PD 时按 `err_mode` 用 PSD 化曲率传播误差、**去掉 PD 门控**
-  （中心值恒输出）；`extract_coupling_complex` 用 `ctpwa.DeviceManager().compiledPrecision()`
-  选复数 dtype；FF/效率放到最后、核心摘要先写、新增 `--ff-only`。
-- 2026-09-24（PR #7）FF 崩溃不再损坏核心摘要；`--ff-only` 输出隔离到 `<output-dir>/ff_only/`。
-- 2026-09-25（PR #9 `4d24aa6`）FF/效率改为开关：`--cal-ff {True,False}`（默认 True）、
-  `--cal-eff {True,False}`（默认 False）；摘要标注“未计算”。
-
-### 日志
-- 2026-09-24（PR #8 `9a88ebc`）`logging.basicConfig(stream=sys.stdout)`：日志进 `.log`。
-- 2026-09-25（PR #10 `5a5dc24`）参数误差日志标签 `[errors]` → `[param-err]`（避免误读为报错）。
-- 2026-09-25（PR #13 `7765e0d`）输出/日志约定：内部诊断（pLBFGS/polish）由 `print` 改 `log`，
-  结果表与可复现 tag 保留 `print`。
-
-### 随机初值 / 输出文件
-- 2026-09-25（PR #12 `279e5e8`）随机初值 `--seed <int>` / `FIT_SEED`（base 默认当前 Unix
-  时间戳，run i 用 `base+i`；`--seed 42` 复现旧行为；启动打印可复现命令；`checkpoint.pt` 存 seed，
-  `--resume` 以 checkpoint 为准）；best 点输出 `param_covariance.csv` / `param_correlation.csv`
-  （完整 N×N，仅正常拟合、仅 best；log 只提示）。
-
-### 代码整理
-- 2026-09-25（PR #13）常量上移、删死代码/历史叙事、`_project_params_`→`_project_params`、
-  去重 `generate_initial_params`（bit-exact）、补类型注解 + `ErrDict/RunResult`、
-  `cfg` dict → `FitConfig(Mapping)` 兼容式 dataclass、`main()` 抽纯函数
-  `_determine_base_seed/_seed_message`；**修 `--warm-start auto` 按 `--output-dir` 找
-  `best_params.pt`**（旧版恒指 `results/`）。
-- 2026-09-25（PR #14）polish 终态 verbose 在“全活跃”时的 `lmax` NameError；非 PD 且
-  `err_mode=strict` 时的警告措辞；参数矩阵输出复用 best 误差（去掉重复 `[param-err]` 与重复 eigh）。
-
-### 文档引用清理
-- 2026-09-25（PR #11 `4b6b3a9`）去掉注释中指向仓库外/不存在的文档引用，以及内部编号标注。
-
-### 路径口径（PR #21）
 - 2026-10-29（PR #21）**统一路径锚点**，`fit.py` 三条改动：
   1. **import 期 chdir 到 config 目录**（在构造 `ctpwa.analysis()` **之前**）：C++ 在构造期
      就按 **cwd** 打开 `data`/`phsp`/`bkg`，而 `phsp_truth` 是 FF/效率时才打开、
@@ -127,44 +65,26 @@
     `parseData` 不做 `parent_path()`），因此上游没有"config 内相对路径统一"这一口径；将来合并
     上游时注意这一点。
 
----
+### `example/README.md`
 
-## `example/plot.py`
-
-- 2026-09-22（PR #2 `af0e72b`）应用 ruff-format。
-- 2026-09-24（PR #7 `b1924f4`）`writeWeightFile` 的复数 dtype 按 `.so` 编译精度选择
-  （`complex128`/`complex64`），修 “vector dtype must match .so complex precision”。
-- 2026-09-29（PR #15 `1f66ceb`）**Dalitz(2D) pull/Fit 加入本底**：`total_fit_values = hfit+hbkg`；
-  Pull 用 `(data-total)/√total`；Fit 面板画 total、标题有本底时 `Fit+Bkg`；`vmax=max(data,total)`。
-  与 1D（`plot_combined_histogram_with_pull`）口径一致。
-- 2026-09-29（PR #17，https://github.com/wwdws1/ctpwa/pull/17 ）修 `--params N` 路径：
-  原先调用不存在的 `analysis.writeWeightFile`，且参数文件名/解析都不对 → 改为从
-  `results/parameters.txt` 按 `# RUN: run_N` 分块正确解析（耦合 `±`/`(fixed)` 与共振态行），
-  拼 `[Re, Im, θ]`（float64）后调 `analysis.writeResult`；失败**明确报错**、不再静默回退。
-
----
-
-## `example/README.md`
-
-- 2026-09-22（PR #1/#2/#3）随 reparam / err-mode / 默认优化器更新。
-- 2026-09-23（PR #5 `43ac312`）修过期内容：默认优化器措辞、`--config` 已生效、环境变量补全、
-  摘要列/系综、§3.5 来源标注。
-- 2026-09-24（PR #6 `e4e0ff3`）FF/效率不再 PD 门控 + 大 `phsp_truth` 崩溃提示 + `--ff-only`。
-- 2026-09-25（PR #9 `4d24aa6`）`--cal-ff`/`--cal-eff` 参数表与说明。
-- 2026-09-25（PR #12 `279e5e8`）`--seed`/`FIT_SEED`、输出文件表加参数矩阵、seed 说明。
-- 2026-09-25（PR #13 `2d9c761`）`--warm-start auto` 目录修正 + 输出/日志约定。
-- 2026-09-29（PR #16）末尾新增 **§8 `plot.py` 使用说明**。
-- 2026-09-29（PR #17）开头注明 `plot.py` 见 §8、变更历史见 `CHANGELOG.md`。
-- 2026-10-22（PR #18）新增 **§9 参数削减 / 误差截断 / 边界诊断 / `--fit-mode`** 参数表与
-  使用建议（含 `--reduce-params` 会替换最终解、生产默认不开的说明）。
-- 2026-10-29（PR #19）新增 **§10 后端选择（CPU/GPU）与 `CTPWA_DEVICE`**；§1/§5 补 ctpwa
+- 2026-10-29（PR #19）新增 **§9 后端选择（CPU/GPU）与 `CTPWA_DEVICE`**；§1/§5 补 ctpwa
   版本要求与新门面环境变量；§7 备注补“正定判据变为可行子空间(KKT)”与“仓库根 `ctpwa/`
-  会遮蔽已装 wheel”两条坑；§9 说明误差口径已改为可行子空间。
-- 2026-10-29（PR #20）新增 **§11 MC 生成（`gen_phsp_mc.py` / `gen_toy_mc.py`）**。
+  会遮蔽已装 wheel”两条坑；§8 说明误差口径已改为可行子空间。
+- 2026-10-29（PR #20）新增 **§10 MC 生成（`gen_phsp_mc.py` / `gen_toy_mc.py`）**。
+- 2026-10-29（PR #22）**章节重组**：把**不属于 `fit.py` 用法**的脚本归入最后一章
+  **§10「其它脚本」**（10.1 `plot.py` / 10.2 `gen_phsp_mc.py` / 10.3 `gen_toy_mc.py`）；
+  原 §9/§10/§11 顺次重编为 **§8/§9/§10**，一级标题改为 `example 使用说明（fit.py 为主）`；
+  开头加**两级目录（TOC，33 条）**。**10.2 新增参数表**、**10.3 表补全**为三列
+  （参数/说明/默认），并补充：`.dat` 每行固定 4 个数、**无权重列**（权重走 `root`/`npy` 或
+  config 的 `data_weights`/`bkg_weights`/`phsp_weights` 独立权重文件），以及
+  `--mode unweighted`（平坦 + `|M|²` 舍选 AR → 等权，`stats.acceptance`/`max_weight`）与
+  `weighted`（全收 + 权重 → 快，需配 `--poisson` 才得到等权 `dat`）的语义；另补
+  **`--seed` 默认取当前 Unix 时间戳（与 `fit.py` 一致、每次运行不同）** 和
+  **`--check-distribution` 自洽性检查的详解**（独立加权平坦参照样本 → `m²(i,j)` 归一化直方图
+  `max|Δ|<0.05`、统计涨落、等权前提、与闭包的区别）；并修掉**列表里多余的反斜杠转义**
+  （`|M|²`/`max|Δ|` 等——转义只在**表格单元格**里需要，列表/正文里会原样显示反斜杠）。
 
----
-
-## `example/gen_phsp_mc.py`（新增，PR #20）
+### `example/gen_phsp_mc.py`
 
 - 2026-10-29（PR #20）**DIYMC P1 平坦相空间生成**（自包含单文件，不 import 本仓库其它文件）：
   `--config -n -o [--seed --format dat|root|npy --mother --mother-mass --weighted --chunk
@@ -172,10 +92,11 @@
   末态顺序 = `Data.order`；内置自检（末态顺序 vs `Data.order`、守恒、质量壳、行数 = n×n_final、
   `weightMax`）；`--chunk` 分块追加写以支持千万级样本。**不需要 GPU，也不读数据文件**。
   文档里写清两条语义：平坦 PS ≠ 生产 `phsp_truth`；closure 用途需百万级样本（窄共振）。
+- 2026-10-29（PR #22）`--seed` 默认由 `0` 改为**当前 Unix 时间戳**（与 `fit.py` 一致）：
+  每次运行都不同，避免"忘了改 seed"导致重复样本；启动打印 `[seed] … 复现本作业请加 --seed N`，
+  分块时第 k 块仍用 `seed+k`。要复现就显式传 `--seed`。
 
----
-
-## `example/gen_toy_mc.py`（新增，PR #20）
+### `example/gen_toy_mc.py`
 
 - 2026-10-29（PR #20）**DIYMC P2/P3 振幅加权 toy → pseudo-data**（自包含单文件）：
   `--config --params-from(best_params.pt) -n -o [--seed --mode unweighted|weighted --batch
@@ -192,41 +113,19 @@
   numpy→torch 自动转换，脚本内部又是 numpy 数组 → 第四轮 GPU 冒烟抛
   `TypeError: writeMC(): incompatible function arguments`（`gen_phsp_mc.py` 走
   `gen.write(ev, …)`，`ev` 本来就是 torch 张量，故未踩到）。
+- 2026-10-29（PR #22）`--seed` 默认由 `0` 改为**当前 Unix 时间戳**（与 `fit.py` 一致）：
+  每次运行都不同（避免"忘了改 seed"导致重复 toy）；启动打印 `[seed] … 复现本作业请加
+  --seed N`，`--stats-json` 里的 `seed` 也记录实际值。`--check-distribution` 参照样本仍用
+  `seed+9999`、本地 RNG 用 `seed+20260101`。
 
----
+### `example/CHANGELOG.md`
 
-## `example/README.md`（续）
+- 2026-10-29（PR #22）**本文件重组**：由「按文件」改为 **按合并日期（`##`）→ 文件（`###`）**；
+  不涉及 `example/` 的上游同步按日期归入各日期的「上游同步」小节；`fit.py` 的变更类别
+  保留为 `####` 小类。历史条目里对 `example/README.md` 的 `§` 引用同步改为重组后的编号。
 
----
+### 上游同步
 
-## `example/.pre-commit-config.yaml`
-
-- 2026-09-22（PR #2 `fdbf26f`/`af0e72b`）新增：仅作用于 `example/`；含 ruff-format 等会改文件的
-  hook；`ruff` 仅 `--select E9,F63,F7,F82`。
-- 2026-09-25（PR #11 `4b6b3a9`）清理注释中指向仓库外文档的引用。
-
----
-
-## 上游同步
-
-- 2026-09-29（PR #16）并入上游 `BHXiang/ctpwa`（`a3946d5` → `68e0d0c`），**不涉及 `example/`**：
-  - `68e0d0c` 修大 `phsp_truth` 下 `getFitFractions`/`getEfficiency` 崩溃与内存泄漏（issue #3）；
-  - `7c59d36` trans 支持 N 个链名 + 每名字一个比值；ONE 占位质量不进振幅；
-  - `754cd98` 发布 v0.3.9（`setup.py`）。
-  - 涉及文件：`include/*`、`src/*`、`tests/configs/trans_multi*.yml`、`tests/test_trans_host.py`、`setup.py`。
-- 2026-10-22（PR #18）并入上游 `BHXiang/ctpwa`（`68e0d0c` → `0e452a1`，13 个提交，
-  tag v0.3.10–v0.3.14）：
-  - `77b2bd6` trans 约束名可为链名/子链片段；配对改最小差异匹配（v0.3.10）；
-  - `98ed8f2`/`970c77b` phsp Hessian 大 n 回退（n² 共享内存超限）+ `CTPWA_PHSP_HESS_DEBUG`（v0.3.11）；
-  - `63e8206`/`7b2cd2c` identical 每-σ 四动量缓冲被提前释放修复 + ident4 回归（v0.3.12）；
-  - `c997a3f` Hessian 乘法链二阶项用 `v_a/(p_j·p_k)`、补齐 step×step 项（v0.3.13）；
-  - `50259f2` Info.cu 同一 intermediate 下重复 `[J,P]` 块被覆盖 → 共振态丢失 + 重复列两次（v0.3.14）；
-  - `bc70a79` `example/fit.py` 新功能（见上两节），唯一与我们的冲突点，按“双方都保留”手工合并；
-  - 涉及文件：`include/AmpGen.cuh`、`src/{AmpGen,ComputeHessian,Info,Parameters}.cu`、
-    `setup.py`、`tests/*`（新增 ident4 / trans_multi_step / dupjp / hess_mult 等回归）、`example/fit.py`。
-  - 环境：`ctpwa` pip 包需 ≥ 0.3.10（`analysis(config, fit_mode)`）；本机 0.3.13
-    （含全部 v0.3.13 C++）。`50259f2` 只在生产配置存在“重复 `[J,P]` 块”时才影响结果，
-    经查 `jlsp/pwa/all/single` 无此结构 → 现有结果不受影响。
 - 2026-10-29（PR #19）并入上游 `BHXiang/ctpwa`（`0e452a1` → `1fda180`，12 个提交，
   tag v0.3.15–v0.3.18）：
   - `039d7df`/`c06b4fc` DIYMC 相空间产生器（native GENBOD + 振幅加权；新增
@@ -249,3 +148,209 @@
     `test_mc*`、`test_hessian_diagnostics.py`）、`example/fit.py`（唯一冲突文件，7 处）。
   - 环境：`ctpwa` pip 需 ≥ 0.3.17（`ctpwa.diagnostics`）；本机 0.3.18。`CTPWA_DEVICE=cuda`
     已在 `test14/sub.gpu` 与生产 `sub.gpu` 中显式设置（避免静默退 CPU）。
+
+---
+
+## 2026-10-22
+
+### `example/fit.py`
+
+#### 参数误差 / Hessian
+
+- 2026-10-22（PR #18，并入上游 `bc70a79`）**非正定时改走有效秩截断**（新开关
+  `--no-errors-truncate` 可退回旧的 pinv）：`--err-mode auto` 且 Hessian 不定时，保留
+  `λ_i > τ·λmax` 的方向做误差传播 `σ²_m = Σ_{i∈keep} E[m,i]²/λ_i`，**每个参数仍有有限误差**，
+  被冻结的线性组合（未测定方向）单独列出并记录在 `_last_error_truncation`；
+  `strict/pinv/psd` 显式指定时语义不变。非正定警告措辞同步更新。
+
+#### 参数削减 / 边界诊断（并入上游 `bc70a79`）
+
+- 2026-10-22（PR #18）新增 `--fit-mode {0,1}`：`0`=FREEPARAMS chain×step（默认）、
+  `1`=VSPACE 逐振幅（Hessian 二阶项恒为 0 → 精确）。fit_mode 只能在 `ctpwa.analysis()`
+  构造期决定，故在 **import 期**用 `_fit_mode_from_argv()` 从 argv/`FIT_MODE` 取出并传给
+  `ctpwa.analysis(cfg, _FIT_MODE)`（需 ctpwa ≥ 0.3.10）。
+- 2026-10-22（PR #18）新增 `--reduce-params`（配合 `--rank-tau`/`--rank-iters`/
+  `--rank-fixed-point`/`--rank-scale`）：用精确 Hessian 的**有效秩**构造降维基
+  `p = p0 + E·y`，在保留子空间做降维重拟合，输出冻结组合与全参数误差到
+  `param_reduction.txt` / `best_params_reduced.pt`；采用降维解时会打印并置
+  `_err_full=None`（协方差/相关矩阵 CSV 在最终点重算）。
+- 2026-10-22（PR #18）新增 `--bound-margin`（默认 0.02）：列出贴住 `free_range` 的 θ
+  （边距 + `|∂NLL/∂θ|`），标注“边界/非驻点评估 → 假非正定”。
+- 摘要 `optimization_summary.txt` 增 `fit_mode` / `err_mode`+截断 / 参数削减 `k` 三行。
+
+### `example/README.md`
+
+- 2026-10-22（PR #18）新增 **§8 参数削减 / 误差截断 / 边界诊断 / `--fit-mode`** 参数表与
+  使用建议（含 `--reduce-params` 会替换最终解、生产默认不开的说明）。
+
+### 上游同步
+
+- 2026-10-22（PR #18）并入上游 `BHXiang/ctpwa`（`68e0d0c` → `0e452a1`，13 个提交，
+  tag v0.3.10–v0.3.14）：
+  - `77b2bd6` trans 约束名可为链名/子链片段；配对改最小差异匹配（v0.3.10）；
+  - `98ed8f2`/`970c77b` phsp Hessian 大 n 回退（n² 共享内存超限）+ `CTPWA_PHSP_HESS_DEBUG`（v0.3.11）；
+  - `63e8206`/`7b2cd2c` identical 每-σ 四动量缓冲被提前释放修复 + ident4 回归（v0.3.12）；
+  - `c997a3f` Hessian 乘法链二阶项用 `v_a/(p_j·p_k)`、补齐 step×step 项（v0.3.13）；
+  - `50259f2` Info.cu 同一 intermediate 下重复 `[J,P]` 块被覆盖 → 共振态丢失 + 重复列两次（v0.3.14）；
+  - `bc70a79` `example/fit.py` 新功能（见上两节），唯一与我们的冲突点，按“双方都保留”手工合并；
+  - 涉及文件：`include/AmpGen.cuh`、`src/{AmpGen,ComputeHessian,Info,Parameters}.cu`、
+    `setup.py`、`tests/*`（新增 ident4 / trans_multi_step / dupjp / hess_mult 等回归）、`example/fit.py`。
+  - 环境：`ctpwa` pip 包需 ≥ 0.3.10（`analysis(config, fit_mode)`）；本机 0.3.13
+    （含全部 v0.3.13 C++）。`50259f2` 只在生产配置存在“重复 `[J,P]` 块”时才影响结果，
+    经查 `jlsp/pwa/all/single` 无此结构 → 现有结果不受影响。
+
+---
+
+## 2026-09-29
+
+### `example/plot.py`
+
+- 2026-09-29（PR #15 `1f66ceb`）**Dalitz(2D) pull/Fit 加入本底**：`total_fit_values = hfit+hbkg`；
+  Pull 用 `(data-total)/√total`；Fit 面板画 total、标题有本底时 `Fit+Bkg`；`vmax=max(data,total)`。
+  与 1D（`plot_combined_histogram_with_pull`）口径一致。
+- 2026-09-29（PR #17，https://github.com/wwdws1/ctpwa/pull/17 ）修 `--params N` 路径：
+  原先调用不存在的 `analysis.writeWeightFile`，且参数文件名/解析都不对 → 改为从
+  `results/parameters.txt` 按 `# RUN: run_N` 分块正确解析（耦合 `±`/`(fixed)` 与共振态行），
+  拼 `[Re, Im, θ]`（float64）后调 `analysis.writeResult`；失败**明确报错**、不再静默回退。
+
+### `example/README.md`
+
+- 2026-09-29（PR #16）末尾新增 **§10.1 `plot.py` 使用说明**。
+- 2026-09-29（PR #17）开头注明 `plot.py` 见 §10.1、变更历史见 `CHANGELOG.md`。
+
+### 上游同步
+
+- 2026-09-29（PR #16）并入上游 `BHXiang/ctpwa`（`a3946d5` → `68e0d0c`），**不涉及 `example/`**：
+  - `68e0d0c` 修大 `phsp_truth` 下 `getFitFractions`/`getEfficiency` 崩溃与内存泄漏（issue #3）；
+  - `7c59d36` trans 支持 N 个链名 + 每名字一个比值；ONE 占位质量不进振幅；
+  - `754cd98` 发布 v0.3.9（`setup.py`）。
+  - 涉及文件：`include/*`、`src/*`、`tests/configs/trans_multi*.yml`、`tests/test_trans_host.py`、`setup.py`。
+
+---
+
+## 2026-09-25
+
+### `example/fit.py`
+
+#### FF（拟合分数）/ 分波效率
+
+- 2026-09-25（PR #9 `4d24aa6`）FF/效率改为开关：`--cal-ff {True,False}`（默认 True）、
+  `--cal-eff {True,False}`（默认 False）；摘要标注“未计算”。
+
+#### 日志
+
+- 2026-09-25（PR #10 `5a5dc24`）参数误差日志标签 `[errors]` → `[param-err]`（避免误读为报错）。
+- 2026-09-25（PR #13 `7765e0d`）输出/日志约定：内部诊断（pLBFGS/polish）由 `print` 改 `log`，
+  结果表与可复现 tag 保留 `print`。
+
+#### 随机初值 / 输出文件
+
+- 2026-09-25（PR #12 `279e5e8`）随机初值 `--seed <int>` / `FIT_SEED`（base 默认当前 Unix
+  时间戳，run i 用 `base+i`；`--seed 42` 复现旧行为；启动打印可复现命令；`checkpoint.pt` 存 seed，
+  `--resume` 以 checkpoint 为准）；best 点输出 `param_covariance.csv` / `param_correlation.csv`
+  （完整 N×N，仅正常拟合、仅 best；log 只提示）。
+
+#### 代码整理
+
+- 2026-09-25（PR #13）常量上移、删死代码/历史叙事、`_project_params_`→`_project_params`、
+  去重 `generate_initial_params`（bit-exact）、补类型注解 + `ErrDict/RunResult`、
+  `cfg` dict → `FitConfig(Mapping)` 兼容式 dataclass、`main()` 抽纯函数
+  `_determine_base_seed/_seed_message`；**修 `--warm-start auto` 按 `--output-dir` 找
+  `best_params.pt`**（旧版恒指 `results/`）。
+- 2026-09-25（PR #14）polish 终态 verbose 在“全活跃”时的 `lmax` NameError；非 PD 且
+  `err_mode=strict` 时的警告措辞；参数矩阵输出复用 best 误差（去掉重复 `[param-err]` 与重复 eigh）。
+
+#### 文档引用清理
+
+- 2026-09-25（PR #11 `4b6b3a9`）去掉注释中指向仓库外/不存在的文档引用，以及内部编号标注。
+
+### `example/README.md`
+
+- 2026-09-25（PR #9 `4d24aa6`）`--cal-ff`/`--cal-eff` 参数表与说明。
+- 2026-09-25（PR #12 `279e5e8`）`--seed`/`FIT_SEED`、输出文件表加参数矩阵、seed 说明。
+- 2026-09-25（PR #13 `2d9c761`）`--warm-start auto` 目录修正 + 输出/日志约定。
+
+### `example/.pre-commit-config.yaml`
+
+- 2026-09-25（PR #11 `4b6b3a9`）清理注释中指向仓库外文档的引用。
+
+---
+
+## 2026-09-24
+
+### `example/fit.py`
+
+#### FF（拟合分数）/ 分波效率
+
+- 2026-09-24（PR #6）放开 FF/效率：非 PD 时按 `err_mode` 用 PSD 化曲率传播误差、**去掉 PD 门控**
+  （中心值恒输出）；`extract_coupling_complex` 用 `ctpwa.DeviceManager().compiledPrecision()`
+  选复数 dtype；FF/效率放到最后、核心摘要先写、新增 `--ff-only`。
+- 2026-09-24（PR #7）FF 崩溃不再损坏核心摘要；`--ff-only` 输出隔离到 `<output-dir>/ff_only/`。
+
+#### 日志
+
+- 2026-09-24（PR #8 `9a88ebc`）`logging.basicConfig(stream=sys.stdout)`：日志进 `.log`。
+
+### `example/plot.py`
+
+- 2026-09-24（PR #7 `b1924f4`）`writeWeightFile` 的复数 dtype 按 `.so` 编译精度选择
+  （`complex128`/`complex64`），修 “vector dtype must match .so complex precision”。
+
+### `example/README.md`
+
+- 2026-09-24（PR #6 `e4e0ff3`）FF/效率不再 PD 门控 + 大 `phsp_truth` 崩溃提示 + `--ff-only`。
+
+---
+
+## 2026-09-23
+
+### `example/fit.py`
+
+#### 可观测性 / 方法学
+
+- 2026-09-23（PR #4）去掉静默降级（polish/FF/保存失败改 `log.exception` + `polish_status`）；
+  reparam profile（`FIT_OPT_PROF`）；`optimization_summary.txt` 增 `eval数/n_iter` 列；
+  all-runs 系综统计（best/median/IQR/std/worst）；`FIT_DETERMINISTIC`；等价微优化
+  （`_reparam_unpack` 预分配、polish 免 n×n 分配、初始化向量化，数值逐位一致）。
+
+### `example/README.md`
+
+- 2026-09-23（PR #5 `43ac312`）修过期内容：默认优化器措辞、`--config` 已生效、环境变量补全、
+  摘要列/系综、§3.5 来源标注。
+
+---
+
+## 2026-09-22
+
+### `example/fit.py`
+
+#### 优化器
+
+- 2026-09-22（PR #1 `b7865bc`）新增 `reparam` 有界优化器并设为默认：S1 幅度软墙
+  `amp=amp_max·sigmoid(u)`、S2 幅度罚项 `λ·Σ|A|²`、S4 polish 加固（步长夹/硬帽/噪声底停机）。
+- 2026-09-22（并入上游 `4e5e5e5`，含上游 `a3946d5`）上游采纳我方 reparam；并入 projected
+  闭式 two-loop + `FIT_OPT_PROF` 诊断、`--config` 修复、`reparam-tol-stop` 更名 +
+  polish `cand_best is None` 保护。
+- 2026-09-22（PR #3 `4a29b3f`）恢复上游默认 `optimizer=projected`；`reparam` 改为可选/推荐；
+  `err_mode` 默认随优化器（reparam→auto，其它→strict）。
+
+#### 参数误差 / Hessian
+
+- 2026-09-22（PR #2 `41c2de0`）Hessian 非正定时的参数误差回退：
+  `--err-mode {auto,strict,pinv,psd}` + `--err-tau`（默认策略 C：显式 > `FIT_ERR_MODE` >
+  优化器相关）。
+- 2026-09-22（PR #2 `3ea973c`）`final_nll` 取**最终接受点**真实 NLL；`parameters.txt` 第 0 行
+  固定参考统一标 `(fixed)`；`getHessian` 耦合块顺序经有限差分确认为 **BLOCK**。
+
+### `example/plot.py`
+
+- 2026-09-22（PR #2 `af0e72b`）应用 ruff-format。
+
+### `example/README.md`
+
+- 2026-09-22（PR #1/#2/#3）随 reparam / err-mode / 默认优化器更新。
+
+### `example/.pre-commit-config.yaml`
+
+- 2026-09-22（PR #2 `fdbf26f`/`af0e72b`）新增：仅作用于 `example/`；含 ruff-format 等会改文件的
+  hook；`ruff` 仅 `--select E9,F63,F7,F82`。

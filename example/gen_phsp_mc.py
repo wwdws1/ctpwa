@@ -28,6 +28,11 @@
     python gen_phsp_mc.py --config config.yml -n 200000 --format npy -o phsp_flat
     python gen_phsp_mc.py --config config.yml -n 200000 --weighted --format root -o phsp_flat.root
 
+随机性
+------
+`--seed` 默认取**当前 Unix 时间戳**（与 `fit.py` 一致）→ **每次运行都不同**，避免"忘了改 seed"
+导致重复样本；要复现请把启动打印的 `[seed]`（或 `--stats-json` 里的 `seed`）用 `--seed N` 传回来。
+
 依赖：`numpy` + `ctpwa`（≥0.3.15 提供 `PhaseSpaceGenerator`）。**不需要 GPU，也不读数据文件**
 （只解析 config 的 `Particles` / `Data.order` / `DecayChains`）。
 
@@ -149,10 +154,20 @@ def physics_check(events, masses, mother_mass, n_check=2000, atol=1e-6):
 # ============================================================================
 
 
+class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
+    """与默认一致，但 `--seed` 不追加 "(default: None)"——它的真实默认是当前时间戳，
+    已写在 help 文本里（和 fit.py 的写法一致）。"""
+
+    def _get_help_string(self, action):
+        if action.dest == "seed":
+            return action.help
+        return super()._get_help_string(action)
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         description="DIYMC P1：由 config 生成平坦 n 体相空间 MC（无需 GPU）",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=_HelpFormatter,
         epilog=(
             "⚠ 产出的是平坦相空间，不等于生产 phsp_truth（见脚本头部说明）；"
             "用于 closure 时样本量需能分辨最窄共振（建议百万级）。"
@@ -163,7 +178,13 @@ def build_parser():
     p.add_argument(
         "-o", "--output", required=True, help="输出文件（dat/root 带扩展名；npy 可省）"
     )
-    p.add_argument("--seed", type=int, default=0, help="随机种子（同 seed 可复现）")
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="随机种子；默认取当前 Unix 时间戳（每次运行不同，避免重复）"
+        "——要复现请把启动打印的 [seed] 传回来",
+    )
     p.add_argument(
         "--format",
         choices=("dat", "root", "npy"),
@@ -199,6 +220,17 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+
+    # 默认 seed = 当前 Unix 时间戳（与 fit.py 一致）：每次运行不同，避免重复样本；
+    # 要复现就把这里打印的 seed 用 --seed 传回来。
+    if args.seed is None:
+        args.seed = int(time.time())
+        print(
+            f"[gen_phsp_mc] [seed] 未指定 --seed → 用当前时间戳 seed={args.seed}；"
+            f"复现本作业请加 --seed {args.seed}（分块时第 k 块用 seed+k）"
+        )
+    else:
+        print(f"[gen_phsp_mc] [seed] seed={args.seed}（--seed 指定）")
 
     if not os.path.isfile(args.config):
         sys.exit(f"[gen_phsp_mc] config 不存在: {args.config}")

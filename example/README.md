@@ -1,11 +1,50 @@
-# `fit.py` 使用说明
+# `example` 使用说明（`fit.py` 为主）
 
 `example/fit.py` 是 ctpwa 的拟合驱动脚本：读取 `config.yml` → 构建振幅 → 多次优化 →
 Hessian / 参数误差 → 保存结果与摘要。
 
-本文主要说明**可选参数**和**三种优化器的区别**；画图脚本 `plot.py` 见 §8，
-参数削减/误差截断/边界诊断/`--fit-mode` 见 §9，MC 生成见 §11。
+本文以 **`fit.py` 为主**：§1–§7 讲运行、参数、输出，§8 讲参数削减/误差截断/边界诊断/
+`--fit-mode`，§9 讲后端选择。**不属于 `fit.py` 用法的脚本**——画图 `plot.py` 与两个
+MC 生成脚本（`gen_phsp_mc.py` / `gen_toy_mc.py`）——统一放在最后一章 **§10「其它脚本」**。
 各文件的变更历史见 [`CHANGELOG.md`](CHANGELOG.md)。
+
+---
+
+## 目录
+
+- [0. TL;DR](#0-tldr)
+- [1. 运行前提](#1-运行前提)
+- [2. 快速开始](#2-快速开始)
+- [3. 优化器区别（重点）](#3-优化器区别重点)
+  - [3.1 `reparam`（默认，推荐）](#31-reparam默认推荐)
+  - [3.2 `projected`](#32-projected)
+  - [3.3 `lbfgs`（legacy，仅 A/B 对照）](#33-lbfgslegacy仅-ab-对照)
+  - [3.4 对比（示例数据，`--runs`/`--niter` 见备注）](#34-对比示例数据--runs--niter-见备注)
+  - [3.5 推荐工作流（随机多起点 → 取最优 → polish）](#35-推荐工作流随机多起点--取最优--polish)
+- [4. 参数总表](#4-参数总表)
+  - [配置 / 日志](#配置--日志)
+  - [核心运行参数](#核心运行参数)
+  - [约束 / 数值稳定](#约束--数值稳定)
+  - [误差估计（Hessian 非正定回退）](#误差估计hessian-非正定回退)
+  - [Warm start](#warm-start)
+  - [Polish（二阶抛光）](#polish二阶抛光)
+  - [权重文件](#权重文件)
+  - [Checkpoint / Resume](#checkpoint--resume)
+  - [输出](#输出)
+  - [参数化 / 参数削减 / 边界诊断（见 §8）](#参数化--参数削减--边界诊断见-8)
+- [5. 环境变量](#5-环境变量)
+- [6. 输出文件](#6-输出文件)
+- [7. 已知问题与备注](#7-已知问题与备注)
+- [8. 参数化 / 参数削减 / 误差截断 / 边界诊断（上游 `bc70a79` 并入）](#8-参数化--参数削减--误差截断--边界诊断上游-bc70a79-并入)
+  - [8.1 `--fit-mode {0,1}`：参数化](#81---fit-mode-01参数化)
+  - [8.2 `--reduce-params`：有效秩降维 + 降维重拟合](#82---reduce-params有效秩降维--降维重拟合)
+  - [8.3 `--no-errors-truncate`：非正定误差口径](#83---no-errors-truncate非正定误差口径)
+  - [8.4 `--bound-margin`：贴边参数诊断](#84---bound-margin贴边参数诊断)
+- [9. 后端选择（CPU / GPU）与 `CTPWA_DEVICE`（ctpwa ≥ 0.3.15）](#9-后端选择cpu--gpu与-ctpwa_devicectpwa--0315)
+- [10. 其它脚本（不属于 `fit.py` 用法）](#10-其它脚本不属于-fitpy-用法)
+  - [10.1 `plot.py` 使用说明](#101-plotpy-使用说明)
+  - [10.2 `gen_phsp_mc.py`：平坦相空间（P1，**不需要 GPU**）](#102-gen_phsp_mcpy平坦相空间p1不需要-gpu)
+  - [10.3 `gen_toy_mc.py`：振幅加权 toy → pseudo-data（P2/P3，**需要 backend**）](#103-gen_toy_mcpy振幅加权-toy--pseudo-datap2p3需要-backend)
 
 ---
 
@@ -25,12 +64,12 @@ python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-4  # 显式�
 - 需要 **ctpwa 包**与 **NVIDIA GPU**。本版本要求的 ctpwa 最低版本：
   - `≥ 0.3.10`：`ctpwa.analysis(config, fit_mode)`（`--fit-mode`）；
   - `≥ 0.3.15`：新门面 `import ctpwa`（单 wheel 双后端）+ `build_info()`/`backend()`；
-  - `≥ 0.3.17`：`ctpwa.diagnostics`（可行子空间 PD 判据，见 §7/§9）。
+  - `≥ 0.3.17`：`ctpwa.diagnostics`（可行子空间 PD 判据，见 §7/§8）。
   本机当前：**0.3.18**。
 - **后端自动选择**（ctpwa ≥ 0.3.15）：`import ctpwa` 时会真跑一次 kernel 探测，
   GPU 可用则用 `_cuda`，否则**回退 CPU**（慢 20–60 倍，会打印警告）。
   用 `CTPWA_DEVICE=auto|cuda|cpu` 控制：**显式 `cuda` 时探测失败直接报错**（推荐在
-  slurm 作业里设，避免静默退 CPU）。详见 §10。当前后端在启动 dump 里打印
+  slurm 作业里设，避免静默退 CPU）。详见 §9。当前后端在启动 dump 里打印
   （`backend=… build_info=…`）。
 - **配置由 `--config` 指定**（默认 `./config.yml`）。`fit.py` 在 **import 时**用
   `_config_path_from_argv()` 从 `sys.argv` 取出 `--config`（转绝对路径），**并在构造
@@ -187,7 +226,7 @@ python fit.py --optimizer projected --runs 5
 2. **不要把 reparam 的最优解再交给 projected 精修**：实测无效（`no-descent`，0 改进）
    或更差（中段交接在 3/3 起点上差 12~373 NLL）——两者停在不同局部极小。
    polish 本来就是两条路共用的同一个 `polish_damped_newton`。
-3. **`--amp-max`（默认 1000）**要确认大于该分析的最大 `\|A\|`，否则会撞软墙；
+3. **`--amp-max`（默认 1000）**要确认大于该分析的最大 `|A|`，否则会撞软墙；
    `--amp-lambda`（默认 1e-4）是只进优化目标的幅度罚项，报告 NLL 仍为真实值，
    设 0 可关闭。
 
@@ -273,7 +312,7 @@ python fit.py --optimizer projected --runs 5
 |---|---|---|---|
 | `--output-dir` | 结果输出目录 | `results` | — |
 
-### 参数化 / 参数削减 / 边界诊断（见 §9）
+### 参数化 / 参数削减 / 边界诊断（见 §8）
 | 参数 | 说明 | 默认 | 环境变量 |
 |---|---|---|---|
 | `--fit-mode` | `0`=FREEPARAMS chain×step；`1`=VSPACE 逐振幅（Hessian 二阶项恒为 0 → 精确）。**只能在构造期决定**，故由 import 期读取 | 0 | `FIT_MODE` |
@@ -297,7 +336,7 @@ FIT_ERR_MODE  FIT_ERR_TAU  FIT_POLISH  FIT_WARM  FIT_WAVES  FIT_EVENT_DATA
 FIT_CHECKPOINT_INTERVAL  FIT_SEED
 FIT_MODE  FIT_REDUCE_PARAMS  FIT_RANK_TAU  FIT_RANK_ITERS  FIT_RANK_FIXED_POINT
 FIT_RANK_SCALE  FIT_ERRORS_TRUNCATE  FIT_BOUND_MARGIN
-# 注意：CTPWA_DEVICE / CTPWA_QUIET 属于 ctpwa 包（不是 fit.py 的参数），见 §10：
+# 注意：CTPWA_DEVICE / CTPWA_QUIET 属于 ctpwa 包（不是 fit.py 的参数），见 §9：
 CTPWA_DEVICE=auto|cuda|cpu   CTPWA_QUIET=1
 # 诊断 / 复现实验 / projected A/B 开关（默认=当前行为，一般不用设）：
 FIT_OPT_PROF  FIT_DETERMINISTIC  FIT_OPT_M  FIT_OPT_TWOLOOP  FIT_OPT_HONEST
@@ -338,7 +377,7 @@ FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
 > 走有效秩截断（`--no-errors-truncate` 则退回伪逆），这是**秩亏下的可行估计、非严格统计误差**
 > （CSV 头部亦有注明）。
 
-> `plot.py` 另外生成 `results_plot.pdf` 等图形，不属于 `fit.py`。
+> `plot.py` 另外生成 `results_plot.pdf` 等图形，不属于 `fit.py`（见 §10.1）。
 
 > 多起点（`--runs N`）结束时终端会打印一行 `[ensemble]`：`n / best / median / IQR / std /
 > worst`。前向 NLL 有数值混沌，**比较不同优化器/配置时请看中位数/IQR 而非单次 NLL**
@@ -387,49 +426,11 @@ FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
 
 ---
 
-## 8. `plot.py` 使用说明
-
-从 `<output-dir>/weight_best.root`（或指定 run 的参数）读取直方图并生成 PDF 图集。
-
-### 运行
-
-```bash
-python plot.py                # 读 results/weight_best.root → results/results_plot.pdf
-python plot.py --params 3     # 用 parameters.txt 第 3 个 run 参数经 GPU 重新生成权重 → results/results_plot_run_3.pdf
-python plot.py --nll 3        # 画第 3 个 run 的 NLL 历史
-```
-
-### 输入直方图（由 fit.py / C++ 写入 `weight_best.root`）
-
-| 对象 | 含义 |
-|---|---|
-| `hdata` | 原始数据计数 |
-| `hfit` | 信号模型（振幅²×phsp）× `normFactor`（即信号产额） |
-| `hbkg` | 预期本底计数（本底事件 × `bkg_weights`，不 Scale） |
-| `h_<分波名>` | 各分波形状（`|A_i|²` 加权） |
-| `interference` | 干涉矩阵（`TMatrixD`，完整对称矩阵） |
-| `legends` | 分波图例 |
-
-### 输出内容
-- **1D 页**：每个观测（质量 / cosβ / obs-1d）一组合图——上方：数据点 + 各分波形状 +
-  **Fit+Bkg** + 本底填充；下方：**pull** `(data-(hfit+hbkg))/√(hfit+hbkg)`，并标注 `χ²/ndf`。
-- **2D Dalitz 页**：每个 2D 观测（dalitz / obs-2d）三列 **Data / Fit+Bkg / Pull**，
-  pull 口径同上（含本底）。
-
-> 口径说明：`data ≈ hfit+hbkg`（`hfit` 已按“数据−本底”归一，`hbkg` 为预期本底）。
-> 因此 Fit 面板与 Pull 都必须用 `hfit+hbkg`；无 `hbkg` 时退化为只看 `hfit`。
-
-### 依赖
-- `uproot` 读取 ROOT 文件；`--params` 需要 GPU + `ctpwa`。
-- 复数 dtype 按 `ctpwa` `.so` 编译精度自动选择（`complex128`/`complex64`）。
-
----
-
-## 9. 参数化 / 参数削减 / 误差截断 / 边界诊断（上游 `bc70a79` 并入）
+## 8. 参数化 / 参数削减 / 误差截断 / 边界诊断（上游 `bc70a79` 并入）
 
 四组开关，**默认都保持既有行为**，按需开启。
 
-### 9.1 `--fit-mode {0,1}`：参数化
+### 8.1 `--fit-mode {0,1}`：参数化
 
 | 值 | 含义 |
 |---|---|
@@ -444,7 +445,7 @@ python -u fit.py --fit-mode 1 --runs 5 --niter 500
 `fit.py` 因此在 **import 期**用 `_fit_mode_from_argv()` 从 argv / `FIT_MODE` 取出该值与
 `--config` 一起传给 `ctpwa.analysis()`；需要 `ctpwa ≥ 0.3.10`。
 
-### 9.2 `--reduce-params`：有效秩降维 + 降维重拟合
+### 8.2 `--reduce-params`：有效秩降维 + 降维重拟合
 
 动机：乘积参数化下数据往往只约束住 Hessian 的一部分方向，其余方向近平坦甚至微负 →
 直接求逆给出天文数字误差。把弱方向**冻结**、只保留 stiff 子空间：
@@ -466,14 +467,14 @@ python -u fit.py --reduce-params --rank-scale median   # 谱病态/跑飞解
 
 > 生产作业默认**不开**（会改变最终解与 `best_params.pt`）；用于诊断“误差给不出来”的原因。
 
-### 9.3 `--no-errors-truncate`：非正定误差口径
+### 8.3 `--no-errors-truncate`：非正定误差口径
 
 `--err-mode auto`（`reparam` 默认）下 Hessian 不定时，默认改为**有效秩截断**：
 只保留 `λ_i > τ·λmax` 的方向做误差传播 `σ²_m = Σ_{i∈keep} E[m,i]²/λ_i` →
 **每个参数仍有有限误差**，被冻结的只是那些线性组合。加 `--no-errors-truncate` 退回旧的
 伪逆口径（未测定方向 σ=0）。`--err-mode strict/pinv/psd` 显式指定时不受影响。
 
-### 9.4 `--bound-margin`：贴边参数诊断
+### 8.4 `--bound-margin`：贴边参数诊断
 
 ```bash
 python -u fit.py --bound-margin 0.02 --runs 1 --niter 200
@@ -487,7 +488,7 @@ python -u fit.py --bound-margin 0.02 --runs 1 --niter 200
 
 ---
 
-## 10. 后端选择（CPU / GPU）与 `CTPWA_DEVICE`（ctpwa ≥ 0.3.15）
+## 9. 后端选择（CPU / GPU）与 `CTPWA_DEVICE`（ctpwa ≥ 0.3.15）
 
 `ctpwa ≥ 0.3.15` 起是**单 wheel 双后端**：wheel 里同时带 `_cuda` 与 `_cpu` 两个扩展，
 `import ctpwa` 时先探测、再加载**一个**（两个后端互斥加载）。
@@ -526,16 +527,66 @@ python -u fit.py --config config.yml --runs 10
 
 ---
 
-## 11. MC 生成：`gen_phsp_mc.py` / `gen_toy_mc.py`（DIYMC）
+## 10. 其它脚本（不属于 `fit.py` 用法）
 
-两个**自包含**脚本（不 import 本仓库其它文件，可单独拷到任何目录运行），基于上游 DIYMC
-（`ctpwa ≥ 0.3.15`）的 `PhaseSpaceGenerator` / `generateMC` / `getIntensity` / `writeMC`。
-
-产物与 `fit.py` 的读取约定一致：`.dat` **每事件 n_final 行**、每行 `E px py pz`
+本章三个脚本都**自包含**（不 import 本仓库其它文件，可单独拷到任何目录运行）。后两个 MC 生成
+脚本基于上游 DIYMC（`ctpwa ≥ 0.3.15`）的 `PhaseSpaceGenerator` / `generateMC` / `getIntensity` /
+`writeMC`，产物与 `fit.py` 的读取约定一致：`.dat` **每事件 n_final 行**、每行 `E px py pz`
 （12 位小数、空格分隔），末态顺序 = config 的 `Data.order`；也支持 `.root`
 （`TTree "mc"`，TLorentzVector 分支）与 `.npy`（`(n, n_final, 4)`）。
 
-### 11.1 `gen_phsp_mc.py`：平坦相空间（P1，**不需要 GPU**）
+> ⚠ **`.dat` 每行固定 4 个数，没有权重列**（C++ 读取端按「每事件 4×n_final 个数」解析，多一列会错位）。
+> 要带权重：写 `root`（权重分支）/`npy`（另存 `<path>.weights.npy`），或按 config 的
+> `data_weights` / `bkg_weights` / `phsp_weights` 约定**另存一个每事件 1 行的独立权重文件**。
+
+> ⚠ **`--seed` 默认取当前 Unix 时间戳**（与 `fit.py` 一致）→ **每次运行都不同**，避免"忘了改
+> seed"导致重复样本；要复现就把启动打印的 `[seed]`（或 `--stats-json` 里的 `seed`）用
+> `--seed N` 传回来。
+
+### 10.1 `plot.py` 使用说明
+
+从 `<output-dir>/weight_best.root`（或指定 run 的参数）读取直方图并生成 PDF 图集。
+
+#### 运行
+
+```bash
+python plot.py                # 读 results/weight_best.root → results/results_plot.pdf
+python plot.py --params 3     # 用 parameters.txt 第 3 个 run 参数经 GPU 重新生成权重 → results/results_plot_run_3.pdf
+python plot.py --nll 3        # 画第 3 个 run 的 NLL 历史
+```
+
+#### 参数
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `--params N` | 用 `parameters.txt` 第 N 个 run 的参数经 GPU 重新生成权重再画图（需 `ctpwa`） | 无（直接读 `weight_best.root`） |
+| `--nll N` | 画 `nll_history.txt` 第 N 个 run 的 NLL 历史 | 无 |
+
+#### 输入直方图（由 fit.py / C++ 写入 `weight_best.root`）
+
+| 对象 | 含义 |
+|---|---|
+| `hdata` | 原始数据计数 |
+| `hfit` | 信号模型（振幅²×phsp）× `normFactor`（即信号产额） |
+| `hbkg` | 预期本底计数（本底事件 × `bkg_weights`，不 Scale） |
+| `h_<分波名>` | 各分波形状（`\|A_i\|²` 加权） |
+| `interference` | 干涉矩阵（`TMatrixD`，完整对称矩阵） |
+| `legends` | 分波图例 |
+
+#### 输出内容
+- **1D 页**：每个观测（质量 / cosβ / obs-1d）一组合图——上方：数据点 + 各分波形状 +
+  **Fit+Bkg** + 本底填充；下方：**pull** `(data-(hfit+hbkg))/√(hfit+hbkg)`，并标注 `χ²/ndf`。
+- **2D Dalitz 页**：每个 2D 观测（dalitz / obs-2d）三列 **Data / Fit+Bkg / Pull**，
+  pull 口径同上（含本底）。
+
+> 口径说明：`data ≈ hfit+hbkg`（`hfit` 已按“数据−本底”归一，`hbkg` 为预期本底）。
+> 因此 Fit 面板与 Pull 都必须用 `hfit+hbkg`；无 `hbkg` 时退化为只看 `hfit`。
+
+#### 依赖
+- `uproot` 读取 ROOT 文件；`--params` 需要 GPU + `ctpwa`。
+- 复数 dtype 按 `ctpwa` `.so` 编译精度自动选择（`complex128`/`complex64`）。
+
+### 10.2 `gen_phsp_mc.py`：平坦相空间（P1，**不需要 GPU**）
 
 ```bash
 python gen_phsp_mc.py --config config.yml -n 100000 --seed 42 -o phsp_flat.dat
@@ -544,10 +595,27 @@ python gen_phsp_mc.py --config config.yml -n 200000 --format npy -o phsp_flat   
 python gen_phsp_mc.py --config config.yml -n 200000 --format root -o phsp_flat.root
 ```
 
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `--config` | `config.yml` 路径 | `config.yml` |
+| `-n`, `--nevents` | 目标事件数（**必填**） | — |
+| `-o`, `--output` | 输出文件（dat/root 带扩展名；npy 可省） | — |
+| `--seed` | 随机种子；**默认取当前 Unix 时间戳（每次运行不同）**。分块时第 k 块用 `seed+k`（块间不重复）；复现请传回启动打印的 seed | 当前时间 |
+| `--format {dat,root,npy}` | 输出格式；默认按 `-o` 的扩展名，无扩展名时用 `dat` | 按扩展名 |
+| `--mother` | 母粒子名 | 从 config 的 `DecayChains` 推 |
+| `--mother-mass` | 覆盖母粒子质量 (GeV) | config 值 |
+| `--weighted` | 导出 GENBOD 权重；`.dat` 每行固定 4 个数、无权重列，故仅 `root`/`npy` 有意义（见章首 ⚠） | False |
+| `--chunk` | 分块生成的事件数（>0 逐块生成并追加写；仅 dat/npy，用于千万级样本） | `0`（不分块） |
+| `--force` | 末态顺序与 `Data.order` 不一致时仍继续 | False |
+| `--no-check` | 跳过我方物理自检（守恒/质量壳） | False |
+| `--check-events` | 物理自检抽样事件数 | `2000` |
+
+要点：
+
 - 只解析 config 的 `Particles` / `Data.order` / `DecayChains`，**不读数据文件、不需 GPU**；
 - 内置自检并打印：母粒子与质量、末态顺序 vs `Data.order`、`weightMax`、四动量守恒、
   各末态质量壳、`dat` 行数 = `n × n_final`；不一致时**退出**（`--force` 可放行）。
-- `--weighted`（导出 GENBOD 权重）只对 `root`/`npy` 有意义（`dat` 没有权重列）。
+- `--weighted`（GENBOD 权重）只写 `root`/`npy`；`--weighted` + `--format dat` **直接报错退出**。
 
 > ⚠ 两个语义提醒：
 > 1. **它不等于生产 `phsp_truth`**：后者是同一批探测器 MC 的 truth 级版本，可能带 truth 级
@@ -557,7 +625,7 @@ python gen_phsp_mc.py --config config.yml -n 200000 --format root -o phsp_flat.r
 >    phsp 时，toy 真值不是 NLL 极小（拟合把宽度顶到边界），加到 200k 才恢复。本仓库共振宽度
 >    是 MeV 级 → 建议**百万级**。
 
-### 11.2 `gen_toy_mc.py`：振幅加权 toy → pseudo-data（P2/P3，**需要 backend**）
+### 10.3 `gen_toy_mc.py`：振幅加权 toy → pseudo-data（P2/P3，**需要 backend**）
 
 ```bash
 # 5 万信号 toy + Poisson + 真本底 → pseudo-data（并派生 config、写 stats）
@@ -575,22 +643,58 @@ python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
     -n 50000 --check-distribution -o toy.dat
 ```
 
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `--config` | `config.yml` 路径 | `config.yml` |
+| `--params-from` | 拟合参数 `best_params.pt`（`[Re.., Im.., θ]` float64；长度按 config 校验；**会自动搬到当前后端设备**——CUDA 后端要求 CUDA 张量，而 `best_params.pt` 是 CPU 张量） | `results/best_params.pt` |
+| `-n`, `--nevents` | 目标事例数（`unweighted` 时为输出事件数；`--poisson` 且未给 `-n` 时默认 = `nobs`） | None |
+| `-o`, `--output` | 输出文件（dat/root/npy） | — |
+| `--seed` | 随机种子；**默认取当前 Unix 时间戳（每次运行不同）**。同时喂给 `generateMC`（平坦相空间 + 舍选）和本地 RNG（Poisson 抽样 / 重抽样 / 本底 / 打乱，内部用 `seed+20260101`）；`--check-distribution` 的参照样本用 `seed+9999`；复现请传回启动打印的 seed | 当前时间 |
+| `--mode {unweighted,weighted}` | `unweighted`=平坦相空间 + `\|M\|²` **舍选（AR）** → **等权**；`weighted`=**全收** + 每事件权重 `I` → **快**（详见下方要点） | `unweighted` |
+| `--batch` | 每批平坦事例数（传给 `generateMC`） | `100000` |
+| `--max-trials` | 平坦事例数上限（安全检查） | None（不限） |
+| `--format {dat,root,npy}` | 输出格式；默认按 `-o` 的扩展名 | 按扩展名 |
+| `--poisson` | 抽成等权 pseudo-data：`nobs ~ Poisson(目标事件数)`（等权无放回 / 带权按 w 有放回） | False |
+| `--nobs N` | `--poisson` 的目标事件数（信号部分） | None |
+| `--nobs-from-data` | `--poisson` 的目标事件数取 config 的 `data` 文件事件数 | 该行为默认 |
+| `--allow-short` | 可用信号 < nobs 时取 min 并警告（默认报错） | False |
+| `--bkg` / `--no-bkg` | 叠加 config 的 `bkg`（按 `bkg_weights` 加权抽样）；默认“有 bkg 就叠” | 有则叠 |
+| `--bkg-scale` | 本底产额缩放：`Poisson(scale·Σw)` | `1.0` |
+| `--no-shuffle` | 信号与本底拼接后不打乱（默认打乱） | False |
+| `--write-config` | 派生 config（把 `data` 指向 toy），可直接 `fit.py --config config_toy.yml` | None |
+| `--stats-json` | seed / 参数 md5 / 事件数 / bkg 产额 / `generateMC` 的 `stats` | None |
+| `--check-distribution` | 自洽性检查：把**生成样本**与「`\|M\|²` 加权平坦样本」投影到 `m²(i,j)` 分布比对（详见下方要点） | False |
+| `--check-events` | 自洽性检查用的事件数 | `20000` |
+| `--check-pair` | 自洽性检查投影的两个末态下标 | `0,1` |
+| `--check-bins` | 自洽性检查直方图 bin 数 | `25` |
+
 要点：
 
-| 参数 | 说明 |
-|---|---|
-| `--params-from` | 拟合参数 `best_params.pt`（`[Re.., Im.., θ]` float64；长度按 config 校验；**会自动搬到当前后端设备**——CUDA 后端要求 CUDA 张量，而 `best_params.pt` 是 CPU 张量） |
-| `--mode unweighted`（默认） | AR 舍选等权样本（`stats.acceptance`/`max_weight` 会打印） |
-| `--mode weighted` | 全部平坦事例 + 权重（快）；未加 `--poisson` 时**不能写 dat**（无权重列） |
-| `--poisson` | 抽成等权 pseudo-data：`nobs ~ Poisson(目标事件数)`（等权无放回 / 带权按 w 有放回） |
-| `--nobs N` / `--nobs-from-data` | 目标事件数；后者取 config 的 `data` 文件事件数（默认） |
-| `--allow-short` | 可用信号 < nobs 时取 min 并警告（默认报错） |
-| `--bkg` / `--no-bkg` | 叠加 config 的 `bkg`（按 `bkg_weights` 加权抽样）；默认"有 bkg 就叠" |
-| `--bkg-scale` | 本底产额缩放：`Poisson(scale·Σw)` |
-| `--write-config` | 派生 config（把 `data` 指向 toy），可直接 `fit.py --config config_toy.yml` |
-| `--stats-json` | seed / 参数 md5 / 事件数 / bkg 产额 / `generateMC` 的 `stats` |
-| `--check-distribution` | 自洽性：`m²(i,j)` 分布 AR vs `|M|²` 加权（`max|Δ|`，经验阈值 0.05） |
+- **`--mode unweighted`（默认）**：平坦相空间 → 按 `|M|²` **舍选（AR）** 得**等权**样本，可直接写
+  `dat`。日志 `stats` 里的 `acceptance` = **接受率**（接受数 / 平坦事例数）、`max_weight` = 舍选上界
+  `Imax`（判据 `u·Imax < I`；未给 `--max-weight` 时用首批 pilot 自适应）——**接受率越低越费时**
+  （本模型实测 ≈2%）。同批还会打印 `flat_acceptance`（平坦 / GENBOD 试探比）、`n_genbod_trials`、
+  `truncated` 等。
+- **`--mode weighted`**：平坦事例**全收** + 每事件权重 `I`（不做舍选）→ **快**（≈`1/acceptance` 倍）；
+  但 `.dat` 每行固定 4 个数、无权重列，故**只能写 `root`/`npy`**。要拿到等权的 `dat`，配 `--poisson`
+  （按权重 `p=w/Σw` 有放回抽成等权 pseudo-data）。
+- **`--check-distribution` 在做什么（自洽性检查）**：它额外生成一份**独立**的参照样本——
+  **加权平坦样本**（`mode=weighted`、`--check-events` 个事件、seed = `seed+9999`），后者天然
+  ∝ `|M|²`（平坦相空间 × 权重 `I`）。然后把**本次生成的信号样本**和这份参照样本都投影到末态对
+  `--check-pair`（默认 `0,1`）的**不变质量平方** `m²(i,j)` 上，用同一组 `--check-bins`（默认 25）
+  直方图分别归一化到 Σ=1，取**逐 bin 最大绝对差** `max|Δ|`：
+  - 判据：`max|Δ| < 0.05` → 打印 `OK`，否则 `偏大，检查样本量/参数`。含义是「**两条独立路径
+    （舍选 vs 加权）给出的 `|M|²` 形状一致**」，用来抓生成实现里的错（判据写反、权重/顺序错…）。
+  - 它是**统计**比较：有限样本有涨落，bin 越多、样本越小越容易超阈值 → 报大时先加大
+    `--check-events`（或减小 `--check-bins`）再判断，**不是**"代码一定错了"的结论。
+  - 前提：被检查的信号样本本身要是**等权、∝`|M|²`**。即用 `--mode unweighted`（默认，示例用法）
+    或 `--mode weighted --poisson`（重抽样后已变等权）。若用 `--mode weighted` 又**不加** `--poisson`，
+    生成的样本是"平坦 + 权重"，其**未加权**直方图不是 `|M|²` → 该检查会（正确地）报偏大，但那属于
+    **用法问题**。对比只用**纯信号**（叠加 `--bkg` 之前），本底不参与。
+  - 它**只**验证"生成分布 = `|M|²`"这条自洽性，**不**验证"toy 真值是否 NLL 极小"（闭包）——
+    后者要用 `--write-config` 派生 config 去跑 `fit.py`。
 
+> ⚠ 所有便宜的错误路径（参数文件/长度、`weighted`+`dat` 组合）都在构造 `analysis` **之前**报错。
 > ⚠ 本脚本**不做拟合**。想验证"toy 真值是否 NLL 极小"（闭包），用 `--write-config` 派生 config
 > 后跑 `fit.py`。样本量要求同上（MeV 级宽度 → 百万级）。
 > ⚠ `fit.py` 目前仍**硬要求 CUDA**（`torch.cuda.is_available()`）；ctpwa 的 CPU 后端只用于

@@ -48,6 +48,11 @@ CPU 后端也能跑但慢 20–60×）。config 的 `data`/`phsp`/`bkg` 文件�
     python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
         -n 50000 --check-distribution -o toy.dat
 
+随机性
+------
+`--seed` 默认取**当前 Unix 时间戳**（与 `fit.py` 一致）→ **每次运行都不同**，避免"忘了改 seed"
+导致重复 toy；要复现请把启动打印的 `[seed]`（或 `--stats-json` 里的 `seed`）用 `--seed N` 传回来。
+
 注意：不要在仓库根目录运行（本仓库自带的 `ctpwa/` 门面包会遮蔽已安装的 wheel）。
 """
 
@@ -258,10 +263,20 @@ def as_torch(x):
 # ============================================================================
 
 
+class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
+    """与默认一致，但 `--seed` 不追加 "(default: None)"——它的真实默认是当前时间戳，
+    已写在 help 文本里（和 fit.py 的写法一致）。"""
+
+    def _get_help_string(self, action):
+        if action.dest == "seed":
+            return action.help
+        return super()._get_help_string(action)
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         description="DIYMC P2/P3：用拟合后的振幅产生 toy MC / pseudo-data",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=_HelpFormatter,
         epilog=(
             "⚠ 样本量要能分辨最窄共振（建议百万级），否则 toy 真值不是 NLL 极小；"
             "本脚本不做拟合。"
@@ -282,7 +297,13 @@ def build_parser():
         "--poisson 且未给 -n 时默认 = nobs）",
     )
     p.add_argument("-o", "--output", required=True, help="输出文件（dat/root/npy）")
-    p.add_argument("--seed", type=int, default=0, help="随机种子（同 seed 可复现）")
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="随机种子；默认取当前 Unix 时间戳（每次运行不同，避免重复）"
+        "——要复现请把启动打印的 [seed] 传回来",
+    )
     p.add_argument(
         "--mode",
         choices=("unweighted", "weighted"),
@@ -362,6 +383,17 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
     t_start = time.time()
+
+    # 默认 seed = 当前 Unix 时间戳（与 fit.py 一致）：每次运行不同，避免"忘了改 seed"导致重复
+    # toy；要复现就把这里打印的 seed 用 --seed 传回来（--stats-json 也会记录）。
+    if args.seed is None:
+        args.seed = int(time.time())
+        print(
+            f"[gen_toy_mc] [seed] 未指定 --seed → 用当前时间戳 seed={args.seed}；"
+            f"复现本作业请加 --seed {args.seed}"
+        )
+    else:
+        print(f"[gen_toy_mc] [seed] seed={args.seed}（--seed 指定）")
 
     if not os.path.isfile(args.config):
         sys.exit(f"[gen_toy_mc] config 不存在: {args.config}")
