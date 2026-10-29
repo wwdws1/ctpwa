@@ -1,7 +1,7 @@
 # CHANGELOG（`example/`）
 
 本文件记录对上游 `BHXiang/ctpwa` 的改动中、**`example/` 目录内**各文件的内容变化
-（PR #1–#19）。其它目录随上游维护，不在本表；上游同步见文末。
+（PR #1–#20）。其它目录随上游维护，不在本表；上游同步见文末。
 日期 = 合并进 `main` 的日期；“PR #n”指 `wwdws1/ctpwa` 的合并请求。
 
 > 只列**行为/接口/文档**变化；纯格式（ruff-format/空白）只在首次记录。
@@ -137,6 +137,42 @@
 - 2026-10-29（PR #19）新增 **§10 后端选择（CPU/GPU）与 `CTPWA_DEVICE`**；§1/§5 补 ctpwa
   版本要求与新门面环境变量；§7 备注补“正定判据变为可行子空间(KKT)”与“仓库根 `ctpwa/`
   会遮蔽已装 wheel”两条坑；§9 说明误差口径已改为可行子空间。
+- 2026-10-29（PR #20）新增 **§11 MC 生成（`gen_phsp_mc.py` / `gen_toy_mc.py`）**。
+
+---
+
+## `example/gen_phsp_mc.py`（新增，PR #20）
+
+- 2026-10-29（PR #20）**DIYMC P1 平坦相空间生成**（自包含单文件，不 import 本仓库其它文件）：
+  `--config -n -o [--seed --format dat|root|npy --mother --mother-mass --weighted --chunk
+  --force --no-check --check-events]`；`dat` 输出 = 每事件 n_final 行 `E px py pz`（12 位小数），
+  末态顺序 = `Data.order`；内置自检（末态顺序 vs `Data.order`、守恒、质量壳、行数 = n×n_final、
+  `weightMax`）；`--chunk` 分块追加写以支持千万级样本。**不需要 GPU，也不读数据文件**。
+  文档里写清两条语义：平坦 PS ≠ 生产 `phsp_truth`；closure 用途需百万级样本（窄共振）。
+
+---
+
+## `example/gen_toy_mc.py`（新增，PR #20）
+
+- 2026-10-29（PR #20）**DIYMC P2/P3 振幅加权 toy → pseudo-data**（自包含单文件）：
+  `--config --params-from(best_params.pt) -n -o [--seed --mode unweighted|weighted --batch
+  --max-trials --format --poisson --nobs|--nobs-from-data --allow-short --bkg/--no-bkg
+  --bkg-scale --no-shuffle --write-config --stats-json --check-distribution --check-events
+  --check-pair --check-bins]`；`--poisson` 抽成等权 pseudo-data（等权无放回 / 带权按 w 有放回）；
+  `--bkg` 按 `bkg_weights` 加权抽样叠加真本底；`--write-config` 派生 config（把 `data` 指向 toy）；
+  `--check-distribution` 用 `m²(i,j)` 分布对照 `|M|²` 加权样本做自洽性检查。所有便宜的错误路径
+  （参数文件/长度、weighted+dat 组合）都在构造 `analysis` **之前**报错。
+  参数按当前后端自动搬到设备：**CUDA 后端要求 `params` 是 CUDA 张量**，而 `best_params.pt`
+  是 fit.py `.cpu()` 存的（首轮 GPU 冒烟就是踩了这个 `TORCH_CHECK(ctpwa_is_cuda_like(params))`）。
+- 2026-10-29（PR #20）`--format root` 写盘前把事件/权重转成 `torch.Tensor`（新工具
+  `as_torch()`）：`analysis.writeMC()` 的第一个形参是 `torch::Tensor`，pybind11 **不做**
+  numpy→torch 自动转换，脚本内部又是 numpy 数组 → 第四轮 GPU 冒烟抛
+  `TypeError: writeMC(): incompatible function arguments`（`gen_phsp_mc.py` 走
+  `gen.write(ev, …)`，`ev` 本来就是 torch 张量，故未踩到）。
+
+---
+
+## `example/README.md`（续）
 
 ---
 
