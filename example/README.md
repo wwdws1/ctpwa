@@ -539,6 +539,10 @@ python -u fit.py --config config.yml --runs 10
 > 要带权重：写 `root`（权重分支）/`npy`（另存 `<path>.weights.npy`），或按 config 的
 > `data_weights` / `bkg_weights` / `phsp_weights` 约定**另存一个每事件 1 行的独立权重文件**。
 
+> ⚠ **`--seed` 默认 `0`、固定**：两个生成脚本同参数、同命令**默认可复现**。这点与 `fit.py`
+> **不同**——`fit.py` 的 `--seed` 默认取**当前 Unix 时间戳**（每次作业都不同，要复现得把日志里
+> `[seed] base seed=…` 的值传回来）。
+
 ### 10.1 `plot.py` 使用说明
 
 从 `<output-dir>/weight_best.root`（或指定 run 的参数）读取直方图并生成 PDF 图集。
@@ -596,7 +600,7 @@ python gen_phsp_mc.py --config config.yml -n 200000 --format root -o phsp_flat.r
 | `--config` | `config.yml` 路径 | `config.yml` |
 | `-n`, `--nevents` | 目标事件数（**必填**） | — |
 | `-o`, `--output` | 输出文件（dat/root 带扩展名；npy 可省） | — |
-| `--seed` | 随机种子 | `0` |
+| `--seed` | 随机种子；**默认 `0`（固定 → 默认可复现）**。分块时第 k 块用 `seed+k`（块间不重复） | `0` |
 | `--format {dat,root,npy}` | 输出格式；默认按 `-o` 的扩展名，无扩展名时用 `dat` | 按扩展名 |
 | `--mother` | 母粒子名 | 从 config 的 `DecayChains` 推 |
 | `--mother-mass` | 覆盖母粒子质量 (GeV) | config 值 |
@@ -645,7 +649,7 @@ python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
 | `--params-from` | 拟合参数 `best_params.pt`（`[Re.., Im.., θ]` float64；长度按 config 校验；**会自动搬到当前后端设备**——CUDA 后端要求 CUDA 张量，而 `best_params.pt` 是 CPU 张量） | `results/best_params.pt` |
 | `-n`, `--nevents` | 目标事例数（`unweighted` 时为输出事件数；`--poisson` 且未给 `-n` 时默认 = `nobs`） | None |
 | `-o`, `--output` | 输出文件（dat/root/npy） | — |
-| `--seed` | 随机种子 | `0` |
+| `--seed` | 随机种子；**默认 `0`（固定 → 默认可复现）**。同时喂给 `generateMC`（平坦相空间 + 舍选）和本地 RNG（Poisson 抽样 / 重抽样 / 本底 / 打乱，内部用 `seed+20260101`）；`--check-distribution` 的参照样本用 `seed+9999` | `0` |
 | `--mode {unweighted,weighted}` | `unweighted`=平坦相空间 + `\|M\|²` **舍选（AR）** → **等权**；`weighted`=**全收** + 每事件权重 `I` → **快**（详见下方要点） | `unweighted` |
 | `--batch` | 每批平坦事例数（传给 `generateMC`） | `100000` |
 | `--max-trials` | 平坦事例数上限（安全检查） | None（不限） |
@@ -659,7 +663,7 @@ python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
 | `--no-shuffle` | 信号与本底拼接后不打乱（默认打乱） | False |
 | `--write-config` | 派生 config（把 `data` 指向 toy），可直接 `fit.py --config config_toy.yml` | None |
 | `--stats-json` | seed / 参数 md5 / 事件数 / bkg 产额 / `generateMC` 的 `stats` | None |
-| `--check-distribution` | 自洽性：`m²(i,j)` 分布 AR vs `\|M\|²` 加权（`max\|Δ\|`，经验阈值 0.05） | False |
+| `--check-distribution` | 自洽性检查：把**生成样本**与「`\|M\|²` 加权平坦样本」投影到 `m²(i,j)` 分布比对（详见下方要点） | False |
 | `--check-events` | 自洽性检查用的事件数 | `20000` |
 | `--check-pair` | 自洽性检查投影的两个末态下标 | `0,1` |
 | `--check-bins` | 自洽性检查直方图 bin 数 | `25` |
@@ -674,6 +678,21 @@ python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
 - **`--mode weighted`**：平坦事例**全收** + 每事件权重 `I`（不做舍选）→ **快**（≈`1/acceptance` 倍）；
   但 `.dat` 每行固定 4 个数、无权重列，故**只能写 `root`/`npy`**。要拿到等权的 `dat`，配 `--poisson`
   （按权重 `p=w/Σw` 有放回抽成等权 pseudo-data）。
+- **`--check-distribution` 在做什么（自洽性检查）**：它额外生成一份**独立**的参照样本——
+  **加权平坦样本**（`mode=weighted`、`--check-events` 个事件、seed = `seed+9999`），后者天然
+  ∝ `\|M\|²`（平坦相空间 × 权重 `I`）。然后把**本次生成的信号样本**和这份参照样本都投影到末态对
+  `--check-pair`（默认 `0,1`）的**不变质量平方** `m²(i,j)` 上，用同一组 `--check-bins`（默认 25）
+  直方图分别归一化到 Σ=1，取**逐 bin 最大绝对差** `max\|Δ\|`：
+  - 判据：`max\|Δ\| < 0.05` → 打印 `OK`，否则 `偏大，检查样本量/参数`。含义是「**两条独立路径
+    （舍选 vs 加权）给出的 `\|M\|²` 形状一致**」，用来抓生成实现里的错（判据写反、权重/顺序错…）。
+  - 它是**统计**比较：有限样本有涨落，bin 越多、样本越小越容易超阈值 → 报大时先加大
+    `--check-events`（或减小 `--check-bins`）再判断，**不是**"代码一定错了"的结论。
+  - 前提：被检查的信号样本本身要是**等权、∝`\|M\|²`**。即用 `--mode unweighted`（默认，示例用法）
+    或 `--mode weighted --poisson`（重抽样后已变等权）。若用 `--mode weighted` 又**不加** `--poisson`，
+    生成的样本是"平坦 + 权重"，其**未加权**直方图不是 `\|M\|²` → 该检查会（正确地）报偏大，但那属于
+    **用法问题**。对比只用**纯信号**（叠加 `--bkg` 之前），本底不参与。
+  - 它**只**验证"生成分布 = `\|M\|²`"这条自洽性，**不**验证"toy 真值是否 NLL 极小"（闭包）——
+    后者要用 `--write-config` 派生 config 去跑 `fit.py`。
 
 > ⚠ 所有便宜的错误路径（参数文件/长度、`weighted`+`dat` 组合）都在构造 `analysis` **之前**报错。
 > ⚠ 本脚本**不做拟合**。想验证"toy 真值是否 NLL 极小"（闭包），用 `--write-config` 派生 config

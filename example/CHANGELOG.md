@@ -78,7 +78,10 @@
   （参数/说明/默认），并补充：`.dat` 每行固定 4 个数、**无权重列**（权重走 `root`/`npy` 或
   config 的 `data_weights`/`bkg_weights`/`phsp_weights` 独立权重文件），以及
   `--mode unweighted`（平坦 + `\|M\|²` 舍选 AR → 等权，`stats.acceptance`/`max_weight`）与
-  `weighted`（全收 + 权重 → 快，需配 `--poisson` 才得到等权 `dat`）的语义。
+  `weighted`（全收 + 权重 → 快，需配 `--poisson` 才得到等权 `dat`）的语义；另补
+  **`--seed` 默认 `0`（固定、默认可复现；与 `fit.py` 默认当前时间戳不同）** 和
+  **`--check-distribution` 自洽性检查的详解**（独立加权平坦参照样本 → `m²(i,j)` 归一化直方图
+  `max\|Δ\|<0.05`、统计涨落、等权前提、与闭包的区别）。
 
 ### `example/gen_phsp_mc.py`
 
