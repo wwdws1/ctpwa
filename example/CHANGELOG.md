@@ -1,7 +1,7 @@
 # CHANGELOG（`example/`）
 
 本文件记录对上游 `BHXiang/ctpwa` 的改动中、**`example/` 目录内**各文件的内容变化
-（PR #1–#18）。其它目录随上游维护，不在本表；上游同步见文末。
+（PR #1–#19）。其它目录随上游维护，不在本表；上游同步见文末。
 日期 = 合并进 `main` 的日期；“PR #n”指 `wwdws1/ctpwa` 的合并请求。
 
 > 只列**行为/接口/文档**变化；纯格式（ruff-format/空白）只在首次记录。
@@ -30,6 +30,20 @@
   `λ_i > τ·λmax` 的方向做误差传播 `σ²_m = Σ_{i∈keep} E[m,i]²/λ_i`，**每个参数仍有有限误差**，
   被冻结的线性组合（未测定方向）单独列出并记录在 `_last_error_truncation`；
   `strict/pinv/psd` 显式指定时语义不变。非正定警告措辞同步更新。
+- 2026-10-29（PR #19，并入上游 `fa40d41`）**正定性改为“可行子空间”判据（KKT 二阶条件）**：
+  `_errors_from_hessian` 内部改用 `ctpwa.diagnostics.analyze_hessian`——
+  剔固定参考（Re_0/Im_0）→ 剔**活跃**参数（贴边且梯度朝外、不计入判别且误差标 NaN）→
+  在剩余**可行子空间**上判正定/求误差。`is_positive_definite` = `reduced_pd`，
+  新增 `is_positive_definite_full`（旧口径全自由块）、`n_active`/`active_params`/
+  `full_min_eigenvalue`/`kkt_grad_max`/`kkt_ok`/`n_negative_*` 字段；
+  误差按 grouped `[Re.., Im.., θ..]` 用 `map_errors_to_params` 映射（不再交错取 `sd[2i]`）。
+  保留原有 `auto/strict/pinv/psd` + 有效秩截断 + 协方差 CSV 语义不变。
+- 2026-10-29（PR #19）终态 `final_nll` 与**梯度**同在 `final_params` 上求（梯度供活跃集判别）；
+  polish 采纳规则放宽为 `nll2 ≤ old+1e-6 或 (pd2 and not old_pd)`，采纳/未采纳都在**最终点**
+  重算误差并把子空间字段同步回 `best_res`（摘要/CSV 与最终参数始终一致）。
+- 2026-10-29（PR #19）`extract_coupling_complex` dtype 判定改为
+  `build_info()['complex_bytes']` 优先、`DeviceManager().compiledPrecision()` 探针兜底、
+  再按 params 精度兜底；并删掉一处重复定义的旧 `extract_coupling_complex`（PR #18 合并残留死代码）。
 
 ### 参数削减 / 边界诊断（并入上游 `bc70a79`）
 - 2026-10-22（PR #18）新增 `--fit-mode {0,1}`：`0`=FREEPARAMS chain×step（默认）、
@@ -44,6 +58,13 @@
 - 2026-10-22（PR #18）新增 `--bound-margin`（默认 0.02）：列出贴住 `free_range` 的 θ
   （边距 + `|∂NLL/∂θ|`），标注“边界/非驻点评估 → 假非正定”。
 - 摘要 `optimization_summary.txt` 增 `fit_mode` / `err_mode`+截断 / 参数削减 `k` 三行。
+- 2026-10-29（PR #19）新增**后端自检**：header 打印
+  `backend=… precision=… complex_bytes=… has_cuda=…`（`ctpwa.build_info()`），
+  非 `cuda` 时 `log.warning`（新门面 0.3.15+ 会在 GPU 不可用时**静默退 CPU**）。
+  摘要增 `正定判据=可行子空间(KKT)`，run 表列由 `正定` 改为 `正定(可行)` + 新增 `贴边` 列；
+  单 run 与总表打印改 `正定(active) = … [full=…]`。`_hessian_fields` 合并进
+  `_err_fields`（err dict → 字段的唯一出口）；`compute_reduction` 的活跃集改用
+  `_hessian_diagnosis`（与误差/抛光同一条可行子空间规则）。
 
 ### 可观测性 / 方法学
 - 2026-09-23（PR #4）去掉静默降级（polish/FF/保存失败改 `log.exception` + `polish_status`）；
@@ -113,6 +134,9 @@
 - 2026-09-29（PR #17）开头注明 `plot.py` 见 §8、变更历史见 `CHANGELOG.md`。
 - 2026-10-22（PR #18）新增 **§9 参数削减 / 误差截断 / 边界诊断 / `--fit-mode`** 参数表与
   使用建议（含 `--reduce-params` 会替换最终解、生产默认不开的说明）。
+- 2026-10-29（PR #19）新增 **§10 后端选择（CPU/GPU）与 `CTPWA_DEVICE`**；§1/§5 补 ctpwa
+  版本要求与新门面环境变量；§7 备注补“正定判据变为可行子空间(KKT)”与“仓库根 `ctpwa/`
+  会遮蔽已装 wheel”两条坑；§9 说明误差口径已改为可行子空间。
 
 ---
 
@@ -144,3 +168,25 @@
   - 环境：`ctpwa` pip 包需 ≥ 0.3.10（`analysis(config, fit_mode)`）；本机 0.3.13
     （含全部 v0.3.13 C++）。`50259f2` 只在生产配置存在“重复 `[J,P]` 块”时才影响结果，
     经查 `jlsp/pwa/all/single` 无此结构 → 现有结果不受影响。
+- 2026-10-29（PR #19）并入上游 `BHXiang/ctpwa`（`0e452a1` → `1fda180`，12 个提交，
+  tag v0.3.15–v0.3.18）：
+  - `039d7df`/`c06b4fc` DIYMC 相空间产生器（native GENBOD + 振幅加权；新增
+    `analysis.getIntensity/generateMC/writeMC`、`PhaseSpaceGenerator`）——**不影响拟合流程**；
+  - `ce9d993`/`f202167`（v0.3.15，breaking）**单 wheel 双后端**：新增 `ctpwa/` 门面包
+    （`__init__.py`：import 时探测后端、GPU 优先；`CTPWA_DEVICE=auto|cuda|cpu`；`build_info()`/
+    `backend()`/`BACKEND`/`FALLBACK_REASON`）、`include/Backend.h`、`CudaCompat.h`、
+    `include/cpu_shims/*`、`src/Backend.cpp`、`src/JitStubs_cpu.cpp`、`scripts/port_cuda_to_cpu.py`、
+    `setup.py` 重写（含 CPU 构建路径）；
+  - `fdd328c`（v0.3.16）恢复被门面裁掉的公开 API；
+  - `f82315a` `phsp_weights` 进入 NLL 归一化/梯度/Hessian（我们的生产 config 未用
+    `phsp_weights` → 现有结果不受影响）；
+  - `ecaa513` 修 bkg `g_v` 在耦合变换二阶项中的符号（**会改变带本底拟合的 Hessian/误差**，
+    中心值不变）；
+  - `fa40d41`（v0.3.17）新增 `ctpwa/diagnostics.py`（`analyze_hessian` 可行子空间判据 +
+    `map_errors_to_params` grouped 映射）并改写 `example/fit.py` 的正定/误差路径；
+  - `1fda180` `example/fit.py` 耦合 dtype 用 `build_info()`、秩门槛打印带尺度；
+  - `1fa9f23` 仓库与 sdist 不再发布 `doc/`（我们本来没有）；
+  - 涉及文件：`ctpwa/*`、`include/*`、`src/*`、`setup.py`、`tests/*`（新增 `test_cpu_*`、
+    `test_mc*`、`test_hessian_diagnostics.py`）、`example/fit.py`（唯一冲突文件，7 处）。
+  - 环境：`ctpwa` pip 需 ≥ 0.3.17（`ctpwa.diagnostics`）；本机 0.3.18。`CTPWA_DEVICE=cuda`
+    已在 `test14/sub.gpu` 与生产 `sub.gpu` 中显式设置（避免静默退 CPU）。

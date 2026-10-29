@@ -22,12 +22,24 @@ python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-4  # 显式�
 
 ## 1. 运行前提
 
-- 需要 **ctpwa 包**（含 CUDA 扩展）与 **NVIDIA GPU**；`torch.cuda.is_available()` 必须为 True。
+- 需要 **ctpwa 包**与 **NVIDIA GPU**。本版本要求的 ctpwa 最低版本：
+  - `≥ 0.3.10`：`ctpwa.analysis(config, fit_mode)`（`--fit-mode`）；
+  - `≥ 0.3.15`：新门面 `import ctpwa`（单 wheel 双后端）+ `build_info()`/`backend()`；
+  - `≥ 0.3.17`：`ctpwa.diagnostics`（可行子空间 PD 判据，见 §7/§9）。
+  本机当前：**0.3.18**。
+- **后端自动选择**（ctpwa ≥ 0.3.15）：`import ctpwa` 时会真跑一次 kernel 探测，
+  GPU 可用则用 `_cuda`，否则**回退 CPU**（慢 20–60 倍，会打印警告）。
+  用 `CTPWA_DEVICE=auto|cuda|cpu` 控制：**显式 `cuda` 时探测失败直接报错**（推荐在
+  slurm 作业里设，避免静默退 CPU）。详见 §10。当前后端在启动 dump 里打印
+  （`backend=… build_info=…`）。
 - **配置由 `--config` 指定**（默认 `./config.yml`）。`fit.py` 在 **import 时**用
   `_config_path_from_argv()` 从 `sys.argv` 取出 `--config`，再传给 `ctpwa.analysis()`，
   因此 `--config /path/to/other.yml` **真正生效**（无需 cd 到配置目录）。
   注意：`config.yml` 内的相对路径按**该 config 文件所在目录**解析。
 - 建议用 `python -u`（无缓冲）以便实时看日志。
+- ⚠ **不要在仓库根目录 `import ctpwa`**：仓库根自带上游的 `ctpwa/` 门面包（源码目录，
+  没有 `_cuda.so`/`_cpu.so`），在 `python -m pytest`/`python -c`（cwd 进 `sys.path`）时会
+  **遮蔽**已安装的 wheel → 报“没有可用的 ctpwa 后端”。生产目录/`test14` 不受影响。
 
 ---
 
@@ -276,6 +288,8 @@ FIT_ERR_MODE  FIT_ERR_TAU  FIT_POLISH  FIT_WARM  FIT_WAVES  FIT_EVENT_DATA
 FIT_CHECKPOINT_INTERVAL  FIT_SEED
 FIT_MODE  FIT_REDUCE_PARAMS  FIT_RANK_TAU  FIT_RANK_ITERS  FIT_RANK_FIXED_POINT
 FIT_RANK_SCALE  FIT_ERRORS_TRUNCATE  FIT_BOUND_MARGIN
+# 注意：CTPWA_DEVICE / CTPWA_QUIET 属于 ctpwa 包（不是 fit.py 的参数），见 §10：
+CTPWA_DEVICE=auto|cuda|cpu   CTPWA_QUIET=1
 # 诊断 / 复现实验 / projected A/B 开关（默认=当前行为，一般不用设）：
 FIT_OPT_PROF  FIT_DETERMINISTIC  FIT_OPT_M  FIT_OPT_TWOLOOP  FIT_OPT_HONEST
 FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
@@ -335,12 +349,16 @@ FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
 2. `reparam` 的 `--amp-lambda` 是作用在**优化 loss** 上的弱先验；报告/保存的 NLL、
    Hessian、误差全部基于**真实 NLL**，不受罚项影响。
 3. 结果普遍 `正定性=False`：精确 Hessian 存在 ~20–30 维近平坦/简并子空间（诊断显示
-   沿负特征值方向 NLL 两侧都不下降，说明是数值/秩亏而非真鞍点）。**用 `reparam` 时**
-   参数误差默认由 `--err-mode auto` **按有效秩截断传播**（保留 `λ>τλmax` 方向，
-   `σ²_m=Σ E[m,i]²/λ_i`，被冻结组合单独列出），并标注为“可行估计、非严格统计误差”；
-   `--no-errors-truncate` 退回旧的伪逆口径；`projected`/`lbfgs` 默认 `strict`（非正定不给
-   误差）。`--bound-margin` 可列出贴边 θ（常见的“假非正定”来源）。**拟合分数/效率不再以真 PD
-   为门控**：非正定时用与 `--err-mode` 一致的回退曲率传播误差（中心值恒输出）。
+   沿负特征值方向 NLL 两侧都不下降，说明是数值/秩亏而非真鞍点）。
+   **2026-10-29 起（PR #19）正定判据改为“可行子空间”（KKT 二阶条件）**：先剔固定参考
+   （Re_0/Im_0）、再剔**活跃**参数（贴边且梯度朝外——该方向根本不可行），才判正定；
+   `is_positive_definite` = `reduced_pd`，旧口径放在 `is_positive_definite_full`。
+   因此贴边参数的“朝外负曲率”不再假报警，`--bound-margin` 可列出贴边 θ 作为对照。
+   **用 `reparam` 时**参数误差默认由 `--err-mode auto` **按有效秩截断传播**
+   （保留 `λ>τλmax` 方向，`σ²_m=Σ E[m,i]²/λ_i`，被冻结组合单独列出）；`--no-errors-truncate`
+   退回旧的伪逆口径；`projected`/`lbfgs` 默认 `strict`（非正定不给误差）。
+   **拟合分数/效率不再以真 PD 为门控**：非正定时用与 `--err-mode` 一致的回退曲率传播误差
+   （中心值恒输出）。
 4. `--lr` 只对 `reparam`/`lbfgs` 有意义；`projected` 不用 `lr`，其停机由
    `--tol-grad`（gtol）控制。
 5. 若在集群提交作业，注意 `fit.py` 会读 cwd 的 `config.yml` 并需要 GPU；建议
@@ -456,3 +474,42 @@ python -u fit.py --bound-margin 0.02 --runs 1 --niter 200
 θ 顶到 `free_range` 边界后 reparam 的 sigmoid 梯度→0、优化器按容差停机，但物理空间梯度
 很大 → Hessian 是在**边界/非驻点**上评估的，容易得到“假非正定”。该诊断会算出
 `|∂NLL/∂θ|` 提示应放宽范围或加先验。
+
+---
+
+## 10. 后端选择（CPU / GPU）与 `CTPWA_DEVICE`（ctpwa ≥ 0.3.15）
+
+`ctpwa ≥ 0.3.15` 起是**单 wheel 双后端**：wheel 里同时带 `_cuda` 与 `_cpu` 两个扩展，
+`import ctpwa` 时先探测、再加载**一个**（两个后端互斥加载）。
+
+探测不是只看 `torch.cuda.is_available()`（那只回答“驱动看得见卡吗”），而是**真跑一个
+torch kernel** —— 编译架构与卡不匹配 / 卡被 MIG 切分或占满时，前者为 True 但 kernel
+起不来。探测失败会**吵着回退 CPU**（慢 20–60 倍）。
+
+| `CTPWA_DEVICE` | 行为 |
+|---|---|
+| `auto`（默认） | GPU 可用则用 CUDA，否则回退 CPU（打印警告） |
+| `cuda` | GPU 不可用（或已 dlopen `_cuda` 后自检失败）**直接报错**，绝不偷偷降级 |
+| `cpu` | 强制 CPU 后端（调试/无卡机器；大统计量不可用） |
+
+```bash
+export CTPWA_DEVICE=cuda        # slurm 作业推荐：GPU 拿不到就失败，别静默跑 CPU
+python -u fit.py --config config.yml --runs 10
+```
+
+其它相关接口/环境变量：
+
+- `ctpwa.backend()` → `'cuda'` / `'cpu'`；`ctpwa.build_info()` →
+  `{'backend','precision','complex_bytes','has_cuda'}`；`ctpwa.BACKEND`、
+  `ctpwa.FALLBACK_REASON`（auto 模式下的回退原因）。
+- `CTPWA_QUIET=1` 抑制导入期的提示（不影响 `ctpwa.backend()` 的返回值）。
+- `fit.py` 启动 dump 会打印 `backend=… precision=… complex_bytes=… has_cuda=…`；
+  非 `cuda` 时额外 `log.warning`，方便在 `.log` 里一眼看出是否跑错后端。
+- **dtype**：`getFitFractions`/`getEfficiency` 的 C++ 入口要求 vector 的复数 dtype 与
+  `.so` 编译精度一致，`fit.py` 按 `build_info()['complex_bytes']`（16→complex128 /
+  8→complex64）选，探测不到再用 `DeviceManager().compiledPrecision()` / params 精度兜底。
+- ⚠ 仓库根有上游自带的 `ctpwa/` 门面**源码**目录（没有 `.so`），在 `python -m pytest` /
+  `python -c`（cwd 进 `sys.path`）时会**遮蔽**已安装的 wheel → 报“没有可用的 ctpwa 后端”。
+  跑在各自作业目录（生产目录、`test14/`）不受影响。
+- 本仓库本地单测 `example/tests` 自己往 `sys.modules` 放 stub，并按**文件路径**加载真实的
+  `ctpwa.diagnostics`（纯 torch，CPU 可跑），因此不受上面这条影响。
