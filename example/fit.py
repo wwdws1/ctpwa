@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Optional, TypedDict
 import ctpwa
+from ctpwa.diagnostics import analyze_hessian, map_errors_to_params
 
 log = logging.getLogger("pwa-fit")
 
@@ -18,7 +19,7 @@ log = logging.getLogger("pwa-fit")
 # 类型（仅静态提示，运行时仍是普通 dict）
 # ============================================================
 class ErrDict(TypedDict, total=False):
-    """`_errors_from_hessian` 的返回结构。"""
+    """`_errors_from_hessian` 的返回结构（可行子空间判据 + 非正定回退）。"""
 
     coupling_real_errors: Any
     coupling_imag_errors: Any
@@ -26,9 +27,19 @@ class ErrDict(TypedDict, total=False):
     mode_used: str
     n_flat: int
     is_pd: bool
+    is_pd_full: bool
     min_eig: float
     max_eig: float
     cond_num: float
+    full_min_eig: float
+    full_max_eig: float
+    n_negative_reduced: int
+    n_negative_full: int
+    n_active: int
+    active_params: list
+    kkt_grad_max: float
+    kkt_ok: bool
+    diag_note: str
     cov: Any
     cov_labels: Any
     cov_mode: Any
@@ -1135,11 +1146,13 @@ class UnifiedPWAOptimizer:
 
         final_params = params.clone().detach()
 
-        # 报告 NLL 用**最终接受点**的真实值：
+        # ---- 终态 NLL/梯度：以 final_params 为准 ----
         # nll_history[-1] 可能是 strong-Wolfe 最后一次被拒绝的试探点（实测 niter=1
-        # 时会偏），所以这里在 clamp 后的 final_params 上重算一次（~0.3s/run）。
-        with torch.no_grad():
-            final_nll = float(self.analysis.getNLL(final_params).item())
+        # 时会偏）；梯度还用于判“贴边参数是否真被边界钉住”（活跃集）。
+        q_eval = final_params.clone().requires_grad_(True)
+        nll_final_t = self.analysis.getNLL(q_eval)
+        grad_final = torch.autograd.grad(nll_final_t, q_eval)[0].detach()
+        final_nll = float(nll_final_t.item())
 
         # Hessian
         hessian_start = time.time()
@@ -1149,18 +1162,19 @@ class UnifiedPWAOptimizer:
         # 播种缓存: 同一最佳点后续要 Hessian（正定性/误差/分支比）直接复用
         self._hess_cache = (final_params.clone(), hessian_full)
 
-        # 去除固定参数 (index 0 和 n_coupling_free)
+        # 去除固定参数 (index 0 和 n_coupling_free) —— 仅用于兼容旧字段
         fixed_mask = torch.ones(self.n_params, dtype=torch.bool, device=self.device)
         fixed_mask[0] = False
         fixed_mask[self.n_coupling_free] = False
         hessian = hessian_full[fixed_mask][:, fixed_mask]
 
-        # 正定性 + 参数误差（统一走 _errors_from_hessian，含非正定回退 auto/pinv/psd）
-        err = self._errors_from_hessian(hessian_full, final_params)
-        is_pos_def = bool(err["is_pd"])
-        min_eig = err["min_eig"]
-        max_eig = err["max_eig"]
-        cond_num = err["cond_num"]
+        # 正定性 + 参数误差（统一走 _errors_from_hessian：可行子空间(KKT)判据 +
+        # 非正定回退 auto/有效秩截断/pinv/psd）
+        err = self._errors_from_hessian(
+            hessian_full, final_params, grad=grad_final, nll=final_nll
+        )
+        fields = self._err_fields(err)
+        is_pos_def = bool(fields["is_positive_definite"])
         coupling_real_errors = err["coupling_real_errors"]
         coupling_imag_errors = err["coupling_imag_errors"]
         res_errors = err["res_errors"]
@@ -1180,15 +1194,10 @@ class UnifiedPWAOptimizer:
             "initial_params": initial_params.clone().detach(),
             "hessian_full": hessian_full,
             "hessian": hessian,
-            "is_positive_definite": is_pos_def,
-            "min_eigenvalue": min_eig,
-            "max_eigenvalue": max_eig,
-            "condition_number": cond_num,
+            **fields,
             "coupling_real_errors": coupling_real_errors,
             "coupling_imag_errors": coupling_imag_errors,
             "res_errors": res_errors,
-            "err_mode_used": err["mode_used"],
-            "n_flat_dirs": err["n_flat"],
             "_err_full": err,  # 完整 err（含 cov），供 best 点参数矩阵复用
         }
 
@@ -1505,29 +1514,103 @@ class UnifiedPWAOptimizer:
         return h
 
     # --------------------------------------------------------
+    def _hessian_diagnosis(
+        self,
+        params,
+        hessian_full=None,
+        grad=None,
+        nll=None,
+        tau=1e-8,
+        bound_margin=1e-8,
+        kkt_tol=1e-2,
+    ):
+        """在**有界拟合的正确子空间**上判 Hessian 正定。
+
+        旧实现直接对 ``hessian[fixed_mask]`` 取 ``eigvalsh`` 并判 ``all(>0)``：
+        * 固定参考耦合（Re_0/Im_0）的两行/列是恒零，必须去掉；
+        * 贴边且梯度朝外的参数（free_range 钉住）对应的"朝外方向"不可行，
+          它的负曲率是**边界效应**，不是拟合点不稳定。
+
+        这里复用 ``ctpwa.diagnostics.analyze_hessian``：返回的 ``reduced_pd``
+        才是 KKT 二阶条件；``free_pd`` 保留旧口径供对照。
+        """
+        if hessian_full is None:
+            hessian_full = self._get_hessian_cached(params)
+        if grad is None or nll is None:
+            q = params.detach().clone().requires_grad_(True)
+            nll_t = self.analysis.getNLL(q)
+            grad = torch.autograd.grad(nll_t, q)[0].detach()
+            nll = float(nll_t.item())
+        lo, hi = self.bounds(params)
+        fixed = torch.zeros(self.n_params, dtype=torch.bool, device=self.device)
+        fixed[0] = True
+        fixed[self.n_coupling_free] = True
+        report = analyze_hessian(
+            hessian_full,
+            params,
+            grad,
+            lo,
+            hi,
+            fixed_mask=fixed,
+            tau=tau,
+            bound_margin=bound_margin,
+            kkt_tol=kkt_tol,
+        )
+        return report, grad, nll
+
+    @staticmethod
+    def _err_fields(err: "ErrDict") -> dict:
+        """把 err dict 的可行子空间/误差字段摊平成 result 与摘要字段。"""
+        return {
+            "is_positive_definite": bool(err["is_pd"]),
+            "is_positive_definite_full": bool(err["is_pd_full"]),
+            "min_eigenvalue": err["min_eig"],
+            "max_eigenvalue": err["max_eig"],
+            "condition_number": err["cond_num"],
+            "full_min_eigenvalue": err["full_min_eig"],
+            "full_max_eigenvalue": err["full_max_eig"],
+            "n_negative_reduced": err["n_negative_reduced"],
+            "n_negative_full": err["n_negative_full"],
+            "n_active": err["n_active"],
+            "active_params": err["active_params"],
+            "kkt_grad_max": err["kkt_grad_max"],
+            "kkt_ok": err["kkt_ok"],
+            "err_mode_used": err["mode_used"],
+            "n_flat_dirs": err["n_flat"],
+        }
+
+    # --------------------------------------------------------
     def _errors_from_hessian(
         self,
         hessian_full: torch.Tensor,
         params_phys: torch.Tensor,
         mode: Optional[str] = None,
         tau: Optional[float] = None,
+        grad: Optional[torch.Tensor] = None,
+        nll: Optional[float] = None,
     ) -> "ErrDict":
-        """从统一 Hessian 求参数误差（含非正定回退 auto/pinv/psd）。
+        """从统一 Hessian 求参数误差（可行子空间判据 + 非正定回退）。
 
-        与 polish 共用「非活跃子空间」判据：去掉固定参考(0/nc) + 活跃集剔除，
-        对剩余子空间做对称特征分解，按 mode 构造协方差：
-          auto(默认): 真 PD → 直接求逆；否则 → 有效秩截断传播误差
+        使用 `ctpwa.diagnostics.analyze_hessian` 得到三个子空间：
+          * 固定参考 (Re_0/Im_0) → 剔除；
+          * **活跃**参数（贴边且梯度朝外）→ 不计入正定判别、误差标 NaN；
+          * **可行子空间** reduced_idx → 在这里判正定与求误差。
+        因此 is_pd = `reduced_pd`（KKT 二阶条件，贴边参数的"朝外负曲率"不再假报警），
+        is_pd_full = `free_pd`（旧口径，全自由块）供对照。
+        误差只在可行子空间求逆，再按 grouped 布局
+        `[Re_1..Re_{nc-1}, Im_1..Im_{nc-1}, θ_0..]` 映射
+        （`map_errors_to_params`，修复旧代码把 grouped 当交错的错位）。
+        按 mode 构造协方差：
+          auto(默认): reduced_pd → 直接求逆；否则 → 有效秩截断传播误差
                      （σ²_m = Σ_{i∈keep} E[m,i]²/λ_i；--no-errors-truncate 可退回 pinv）
-          strict    : 真 PD → 直接求逆；否则不给误差(None)
+          strict    : 只有 reduced_pd 才给；否则不给误差(None)
           pinv      : 强制伪逆（丢掉 λ<τλmax 的方向）
           psd       : 强制把 λ 截到 τλmax 后求逆（更保守）
-        被 free_range 钉住的参数返回 NaN。
-        非 PD 走截断时，被冻结的线性组合记录在 self._last_error_truncation
-        （供 --reduce-params 报告与摘要使用）。
+        被固定/活跃的参数返回 NaN。非 PD 走截断时，被冻结的线性组合记录在
+        self._last_error_truncation（供 --reduce-params 报告与摘要使用）。
 
-        索引映射按分块布局（与 params 一致）:
-          red = [Re_1..Re_{nc-1}, Im_1..Im_{nc-1}, θ_0..θ_{n_res-1}]
-        返回 dict（含 mode_used/n_flat/is_pd/min_eig/max_eig/cond_num）。
+        返回 dict（含 mode_used/n_flat/is_pd/is_pd_full/min_eig/max_eig/cond_num/
+        活跃列表与 KKT 诊断字段，以及 cov/cov_labels/cov_mode）。
 
         注：日志标签 `[param-err]` 中的 error 指**参数不确定度 (error bar)**，
         不是程序报错；它报告误差在哪个 mode / 多大简并子空间下算出。
@@ -1538,37 +1621,30 @@ class UnifiedPWAOptimizer:
             mode = self.err_mode
         if tau is None:
             tau = self.err_tau
-        out = {
+        out: ErrDict = {
             "coupling_real_errors": None,
             "coupling_imag_errors": None,
             "res_errors": None,
             "mode_used": mode,
             "n_flat": 0,
             "is_pd": False,
+            "is_pd_full": False,
             "min_eig": float("nan"),
             "max_eig": float("nan"),
             "cond_num": float("nan"),
+            "full_min_eig": float("nan"),
+            "full_max_eig": float("nan"),
+            "n_negative_reduced": 0,
+            "n_negative_full": 0,
+            "n_active": 0,
+            "active_params": [],
+            "kkt_grad_max": float("nan"),
+            "kkt_ok": False,
+            "diag_note": "",
             "cov": None,
             "cov_labels": None,
             "cov_mode": None,
         }
-
-        fixed_mask = torch.ones(self.n_params, dtype=torch.bool, device=self.device)
-        fixed_mask[0] = False
-        fixed_mask[nc] = False
-        red_idx = torch.nonzero(fixed_mask, as_tuple=False).flatten()
-        H_red = hessian_full[fixed_mask][:, fixed_mask].double()
-
-        # 活跃集: 贴边且下降方向朝外（与 polish / projected_lbfgs 同一条规则）
-        p = params_phys.detach()
-        q = p.clone().requires_grad_(True)
-        g = torch.autograd.grad(self.analysis.getNLL(q), q)[0].detach()
-        lo, hi = self.bounds(p)
-        w = (hi - lo).clamp(min=1e-30)
-        at_lo = (p - lo) <= 1e-8 * w
-        at_hi = (hi - p) <= 1e-8 * w
-        active_full = ((at_lo & (g > 0)) | (at_hi & (g < 0))) & fixed_mask
-        keep = ~active_full[red_idx]
 
         def _label(full_idx):
             if full_idx < nc:
@@ -1577,23 +1653,84 @@ class UnifiedPWAOptimizer:
                 return f"Im({self.params_names[full_idx - nc]})"
             return self.params_names[full_idx - nc]
 
-        if int(keep.sum().item()) == 0:
-            log.warning("所有自由方向都被边界钉住，无法给出参数误差")
+        # ---- 可行子空间诊断（固定参考 + 贴边活跃剔除；KKT 二阶条件）----
+        try:
+            report, _, _ = self._hessian_diagnosis(
+                params_phys, hessian_full, grad=grad, nll=nll
+            )
+        except Exception as e:
+            log.exception(f"Hessian 子空间诊断失败: {e}")
+            out["mode_used"] = "diag-fail"
             return out
 
-        H_k = H_red[keep][:, keep]
+        fixed_mask = report.fixed_mask
+        red_idx = report.reduced_idx  # 可行子空间（非固定 + 非活跃）
+        act_idx = report.active_idx
+        free_idx = torch.nonzero(~fixed_mask, as_tuple=False).flatten()
+        # 全部非固定参数块（协方差 CSV 口径：含贴边 active）
+        H_free = (
+            hessian_full[~fixed_mask][:, ~fixed_mask].double()
+            if int(free_idx.numel())
+            else torch.zeros((0, 0), dtype=torch.float64, device=self.device)
+        )
+        rm, rx = report.reduced_min_eigenvalue, report.reduced_max_eigenvalue
+        out.update(
+            {
+                "is_pd": bool(report.reduced_pd),
+                "is_pd_full": bool(report.free_pd),
+                "min_eig": rm,
+                "max_eig": rx,
+                "cond_num": (rx / rm) if (rm == rm and rm > 0) else float("inf"),
+                "full_min_eig": report.free_min_eigenvalue,
+                "full_max_eig": report.free_max_eigenvalue,
+                "n_negative_reduced": (
+                    int((report.ev_reduced < 0).sum().item())
+                    if report.ev_reduced.numel()
+                    else 0
+                ),
+                "n_negative_full": (
+                    int((report.ev_free < 0).sum().item())
+                    if report.ev_free.numel()
+                    else 0
+                ),
+                "n_active": int(report.n_active),
+                "active_params": [_label(int(i)) for i in act_idx.tolist()],
+                "kkt_grad_max": float(report.kkt_max),
+                "kkt_ok": bool(report.kkt_ok),
+                "diag_note": report.note,
+            }
+        )
+        is_pd = bool(report.reduced_pd)
+
+        if act_idx.numel():
+            _shown = ", ".join(out["active_params"][:8])
+            if report.n_active > 8:
+                _shown += f" …(+{report.n_active - 8})"
+            print(
+                f"[param-err] {report.n_active} 个参数贴边（活跃）：不计入正定判别、"
+                f"误差标 NaN: {_shown}"
+            )
+            print(
+                "[param-err]   这表示数据想把它们推到范围外 → 放宽该 free_range，"
+                "或按单侧限制报告（边距与 |∂NLL/∂θ| 见 --bound-margin）"
+            )
+
+        if int(red_idx.numel()) == 0:
+            log.warning(
+                "可行子空间为空（所有自由方向都被固定/边界钉住），无法给出参数误差"
+            )
+            out["mode_used"] = "no-free"
+            return out
+
+        H_k = hessian_full[red_idx][:, red_idx].double()
+        H_k = 0.5 * (H_k + H_k.t())
         try:
             eig, vec = torch.linalg.eigh(H_k)
         except Exception as e:
             log.exception(f"Hessian 特征分解失败: {e}")
             return out
         lmax = eig[-1].abs().clamp(min=1e-30)
-        lmin = eig[0].item()
-        out["min_eig"] = lmin
-        out["max_eig"] = eig[-1].item()
-        out["cond_num"] = (eig[-1].item() / lmin) if lmin > 0 else float("inf")
-        is_pd = bool(lmin > tau * lmax.item())
-        out["is_pd"] = is_pd
+        lmin = float(eig[0].item())
         n_flat = int((eig < tau * lmax).sum().item())
         out["n_flat"] = n_flat
         tail = f"λmin={lmin:.3e}, λmin/λmax={lmin / lmax.item():.2e}"
@@ -1604,16 +1741,13 @@ class UnifiedPWAOptimizer:
                 eff = "inv"
             elif self.errors_truncate:
                 # 不定 → 有效秩截断：只保留 λ_i > tau·λmax 的方向，再把误差传播到
-                # **所有**自由参数（被冻结的线性组合才是"未测定方向"）
+                # **所有**可行参数（被冻结的线性组合才是"未测定方向"）
                 eff = "trunc"
             else:
                 eff = "pinv"
         elif mode == "strict":
             if not is_pd:
-                log.warning(
-                    f"非活跃子空间 Hessian 仍不定: λmin={lmin:.3e}, "
-                    f"λmin/λmax={lmin / lmax.item():.2e} → strict: 不给误差"
-                )
+                log.warning(f"可行子空间 Hessian 仍不定: {tail} → strict: 不给误差")
                 out["mode_used"] = "strict(no-pd)"
                 return out
             eff = "inv"
@@ -1652,7 +1786,7 @@ class UnifiedPWAOptimizer:
                 "tau": float(tau),
             }
             print(
-                f"[param-err] ⚠ 非活跃子空间 Hessian 不定 ({tail}) "
+                f"[param-err] ⚠ 可行子空间 Hessian 不定 ({tail}) "
                 "→ 改用有效秩截断传播误差:"
             )
             print(
@@ -1667,74 +1801,44 @@ class UnifiedPWAOptimizer:
             print("[param-err]   想看冻结组合的物理内容: 加 --reduce-params")
 
         out["mode_used"] = eff
-        sd_red = torch.full(
-            (H_red.shape[0],), float("nan"), dtype=torch.float64, device=self.device
-        )
-        sd_red[keep] = sd_keep
-        pinned = [
-            _label(int(red_idx[i].item()))
-            for i in range(len(red_idx))
-            if not bool(keep[i])
-        ]
-        if pinned:
-            print(
-                f"[param-err] {len(pinned)} 个参数被 free_range 钉住，无统计误差(标 NaN): "
-                f"{', '.join(pinned)}"
-            )
-            print(
-                "[param-err]   这表示数据想把它们推到范围外 → 放宽该 free_range，"
-                "或按单侧限制报告"
-            )
         if self._last_error_truncation is None:
             print(
-                f"[param-err] mode={eff} (请求 {mode}), λmin={lmin:.3e} "
-                f"λmax={eig[-1].item():.3e} λmin/λmax={lmin / lmax.item():.2e}, "
+                f"[param-err] mode={eff} (请求 {mode}), {tail}, "
                 f"flat(λ<τ·λmax)={n_flat}/{len(eig)}, "
-                f"active={int(active_full.sum())}, keep={int(keep.sum())}"
+                f"active={report.n_active}, keep={int(red_idx.numel())}"
             )
 
-        # ---- 参数协方差矩阵（tf-pwa 口径）: 在**全部非固定参数** red 子空间上，
+        # ---- 参数协方差矩阵（tf-pwa 口径）: 在**全部非固定参数**块上，
         # 含贴边 active（不额外剔除），供 save_param_matrices 输出 CSV。
-        # 注意: 既有对角误差走 keep（剔除 active）；active=0 时两者一致。
-        try:
-            eig_r, vec_r = torch.linalg.eigh(H_red)
-            lmax_r = eig_r[-1].abs().clamp(min=1e-30)
-            if eff == "inv" and bool(eig_r[0] > tau * lmax_r):
-                cov_r = (vec_r * (1.0 / eig_r)) @ vec_r.t()
-                cov_mode = "inv"
-            elif eff == "psd":
-                _eig2 = torch.clamp(eig_r, min=tau * lmax_r)
-                cov_r = (vec_r * (1.0 / _eig2)) @ vec_r.t()
-                cov_mode = "psd"
-            else:  # pinv / trunc
-                _inv = torch.where(
-                    eig_r > tau * lmax_r, 1.0 / eig_r, torch.zeros_like(eig_r)
-                )
-                cov_r = (vec_r * _inv) @ vec_r.t()
-                cov_mode = "trunc" if eff == "trunc" else "pinv"
-            out["cov"] = cov_r
-            out["cov_labels"] = [_label(int(j)) for j in red_idx.tolist()]
-            out["cov_mode"] = cov_mode
-        except Exception as e:
-            log.exception(f"参数协方差矩阵构造失败: {e}")
+        # 注意: 既有对角误差走可行子空间；active=0 时两者一致。
+        if int(free_idx.numel()):
+            try:
+                eig_r, vec_r = torch.linalg.eigh(0.5 * (H_free + H_free.t()))
+                lmax_r = eig_r[-1].abs().clamp(min=1e-30)
+                if eff == "inv" and bool(eig_r[0] > tau * lmax_r):
+                    cov_r = (vec_r * (1.0 / eig_r)) @ vec_r.t()
+                    cov_mode = "inv"
+                elif eff == "psd":
+                    _eig2 = torch.clamp(eig_r, min=tau * lmax_r)
+                    cov_r = (vec_r * (1.0 / _eig2)) @ vec_r.t()
+                    cov_mode = "psd"
+                else:  # pinv / trunc
+                    _inv = torch.where(
+                        eig_r > tau * lmax_r, 1.0 / eig_r, torch.zeros_like(eig_r)
+                    )
+                    cov_r = (vec_r * _inv) @ vec_r.t()
+                    cov_mode = "trunc" if eff == "trunc" else "pinv"
+                out["cov"] = cov_r
+                out["cov_labels"] = [_label(int(j)) for j in free_idx.tolist()]
+                out["cov_mode"] = cov_mode
+            except Exception as e:
+                log.exception(f"参数协方差矩阵构造失败: {e}")
 
-        n_c_var = nc - 1
-        coupling_real_errors = torch.full(
-            (nc,), float("nan"), dtype=torch.float32, device=self.device
-        )
-        coupling_imag_errors = torch.full(
-            (nc,), float("nan"), dtype=torch.float32, device=self.device
-        )
-        # 分块布局: [Re_1..Re_{nc-1}, Im_1..Im_{nc-1}, θ...]
-        for i in range(n_c_var):
-            coupling_real_errors[i + 1] = sd_red[i].float()
-            coupling_imag_errors[i + 1] = sd_red[n_c_var + i].float()
-        res_errors = None
-        if self.has_free_res:
-            res_errors = sd_red[2 * n_c_var :].float()
-        out["coupling_real_errors"] = coupling_real_errors
-        out["coupling_imag_errors"] = coupling_imag_errors
-        out["res_errors"] = res_errors
+        # ---- 映射回 grouped [Re_1.., Im_1.., θ..]（固定/活跃 → NaN；Re_0/Im_0 = 0）----
+        cre, cim, res_e = map_errors_to_params(sd_keep, red_idx, nc, self.n_res_free)
+        out["coupling_real_errors"] = cre
+        out["coupling_imag_errors"] = cim
+        out["res_errors"] = res_e
         return out
 
     # --------------------------------------------------------
@@ -1770,21 +1874,16 @@ class UnifiedPWAOptimizer:
         tau = self.rank_tau if tau is None else float(tau)
         hessian_full = self._get_hessian_cached(params_phys)
         nc = self.n_coupling_free
-        fixed = torch.ones(self.n_params, dtype=torch.bool, device=self.device)
-        fixed[0] = False
-        if self.n_params > nc:
-            fixed[nc] = False
-        if exclude_active and self.has_free_res:
-            # 与 compute_param_errors 同一条活跃集规则: 贴边且梯度朝外的 θ 不算自由
-            p = params_phys.detach()
-            q = p.clone().requires_grad_(True)
-            g = torch.autograd.grad(self.analysis.getNLL(q), q)[0].detach()
-            lo, hi = self.bounds(p)
-            w = (hi - lo).clamp(min=1e-30)
-            at_lo = (p - lo) <= 1e-8 * w
-            at_hi = (hi - p) <= 1e-8 * w
-            active = ((at_lo & (g > 0)) | (at_hi & (g < 0))) & fixed
-            fixed = fixed & ~active
+        if exclude_active:
+            # 与 _errors_from_hessian / polish 同一条**可行子空间**规则
+            # （ctpwa.diagnostics：剔除固定参考与"贴边且梯度朝外"的活跃参数）
+            report, _, _ = self._hessian_diagnosis(params_phys, hessian_full)
+            fixed = report.reduced_mask.clone()
+        else:
+            fixed = torch.ones(self.n_params, dtype=torch.bool, device=self.device)
+            fixed[0] = False
+            if self.n_params > nc:
+                fixed[nc] = False
         idx = torch.nonzero(fixed, as_tuple=False).flatten()
         Hr = hessian_full[fixed][:, fixed].double()
         ev, evec = torch.linalg.eigh(Hr)  # 升序
@@ -1937,8 +2036,11 @@ class UnifiedPWAOptimizer:
         print("参数削减报告 (有效秩降维, --reduce-params)")
         print("=" * 78)
         print(f"  统一参数: {self.n_params} 实维 (复耦合 {nc} + θ {self.n_res_free})")
+        _thr = red["tau"] * red.get("scale", red["lam_max"])
         print(
-            f"  自由(非活跃)坐标: {red['n_free']} 实维; 有效秩门槛 tau={red['tau']:g}·λmax"
+            f"  自由(非活跃)坐标: {red['n_free']} 实维; "
+            f"有效秩门槛 tau={red['tau']:g}·{red.get('rank_scale', 'max')} "
+            f"(= {_thr:.4g})"
         )
         print(
             f"  => 保留 {red['k']} 实维 (≈{red['k'] / 2:.1f} 复参数, "
@@ -2050,13 +2152,6 @@ class UnifiedPWAOptimizer:
             "报告误差时应剔除/放宽范围, 或加高斯先验"
         )
         return flag
-
-    # --------------------------------------------------------
-    def extract_coupling_complex(self, params):
-        """从统一参数中提取复数耦合向量 (complex64, n_coupling_free)"""
-        real = params[: self.n_coupling_free].float()
-        imag = params[self.n_coupling_free : 2 * self.n_coupling_free].float()
-        return torch.complex(real, imag)
 
     # --------------------------------------------------------
     def _propagation_curvature(self, params, mode=None, tau=None):
@@ -2172,17 +2267,32 @@ class UnifiedPWAOptimizer:
 
     # --------------------------------------------------------
     def extract_coupling_complex(self, params: torch.Tensor) -> torch.Tensor:
-        """提取复数耦合向量，dtype 匹配 .so 精度。
+        """提取复数耦合向量，dtype 必须匹配 .so 编译精度。
 
-        优先用 `ctpwa.DeviceManager().compiledPrecision()`（double→complex128 /
-        float→complex64）；探测失败时按 params 实数精度兜底。旧版固定 complex64 会在
-        getFitFractions/getEfficiency 触发 "vector dtype must match .so complex precision"。
+        `getFitFractions` / `getEfficiency` 的 C++ 入口用
+        `TORCH_CHECK(vector.dtype() == TORCH_COMPLEX)`；double 编译的 .so（默认 wheel）
+        要求 complex128，旧代码固定 `.float()` 得到 complex64 → 即使 config 没有
+        phsp_truth 也会先在 dtype 检查处报 "vector dtype must match .so complex precision"。
+
+        判定顺序：`ctpwa.build_info()['complex_bytes']`（16→complex128 / 8→complex64）
+        → `DeviceManager().compiledPrecision()` 探针（CPU 后端/旧包无 build_info 时）
+        → 按 params 实数精度兜底。
         """
-        real = params[: self.n_coupling_free]
-        imag = params[self.n_coupling_free : 2 * self.n_coupling_free]
-        cdt = _so_complex_dtype()
+        cdt = None
+        try:
+            complex_bytes = int(ctpwa.build_info().get("complex_bytes", 0))
+            if complex_bytes == 16:
+                cdt = torch.complex128
+            elif complex_bytes == 8:
+                cdt = torch.complex64
+        except Exception:
+            cdt = None
+        if cdt is None:
+            cdt = _so_complex_dtype()
         if cdt is None:
             cdt = torch.complex128 if params.dtype == torch.float64 else torch.complex64
+        real = params[: self.n_coupling_free]
+        imag = params[self.n_coupling_free : 2 * self.n_coupling_free]
         if cdt == torch.complex128:
             return torch.complex(real.double(), imag.double())
         return torch.complex(real.float(), imag.float())
@@ -2547,7 +2657,13 @@ class UnifiedPWAOptimizer:
 
                 print(f"第 {i} 次优化完成!")
                 print(f"  NLL = {result['final_nll']:.6f}")
-                print(f"  正定性 = {result['is_positive_definite']}")
+                print(
+                    f"  正定(可行子空间) = {result['is_positive_definite']} "
+                    f"(全自由块={result['is_positive_definite_full']}, "
+                    f"active={result['n_active']}, "
+                    f"λmin_full={result['full_min_eigenvalue']:.2e}, "
+                    f"|pg|={result['kkt_grad_max']:.1e})"
+                )
                 print(f"  优化器状态 = {result.get('optimizer_status', '?')}")
                 if str(result.get("optimizer_status", "")).endswith(
                     "tol-stop"
@@ -2739,7 +2855,8 @@ class UnifiedPWAOptimizer:
             )
             f.write(
                 f"误差: err_mode={self.err_mode}, τ={self.err_tau:.1e}, "
-                f"非正定有效秩截断={'on' if self.errors_truncate else 'off'}\n"
+                f"非正定有效秩截断={'on' if self.errors_truncate else 'off'}, "
+                f"正定判据=可行子空间(KKT)\n"
             )
             if self.best_result and self.best_result.get("reduced_k") is not None:
                 f.write(
@@ -2761,10 +2878,10 @@ class UnifiedPWAOptimizer:
             f.write(
                 f"{'排名':<4} {'运行ID':<6} {'NLL':<12} {'迭代':<8} "
                 f"{'eval数':<8} {'n_iter':<7} "
-                f"{'耗时':<10} {'Hessian耗时':<12} {'正定':<6} "
+                f"{'耗时':<10} {'Hessian耗时':<12} {'正定(可行)':<10} {'贴边':<6} "
                 f"{'误差模式':<12} {'平坦维':<6} {'优化器状态':<20}\n"
             )
-            f.write("-" * 120 + "\n")
+            f.write("-" * 130 + "\n")
 
             for rank, res in enumerate(sorted_results):
                 f.write(
@@ -2774,7 +2891,8 @@ class UnifiedPWAOptimizer:
                     f"{str(res.get('n_iter', '-')):<7} "
                     f"{res['time']:<10.2f} "
                     f"{res['hessian_time']:<12.2f} "
-                    f"{str(res['is_positive_definite']):<6} "
+                    f"{str(res['is_positive_definite']):<10} "
+                    f"{str(res.get('n_active', '-')):<6} "
                     f"{str(res.get('err_mode_used', '-')):<12} "
                     f"{str(res.get('n_flat_dirs', '-')):<6} "
                     f"{res.get('optimizer_status', '-'):<20}\n"
@@ -3529,6 +3647,20 @@ def main():
     print(f"  event_data={cfg['event_data']}")
     print(f"  checkpoint_interval={cfg['checkpoint_interval']}")
     print(f"  fit_mode={_FIT_MODE} (0=FREEPARAMS chain×step, 1=VSPACE 逐振幅)")
+    try:
+        _bi = ctpwa.build_info()
+        print(
+            f"  backend={ctpwa.backend()}, precision={_bi.get('precision')}, "
+            f"complex_bytes={_bi.get('complex_bytes')}, has_cuda={_bi.get('has_cuda')}"
+        )
+        if str(ctpwa.backend()).lower() != "cuda":
+            log.warning(
+                f"当前用的是 {ctpwa.backend()} 后端（比 GPU 慢 20~60 倍）；"
+                "若本作业应在 GPU 上跑，请检查 CTPWA_DEVICE / GPU 申请。"
+                f"回退原因: {getattr(ctpwa, 'FALLBACK_REASON', '')}"
+            )
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"无法获取 ctpwa 后端信息: {e}")
     print(
         f"  reduce_params={cfg['reduce_params']} (tau={cfg['rank_tau']:g}, "
         f"iters={cfg['rank_iters']}, fixed_point={cfg['rank_fixed_point']})"
@@ -3676,7 +3808,8 @@ def main():
                 f"运行 {res['run_id']:2d}: NLL = {res['final_nll']:12.6f}, "
                 f"迭代 = {res['iterations']:3d}, "
                 f"耗时 = {res['time']:6.2f}s, Hessian = {res['hessian_time']:6.2f}s, "
-                f"正定 = {res['is_positive_definite']}, "
+                f"正定(active) = {res['is_positive_definite']} "
+                f"[full={res.get('is_positive_definite_full', '-')}], "
                 f"优化器 = {res.get('optimizer_status', '-')}"
             )
 
@@ -3706,27 +3839,41 @@ def main():
                     f"Hessian 次数 = {_ps.get('n_hess', '?')}, "
                     f"polish 内求值 = {_ps.get('n_evals', '?')}"
                 )
-                if nll2 < best_res["final_nll"]:
-                    print(
-                        f"抛光: NLL {best_res['final_nll']:.6f} → {nll2:.6f} "
-                        f"(Δ={nll2 - best_res['final_nll']:.3f}), 正定={pd2}"
-                    )
+                _old_pd = bool(best_res["is_positive_definite"])
+                # 抛光即使 NLL 只变化 1e-6 量级，只要"贴边活跃"处理对，正定判据
+                # 就该更新（旧代码只在 nll2 严格更小时才采纳，会把一个可行子空间
+                # 正定的抛光点丢掉、误差仍然是空的）。
+                if nll2 <= best_res["final_nll"] + 1e-6 or (pd2 and not _old_pd):
+                    if nll2 > best_res["final_nll"]:
+                        print(
+                            f"抛光: NLL {best_res['final_nll']:.6f} → {nll2:.6f} "
+                            f"(Δ=+{nll2 - best_res['final_nll']:.2e})，"
+                            f"但可行子空间正定 {_old_pd} → {pd2}；采纳抛光点以便报误差"
+                        )
+                    else:
+                        print(
+                            f"抛光: NLL {best_res['final_nll']:.6f} → {nll2:.6f} "
+                            f"(Δ={nll2 - best_res['final_nll']:.3f}), "
+                            f"可行子空间正定={pd2}"
+                        )
                     best_res["final_params"] = p2.clone()
                     best_res["final_nll"] = nll2
-                    best_res["is_positive_definite"] = pd2
                     # 同步优化器内部状态：否则摘要里的"最佳共振态参数"表仍然打印
                     # polish *之前* 的 self.best_params，与同一张表的 NLL/正定列不一致
                     optimizer.best_params = p2.clone()
                     optimizer.best_nll = nll2
                     optimizer.best_result = best_res
                     torch.save(p2.cpu(), os.path.join(output_dir, "best_params.pt"))
-                # 无论是否改进，都在当前最佳点上重算误差（含非正定回退 auto/pinv/psd）
+                # 无论是否采纳抛光点，都在**最终点**重算误差（可行子空间判据 +
+                # 非正定回退 auto/截断/pinv/psd），并把子空间字段同步回 best_res
+                # —— 摘要/CSV 与最终参数始终一致。
                 (
                     best_res["coupling_real_errors"],
                     best_res["coupling_imag_errors"],
                     best_res["res_errors"],
                     best_res["_err_full"],
                 ) = optimizer.compute_param_errors(best_res["final_params"])
+                best_res.update(optimizer._err_fields(best_res["_err_full"]))
                 best_res["polish_status"] = "ok"
             except Exception as e:
                 # 不要静默：打印完整 traceback，并在状态里标注失败（宽 except

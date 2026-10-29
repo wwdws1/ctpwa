@@ -5,6 +5,10 @@
 !src/**
 !include/
 !include/**
+!ctpwa/
+!ctpwa/**
+# 但包里的编译产物不入库
+ctpwa/*.so
 !setup.py
 !example/
 !example/**
@@ -16,6 +20,7 @@
 !scripts/
 !scripts/run_tests.sh
 !scripts/check_interp_shape.py
+!scripts/port_cuda_to_cpu.py
 !scripts/cluster/
 !scripts/cluster/**
 tests/outputs/
