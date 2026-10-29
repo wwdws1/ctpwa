@@ -121,7 +121,9 @@ def physics_check(events, masses, mother_mass, n_check=2000, atol=1e-6):
     ok = True
     dE = float(np.abs(s[..., 0].sum(axis=1) - mother_mass).max())
     dp = float(np.abs(s[..., 1:].sum(axis=1)).max())
-    lines.append(f"四动量守恒: max|ΣE-m| = {dE:.2e}, max|Σp| = {dp:.2e} (抽样 {k} 事件)")
+    lines.append(
+        f"四动量守恒: max|ΣE-m| = {dE:.2e}, max|Σp| = {dp:.2e} (抽样 {k} 事件)"
+    )
     if dE > atol or dp > atol:
         ok = False
         lines.append("!! 守恒被破坏（超过 atol）")
@@ -158,19 +160,39 @@ def build_parser():
     )
     p.add_argument("--config", default="config.yml", help="config.yml 路径")
     p.add_argument("-n", "--nevents", type=int, required=True, help="目标事件数")
-    p.add_argument("-o", "--output", required=True, help="输出文件（dat/root 带扩展名；npy 可省）")
+    p.add_argument(
+        "-o", "--output", required=True, help="输出文件（dat/root 带扩展名；npy 可省）"
+    )
     p.add_argument("--seed", type=int, default=0, help="随机种子（同 seed 可复现）")
-    p.add_argument("--format", choices=("dat", "root", "npy"), default=None,
-                   help="输出格式；默认按 -o 的扩展名（.dat/.root/.npy），无扩展名时用 dat")
-    p.add_argument("--mother", default="", help="母粒子名（默认从 config 的 DecayChains 推）")
-    p.add_argument("--mother-mass", type=float, default=None, help="覆盖母粒子质量 (GeV)")
-    p.add_argument("--weighted", action="store_true",
-                   help="导出 GENBOD 权重（dat 只有动量列，故 weighted 仅对 root/npy 有意义）")
-    p.add_argument("--chunk", type=int, default=0,
-                   help="分块生成的事件数（>0 时逐块生成并追加写；仅 dat/npy，用于千万级样本）")
-    p.add_argument("--force", action="store_true",
-                   help="末态顺序与 Data.order 不一致时仍继续")
-    p.add_argument("--no-check", action="store_true", help="跳过我方物理自检（守恒/质量壳）")
+    p.add_argument(
+        "--format",
+        choices=("dat", "root", "npy"),
+        default=None,
+        help="输出格式；默认按 -o 的扩展名（.dat/.root/.npy），无扩展名时用 dat",
+    )
+    p.add_argument(
+        "--mother", default="", help="母粒子名（默认从 config 的 DecayChains 推）"
+    )
+    p.add_argument(
+        "--mother-mass", type=float, default=None, help="覆盖母粒子质量 (GeV)"
+    )
+    p.add_argument(
+        "--weighted",
+        action="store_true",
+        help="导出 GENBOD 权重（dat 只有动量列，故 weighted 仅对 root/npy 有意义）",
+    )
+    p.add_argument(
+        "--chunk",
+        type=int,
+        default=0,
+        help="分块生成的事件数（>0 时逐块生成并追加写；仅 dat/npy，用于千万级样本）",
+    )
+    p.add_argument(
+        "--force", action="store_true", help="末态顺序与 Data.order 不一致时仍继续"
+    )
+    p.add_argument(
+        "--no-check", action="store_true", help="跳过我方物理自检（守恒/质量壳）"
+    )
     p.add_argument("--check-events", type=int, default=2000, help="物理自检抽样事件数")
     return p
 
@@ -207,8 +229,10 @@ def main():
     print(f"[gen_phsp_mc] Data.order : {order}")
     print(f"[gen_phsp_mc] weightMax  : {gen.weightMax():g}")
     if order is not None and order != finals:
-        msg = (f"[gen_phsp_mc] 末态顺序 {finals} 与 config 的 Data.order {order} 不一致："
-               f"生成的 dat 会被 fit.py 按 Data.order 解读！")
+        msg = (
+            f"[gen_phsp_mc] 末态顺序 {finals} 与 config 的 Data.order {order} 不一致："
+            f"生成的 dat 会被 fit.py 按 Data.order 解读！"
+        )
         if args.force:
             print("WARNING " + msg + "（--force，继续）")
         else:
@@ -217,7 +241,9 @@ def main():
     masses = [pmass.get(nm) for nm in finals]
     if any(m is None for m in masses):
         miss = [nm for nm, m in zip(finals, masses) if m is None]
-        print(f"[gen_phsp_mc] 注意: config 里没有 {'/'.join(miss)} 的 mass → 质量壳检查跳过这些")
+        print(
+            f"[gen_phsp_mc] 注意: config 里没有 {'/'.join(miss)} 的 mass → 质量壳检查跳过这些"
+        )
         masses = [m for m in masses]
     masses_onesided = masses  # 保持与 finals 同序；None 表示跳过
 
@@ -246,13 +272,19 @@ def main():
         elif fmt == "npy":
             # 分块时逐块存 `<out>.<i>.npy`，避免一次性 hold 住大数组
             if args.chunk:
-                write_npy(ev_np, f"{os.path.splitext(out)[0]}.{n_done}.npy", w_np if args.weighted else None)
+                write_npy(
+                    ev_np,
+                    f"{os.path.splitext(out)[0]}.{n_done}.npy",
+                    w_np if args.weighted else None,
+                )
             else:
                 write_npy(ev_np, out, w_np if args.weighted else None)
         else:  # root（只允许一次性）
             gen.write(ev, out, w if args.weighted else None)
         n_done += m
-        print(f"[gen_phsp_mc]   {n_done}/{args.nevents} 事件  ({time.time() - t0:.1f}s)")
+        print(
+            f"[gen_phsp_mc]   {n_done}/{args.nevents} 事件  ({time.time() - t0:.1f}s)"
+        )
     dt = time.time() - t0
 
     # ---- 落盘自检：行数 ----
@@ -261,21 +293,29 @@ def main():
         with open(out, encoding="utf-8") as f:
             nlines = sum(1 for _ in f)
         expect = args.nevents * gen.nFinal()
-        print(f"[gen_phsp_mc] dat 行数: {nlines}（期望 {expect} = {args.nevents} × nFinal）")
+        print(
+            f"[gen_phsp_mc] dat 行数: {nlines}（期望 {expect} = {args.nevents} × nFinal）"
+        )
         if nlines != expect:
             sys.exit("[gen_phsp_mc] 行数不符，请检查输出")
 
     # ---- 物理自检 ----
     if not args.no_check and sample_ev is not None and sample_ev.size:
-        ok, lines = physics_check(sample_ev, masses_onesided, float(gen.motherMass()),
-                                  n_check=args.check_events)
+        ok, lines = physics_check(
+            sample_ev,
+            masses_onesided,
+            float(gen.motherMass()),
+            n_check=args.check_events,
+        )
         for ln in lines:
             print("[gen_phsp_mc]   " + ln)
         if not ok:
             sys.exit("[gen_phsp_mc] 物理自检未通过")
 
-    print(f"[gen_phsp_mc] 完成: {args.nevents} 事件 → {out} ({fmt}), "
-          f"seed={args.seed}, 耗时 {dt:.1f}s")
+    print(
+        f"[gen_phsp_mc] 完成: {args.nevents} 事件 → {out} ({fmt}), "
+        f"seed={args.seed}, 耗时 {dt:.1f}s"
+    )
 
 
 if __name__ == "__main__":

@@ -19,6 +19,8 @@
 --------
 `ctpwa`（≥0.3.15，含 `generateMC`/`getIntensity`/`writeMC`）+ backend（**GPU 推荐**；
 CPU 后端也能跑但慢 20–60×）。config 的 `data`/`phsp`/`bkg` 文件必须存在（构造 analysis 要读它们）。
+`--params-from` 的 `best_params.pt` 是 **CPU 张量**（fit.py 用 `.cpu()` 保存），脚本会按当前
+后端自动搬到 `cuda`/`cpu`（C++ 侧要求 `params` 与后端同设备）。
 
 输出
 ----
@@ -144,16 +146,29 @@ def derive_config_dat_path(src_path, dst_path, key, new_value):
             continue
         indent, rest = m.group(1), m.group(2).rstrip("\n")
         if rest.strip() and '"' in rest:  # 单行 flow：[dat, "path"]
-            lines[i] = f"{indent}{key}:" + re.sub(
-                r'"[^"]*"', f'"{new_value}"', rest, count=1) + "\n"
+            lines[i] = (
+                f"{indent}{key}:"
+                + re.sub(r'"[^"]*"', f'"{new_value}"', rest, count=1)
+                + "\n"
+            )
             done = True
             break
-        j = next((k for k in range(i + 1, min(i + 8, span[1]))
-                  if re.match(r"^\s*dat\s*,", lines[k])), None)
+        j = next(
+            (
+                k
+                for k in range(i + 1, min(i + 8, span[1]))
+                if re.match(r"^\s*dat\s*,", lines[k])
+            ),
+            None,
+        )
         if j is None:
-            sys.exit(f"[gen_toy_mc] {src_path} 的 `{key}:` 不是已知的 dat 写法，"
-                     "无法自动改写（请手工改）")
-        k = next((k for k in range(j + 1, min(j + 4, span[1])) if '"' in lines[k]), None)
+            sys.exit(
+                f"[gen_toy_mc] {src_path} 的 `{key}:` 不是已知的 dat 写法，"
+                "无法自动改写（请手工改）"
+            )
+        k = next(
+            (k for k in range(j + 1, min(j + 4, span[1])) if '"' in lines[k]), None
+        )
         if k is None:
             sys.exit(f"[gen_toy_mc] {src_path} 的 `{key}:` 块里找不到带引号的路径行")
         ind2 = re.match(r"^(\s*)", lines[k]).group(1)
@@ -161,7 +176,9 @@ def derive_config_dat_path(src_path, dst_path, key, new_value):
         done = True
         break
     if not done:
-        sys.exit(f"[gen_toy_mc] {src_path} 的 `Data` 段里没有 `{key}:`，无法派生 config")
+        sys.exit(
+            f"[gen_toy_mc] {src_path} 的 `Data` 段里没有 `{key}:`，无法派生 config"
+        )
     with open(dst_path, "w", encoding="utf-8") as f:
         f.writelines(lines)
     return dst_path
@@ -173,9 +190,13 @@ def read_dat(path, nfinal):
     if a.ndim == 1:
         a = a.reshape(1, -1)
     if a.shape[1] != 4:
-        sys.exit(f"[gen_toy_mc] {path} 每行应为 4 个数（E px py pz），实际 {a.shape[1]}")
+        sys.exit(
+            f"[gen_toy_mc] {path} 每行应为 4 个数（E px py pz），实际 {a.shape[1]}"
+        )
     if a.shape[0] % nfinal:
-        sys.exit(f"[gen_toy_mc] {path} 行数 {a.shape[0]} 不是 n_final={nfinal} 的整数倍")
+        sys.exit(
+            f"[gen_toy_mc] {path} 行数 {a.shape[0]} 不是 n_final={nfinal} 的整数倍"
+        )
     return a.reshape(-1, nfinal, 4)
 
 
@@ -205,6 +226,16 @@ def m2_pair(events, i, j):
     return s[:, 0] ** 2 - s[:, 1] ** 2 - s[:, 2] ** 2 - s[:, 3] ** 2
 
 
+def backend_device(bi):
+    """当前后端对应的 torch 设备字符串。
+
+    CUDA 后端要求传给 `generateMC` / `getIntensity` 的 `params` 在 **CUDA** 上
+    （C++ 侧 `TORCH_CHECK(ctpwa_is_cuda_like(params))`），而 `best_params.pt` 是
+    fit.py 用 `.cpu()` 存的 CPU 张量 → 必须显式搬过去；CPU 后端则要 CPU 张量。
+    """
+    return "cuda" if str((bi or {}).get("backend", "")).lower() == "cuda" else "cpu"
+
+
 # ============================================================================
 # 主流程
 # ============================================================================
@@ -214,46 +245,98 @@ def build_parser():
     p = argparse.ArgumentParser(
         description="DIYMC P2/P3：用拟合后的振幅产生 toy MC / pseudo-data",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        epilog=("⚠ 样本量要能分辨最窄共振（建议百万级），否则 toy 真值不是 NLL 极小；"
-                "本脚本不做拟合。"),
+        epilog=(
+            "⚠ 样本量要能分辨最窄共振（建议百万级），否则 toy 真值不是 NLL 极小；"
+            "本脚本不做拟合。"
+        ),
     )
     p.add_argument("--config", default="config.yml", help="config.yml 路径")
-    p.add_argument("--params-from", default="results/best_params.pt",
-                   help="拟合参数（best_params.pt，[Re.., Im.., θ] float64）")
-    p.add_argument("-n", "--nevents", type=int, default=None,
-                   help="目标事例数（mode=unweighted 时为输出事件数；"
-                        "--poisson 且未给 -n 时默认 = nobs）")
+    p.add_argument(
+        "--params-from",
+        default="results/best_params.pt",
+        help="拟合参数（best_params.pt，[Re.., Im.., θ] float64）",
+    )
+    p.add_argument(
+        "-n",
+        "--nevents",
+        type=int,
+        default=None,
+        help="目标事例数（mode=unweighted 时为输出事件数；"
+        "--poisson 且未给 -n 时默认 = nobs）",
+    )
     p.add_argument("-o", "--output", required=True, help="输出文件（dat/root/npy）")
     p.add_argument("--seed", type=int, default=0, help="随机种子（同 seed 可复现）")
-    p.add_argument("--mode", choices=("unweighted", "weighted"), default="unweighted",
-                   help="unweighted=AR 舍选等权；weighted=全收+权重（快）")
-    p.add_argument("--batch", type=int, default=100000, help="每批平坦事例数（传给 generateMC）")
-    p.add_argument("--max-trials", type=int, default=None,
-                   help="平坦事例数上限（安全检查；None=不限）")
-    p.add_argument("--format", choices=("dat", "root", "npy"), default=None,
-                   help="输出格式；默认按 -o 的扩展名")
-    p.add_argument("--poisson", action="store_true",
-                   help="按目标事件数抽成等权 pseudo-data（加权模式按权重有放回抽）")
-    p.add_argument("--nobs", type=int, default=None,
-                   help="--poisson 的目标事件数（信号部分）")
-    p.add_argument("--nobs-from-data", action="store_true", default=None,
-                   help="--poisson 的目标事件数取 config 的 data 文件事件数（默认行为）")
-    p.add_argument("--allow-short", action="store_true",
-                   help="可用信号不足 nobs 时取 min(nobs, 可用) 并警告（默认报错）")
-    p.add_argument("--bkg", dest="bkg", action="store_true", default=None,
-                   help="叠加 config 的 bkg（按 bkg_weights 加权抽样）")
-    p.add_argument("--no-bkg", dest="bkg", action="store_false",
-                   help="不叠加本底")
-    p.add_argument("--bkg-scale", type=float, default=1.0,
-                   help="本底产额缩放（Σw × scale 作为 Poisson 均值）")
-    p.add_argument("--no-shuffle", action="store_true",
-                   help="信号与本底拼接后不打乱（默认打乱）")
-    p.add_argument("--write-config", default=None,
-                   help="派生一份 config：把 data 指向本 toy（便于直接跑 fit.py）")
+    p.add_argument(
+        "--mode",
+        choices=("unweighted", "weighted"),
+        default="unweighted",
+        help="unweighted=AR 舍选等权；weighted=全收+权重（快）",
+    )
+    p.add_argument(
+        "--batch", type=int, default=100000, help="每批平坦事例数（传给 generateMC）"
+    )
+    p.add_argument(
+        "--max-trials",
+        type=int,
+        default=None,
+        help="平坦事例数上限（安全检查；None=不限）",
+    )
+    p.add_argument(
+        "--format",
+        choices=("dat", "root", "npy"),
+        default=None,
+        help="输出格式；默认按 -o 的扩展名",
+    )
+    p.add_argument(
+        "--poisson",
+        action="store_true",
+        help="按目标事件数抽成等权 pseudo-data（加权模式按权重有放回抽）",
+    )
+    p.add_argument(
+        "--nobs", type=int, default=None, help="--poisson 的目标事件数（信号部分）"
+    )
+    p.add_argument(
+        "--nobs-from-data",
+        action="store_true",
+        default=None,
+        help="--poisson 的目标事件数取 config 的 data 文件事件数（默认行为）",
+    )
+    p.add_argument(
+        "--allow-short",
+        action="store_true",
+        help="可用信号不足 nobs 时取 min(nobs, 可用) 并警告（默认报错）",
+    )
+    p.add_argument(
+        "--bkg",
+        dest="bkg",
+        action="store_true",
+        default=None,
+        help="叠加 config 的 bkg（按 bkg_weights 加权抽样）",
+    )
+    p.add_argument("--no-bkg", dest="bkg", action="store_false", help="不叠加本底")
+    p.add_argument(
+        "--bkg-scale",
+        type=float,
+        default=1.0,
+        help="本底产额缩放（Σw × scale 作为 Poisson 均值）",
+    )
+    p.add_argument(
+        "--no-shuffle", action="store_true", help="信号与本底拼接后不打乱（默认打乱）"
+    )
+    p.add_argument(
+        "--write-config",
+        default=None,
+        help="派生一份 config：把 data 指向本 toy（便于直接跑 fit.py）",
+    )
     p.add_argument("--stats-json", default=None, help="把统计信息写成 JSON")
-    p.add_argument("--check-distribution", action="store_true",
-                   help="自洽性检查：生成分布 vs |M|² 加权平坦样本（会多生成一份加权样本）")
-    p.add_argument("--check-events", type=int, default=20000, help="自洽性检查用的事件数")
+    p.add_argument(
+        "--check-distribution",
+        action="store_true",
+        help="自洽性检查：生成分布 vs |M|² 加权平坦样本（会多生成一份加权样本）",
+    )
+    p.add_argument(
+        "--check-events", type=int, default=20000, help="自洽性检查用的事件数"
+    )
     p.add_argument("--check-pair", default="0,1", help="自洽性检查投影的两个末态下标")
     p.add_argument("--check-bins", type=int, default=25, help="自洽性检查直方图 bin 数")
     return p
@@ -286,16 +369,20 @@ def main():
     nobs = args.nobs
     if args.poisson and nobs is None:
         if data_events is None:
-            sys.exit("[gen_toy_mc] --poisson 需要 --nobs，或 config 的 data 文件可读"
-                     "（用于 --nobs-from-data）")
+            sys.exit(
+                "[gen_toy_mc] --poisson 需要 --nobs，或 config 的 data 文件可读"
+                "（用于 --nobs-from-data）"
+            )
         nobs = data_events
     if args.poisson and nobs is not None and args.nevents is None:
         args.nevents = int(nobs)
     if args.nevents is None or args.nevents <= 0:
         sys.exit("[gen_toy_mc] 需要 -n（--poisson 未给 -n 时按 nobs 推断）")
     if args.mode == "weighted" and fmt == "dat" and not args.poisson:
-        sys.exit("[gen_toy_mc] mode=weighted 且未加 --poisson 时不能写 dat（dat 无权重列）："
-                 "请用 --format root/npy，或加 --poisson 转成等权 pseudo-data")
+        sys.exit(
+            "[gen_toy_mc] mode=weighted 且未加 --poisson 时不能写 dat（dat 无权重列）："
+            "请用 --format root/npy，或加 --poisson 转成等权 pseudo-data"
+        )
 
     params = torch.load(args.params_from, weights_only=True)
     if not torch.is_tensor(params):
@@ -316,8 +403,10 @@ def main():
             if bkgw_path and os.path.isfile(bkgw_path):
                 bkg_w = np.loadtxt(bkgw_path, dtype=np.float64).reshape(-1)
                 if bkg_w.size != bkg_ev.shape[0]:
-                    sys.exit(f"[gen_toy_mc] bkg_weights 行数 {bkg_w.size} != bkg 事件数 "
-                             f"{bkg_ev.shape[0]}")
+                    sys.exit(
+                        f"[gen_toy_mc] bkg_weights 行数 {bkg_w.size} != bkg 事件数 "
+                        f"{bkg_ev.shape[0]}"
+                    )
             else:
                 bkg_w = np.ones(bkg_ev.shape[0], dtype=np.float64)
 
@@ -334,38 +423,66 @@ def main():
         bi = {"backend": ctpwa.backend()}
     print(f"[gen_toy_mc] backend={bi.get('backend')} build_info={bi}")
     if str(bi.get("backend", "")).lower() != "cuda":
-        print("[gen_toy_mc] WARNING 非 CUDA 后端（CPU 慢 20~60×；GPU 作业请设 CTPWA_DEVICE=cuda）")
+        print(
+            "[gen_toy_mc] WARNING 非 CUDA 后端（CPU 慢 20~60×；GPU 作业请设 CTPWA_DEVICE=cuda）"
+        )
     print(f"[gen_toy_mc] 参数维度: 2×{nvec} + {ntheta} = {nparams}；Data.order={order}")
 
     if params.numel() != nparams:
-        sys.exit(f"[gen_toy_mc] 参数长度 {params.numel()} != 期望 {nparams}"
-                 "（是不是用了别的 config 的 best_params.pt？）")
-    print(f"[gen_toy_mc] 参数: {args.params_from} (md5 {md5_file(args.params_from)[:12]}, "
-          f"Re_0={float(params[0]):g}, Im_0={float(params[nvec]):g})")
+        sys.exit(
+            f"[gen_toy_mc] 参数长度 {params.numel()} != 期望 {nparams}"
+            "（是不是用了别的 config 的 best_params.pt？）"
+        )
+    # CUDA 后端要求 params 在 CUDA 上（best_params.pt 是 CPU 张量）
+    dev = backend_device(bi)
+    params = params.to(dev)
+    print(
+        f"[gen_toy_mc] 参数: {args.params_from} (md5 {md5_file(args.params_from)[:12]}, "
+        f"Re_0={float(params[0]):g}, Im_0={float(params[nvec]):g}, device={dev})"
+    )
     if nobs is not None:
-        print(f"[gen_toy_mc] --poisson: nobs={nobs}"
-              f"{' (来自 data 文件)' if args.nobs is None else ' (--nobs)'}, "
-              f"data 事件数={data_events}")
+        print(
+            f"[gen_toy_mc] --poisson: nobs={nobs}"
+            f"{' (来自 data 文件)' if args.nobs is None else ' (--nobs)'}, "
+            f"data 事件数={data_events}"
+        )
     if use_bkg:
-        print(f"[gen_toy_mc] 本底: {bkg_ev.shape[0]} 事件, Σw={bkg_w.sum():.6g}, "
-              f"scale={args.bkg_scale:g}")
+        print(
+            f"[gen_toy_mc] 本底: {bkg_ev.shape[0]} 事件, Σw={bkg_w.sum():.6g}, "
+            f"scale={args.bkg_scale:g}"
+        )
 
     # ---- 生成信号 ----
     t0 = time.time()
-    res = ana.generateMC(int(args.nevents), params, seed=int(args.seed),
-                         mode=args.mode, batch=int(args.batch),
-                         max_trials=args.max_trials)
+    res = ana.generateMC(
+        int(args.nevents),
+        params,
+        seed=int(args.seed),
+        mode=args.mode,
+        batch=int(args.batch),
+        max_trials=args.max_trials,
+    )
     ev = np.asarray(res["events"].numpy(), dtype=np.float64)
-    wt = np.asarray(res["weights"].numpy(), dtype=np.float64) if res["weights"].numel() else None
+    wt = (
+        np.asarray(res["weights"].numpy(), dtype=np.float64)
+        if res["weights"].numel()
+        else None
+    )
     stats = dict(res["stats"])
-    print(f"[gen_toy_mc] generateMC({args.nevents}, mode={args.mode}): "
-          f"{ev.shape[0]} 事件, {time.time() - t0:.1f}s")
+    print(
+        f"[gen_toy_mc] generateMC({args.nevents}, mode={args.mode}): "
+        f"{ev.shape[0]} 事件, {time.time() - t0:.1f}s"
+    )
     print(f"[gen_toy_mc]   stats: {stats}")
     if stats.get("truncated"):
-        print("[gen_toy_mc] WARNING stats.truncated=True：平坦事例被 max_trials 截断，"
-              "输出事件数少于请求值")
+        print(
+            "[gen_toy_mc] WARNING stats.truncated=True：平坦事例被 max_trials 截断，"
+            "输出事件数少于请求值"
+        )
     if nfinal_cfg and ev.shape[1] != nfinal_cfg:
-        sys.exit(f"[gen_toy_mc] 生成 n_final={ev.shape[1]} 与 Data.order 长度 {nfinal_cfg} 不符")
+        sys.exit(
+            f"[gen_toy_mc] 生成 n_final={ev.shape[1]} 与 Data.order 长度 {nfinal_cfg} 不符"
+        )
     if stats.get("truncated"):
         pass  # 已在上面警告
 
@@ -377,11 +494,15 @@ def main():
         if args.mode == "unweighted":
             if want > ev.shape[0]:
                 if args.allow_short:
-                    print(f"[gen_toy_mc] WARNING 需要 {want} 但只有 {ev.shape[0]}（--allow-short）")
+                    print(
+                        f"[gen_toy_mc] WARNING 需要 {want} 但只有 {ev.shape[0]}（--allow-short）"
+                    )
                     want = ev.shape[0]
                 else:
-                    sys.exit(f"[gen_toy_mc] --poisson 需要 {want} 事件，但只生成了 {ev.shape[0]}"
-                             "；请增大 -n（或加 --allow-short）")
+                    sys.exit(
+                        f"[gen_toy_mc] --poisson 需要 {want} 事件，但只生成了 {ev.shape[0]}"
+                        "；请增大 -n（或加 --allow-short）"
+                    )
             idx = rng.choice(ev.shape[0], size=want, replace=False)
             sig, sig_w = ev[idx], None
         else:  # weighted → 按权重有放回抽样
@@ -391,8 +512,10 @@ def main():
         print(f"[gen_toy_mc] Poisson: nobs={nobs} → 信号 {sig.shape[0]} 事件（等权）")
     else:
         sig, sig_w = ev, wt
-        print(f"[gen_toy_mc] 不做 Poisson：输出全部 {sig.shape[0]} 事件"
-              f"{'（带权重）' if sig_w is not None else '（等权）'}")
+        print(
+            f"[gen_toy_mc] 不做 Poisson：输出全部 {sig.shape[0]} 事件"
+            f"{'（带权重）' if sig_w is not None else '（等权）'}"
+        )
     sig_pure = sig  # 纯信号（自洽性检查用；下面叠加本底/打乱不会改到它）
 
     # ---- 叠加本底 ----
@@ -422,25 +545,36 @@ def main():
         nlines = write_dat(sig, args.output)
         with open(args.output, encoding="utf-8") as f:
             n_check = sum(1 for _ in f)
-        print(f"[gen_toy_mc] dat 已写: {args.output} 行数={n_check}"
-              f"（期望 {nlines} = {n_total}×{sig.shape[1]}）")
+        print(
+            f"[gen_toy_mc] dat 已写: {args.output} 行数={n_check}"
+            f"（期望 {nlines} = {n_total}×{sig.shape[1]}）"
+        )
         if n_check != nlines:
             sys.exit("[gen_toy_mc] 行数不符")
     elif fmt == "npy":
-        np.save(args.output if str(args.output).endswith(".npy") else str(args.output) + ".npy", sig)
+        np.save(
+            args.output
+            if str(args.output).endswith(".npy")
+            else str(args.output) + ".npy",
+            sig,
+        )
         if sig_w is not None:
             np.save(str(args.output) + ".weights.npy", sig_w)
         print(f"[gen_toy_mc] npy 已写: {args.output}")
     else:  # root
-        ana.writeMC(sig, args.output,
-                    None if sig_w is None else torch.from_numpy(sig_w))
+        ana.writeMC(
+            sig, args.output, None if sig_w is None else torch.from_numpy(sig_w)
+        )
         print(f"[gen_toy_mc] root 已写: {args.output}")
 
     # ---- 派生 config ----
     if args.write_config:
-        derive_config_dat_path(args.config, args.write_config, "data",
-                               os.path.abspath(args.output))
-        print(f"[gen_toy_mc] 派生 config: {args.write_config}（data → {os.path.abspath(args.output)}）")
+        derive_config_dat_path(
+            args.config, args.write_config, "data", os.path.abspath(args.output)
+        )
+        print(
+            f"[gen_toy_mc] 派生 config: {args.write_config}（data → {os.path.abspath(args.output)}）"
+        )
 
     # ---- 自洽性检查（生成分布 vs |M|² 加权）----
     check = None
@@ -451,25 +585,40 @@ def main():
             sys.exit("[gen_toy_mc] --check-pair 需形如 0,1")
         n_probe = max(1000, int(args.check_events))
         t0 = time.time()
-        wtres = ana.generateMC(n_probe, params, seed=int(args.seed) + 9999,
-                               mode="weighted", batch=int(args.batch))
+        wtres = ana.generateMC(
+            n_probe,
+            params,
+            seed=int(args.seed) + 9999,
+            mode="weighted",
+            batch=int(args.batch),
+        )
         ev_wt = np.asarray(wtres["events"].numpy(), dtype=np.float64)
         w_wt = np.asarray(wtres["weights"].numpy(), dtype=np.float64)
         src = sig_pure[:n_probe] if sig_pure.shape[0] >= n_probe else sig_pure
         x_ar = m2_pair(src, i, j)
         x_wt = m2_pair(ev_wt, i, j)
-        bins = np.linspace(min(x_ar.min(), x_wt.min()), max(x_ar.max(), x_wt.max()),
-                           int(args.check_bins) + 1)
+        bins = np.linspace(
+            min(x_ar.min(), x_wt.min()),
+            max(x_ar.max(), x_wt.max()),
+            int(args.check_bins) + 1,
+        )
         h_ar, _ = np.histogram(x_ar, bins=bins)
         h_wt, _ = np.histogram(x_wt, bins=bins, weights=w_wt)
         h_ar = h_ar / max(h_ar.sum(), 1)
         h_wt = h_wt / max(h_wt.sum(), 1)
         dmax = float(np.abs(h_ar - h_wt).max())
-        check = {"pair": [i, j], "n_ar": int(x_ar.size), "n_weighted": int(x_wt.size),
-                 "max_abs_diff": dmax, "bins": int(args.check_bins)}
-        print(f"[gen_toy_mc] 自洽性检查 m²({i},{j}): max|Δ|={dmax:.4f}"
-              f"（AR {x_ar.size} vs 加权 {x_wt.size}；{time.time() - t0:.1f}s）"
-              f" → {'OK' if dmax < 0.05 else '偏大，检查样本量/参数'}")
+        check = {
+            "pair": [i, j],
+            "n_ar": int(x_ar.size),
+            "n_weighted": int(x_wt.size),
+            "max_abs_diff": dmax,
+            "bins": int(args.check_bins),
+        }
+        print(
+            f"[gen_toy_mc] 自洽性检查 m²({i},{j}): max|Δ|={dmax:.4f}"
+            f"（AR {x_ar.size} vs 加权 {x_wt.size}；{time.time() - t0:.1f}s）"
+            f" → {'OK' if dmax < 0.05 else '偏大，检查样本量/参数'}"
+        )
 
     # ---- stats json ----
     dt = time.time() - t_start
@@ -502,8 +651,10 @@ def main():
         with open(args.stats_json, "w", encoding="utf-8") as f:
             json.dump(info, f, indent=2, ensure_ascii=False, default=str)
         print(f"[gen_toy_mc] stats: {args.stats_json}")
-    print(f"[gen_toy_mc] 完成: {n_total} 事件 → {args.output} ({fmt}), "
-          f"seed={args.seed}, 耗时 {dt:.1f}s")
+    print(
+        f"[gen_toy_mc] 完成: {n_total} 事件 → {args.output} ({fmt}), "
+        f"seed={args.seed}, 耗时 {dt:.1f}s"
+    )
 
 
 if __name__ == "__main__":

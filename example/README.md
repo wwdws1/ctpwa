@@ -569,7 +569,7 @@ python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
 
 | 参数 | 说明 |
 |---|---|
-| `--params-from` | 拟合参数 `best_params.pt`（`[Re.., Im.., θ]` float64；长度按 config 校验） |
+| `--params-from` | 拟合参数 `best_params.pt`（`[Re.., Im.., θ]` float64；长度按 config 校验；**会自动搬到当前后端设备**——CUDA 后端要求 CUDA 张量，而 `best_params.pt` 是 CPU 张量） |
 | `--mode unweighted`（默认） | AR 舍选等权样本（`stats.acceptance`/`max_weight` 会打印） |
 | `--mode weighted` | 全部平坦事例 + 权重（快）；未加 `--poisson` 时**不能写 dat**（无权重列） |
 | `--poisson` | 抽成等权 pseudo-data：`nobs ~ Poisson(目标事件数)`（等权无放回 / 带权按 w 有放回） |

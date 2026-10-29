@@ -162,6 +162,8 @@
   `--bkg` 按 `bkg_weights` 加权抽样叠加真本底；`--write-config` 派生 config（把 `data` 指向 toy）；
   `--check-distribution` 用 `m²(i,j)` 分布对照 `|M|²` 加权样本做自洽性检查。所有便宜的错误路径
   （参数文件/长度、weighted+dat 组合）都在构造 `analysis` **之前**报错。
+  参数按当前后端自动搬到设备：**CUDA 后端要求 `params` 是 CUDA 张量**，而 `best_params.pt`
+  是 fit.py `.cpu()` 存的（首轮 GPU 冒烟就是踩了这个 `TORCH_CHECK(ctpwa_is_cuda_like(params))`）。
 
 ---
 
