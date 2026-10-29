@@ -164,6 +164,11 @@
   （参数文件/长度、weighted+dat 组合）都在构造 `analysis` **之前**报错。
   参数按当前后端自动搬到设备：**CUDA 后端要求 `params` 是 CUDA 张量**，而 `best_params.pt`
   是 fit.py `.cpu()` 存的（首轮 GPU 冒烟就是踩了这个 `TORCH_CHECK(ctpwa_is_cuda_like(params))`）。
+- 2026-10-29（PR #20）`--format root` 写盘前把事件/权重转成 `torch.Tensor`（新工具
+  `as_torch()`）：`analysis.writeMC()` 的第一个形参是 `torch::Tensor`，pybind11 **不做**
+  numpy→torch 自动转换，脚本内部又是 numpy 数组 → 第四轮 GPU 冒烟抛
+  `TypeError: writeMC(): incompatible function arguments`（`gen_phsp_mc.py` 走
+  `gen.write(ev, …)`，`ev` 本来就是 torch 张量，故未踩到）。
 
 ---
 
