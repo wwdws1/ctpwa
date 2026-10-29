@@ -513,3 +513,75 @@ python -u fit.py --config config.yml --runs 10
   跑在各自作业目录（生产目录、`test14/`）不受影响。
 - 本仓库本地单测 `example/tests` 自己往 `sys.modules` 放 stub，并按**文件路径**加载真实的
   `ctpwa.diagnostics`（纯 torch，CPU 可跑），因此不受上面这条影响。
+
+---
+
+## 11. MC 生成：`gen_phsp_mc.py` / `gen_toy_mc.py`（DIYMC）
+
+两个**自包含**脚本（不 import 本仓库其它文件，可单独拷到任何目录运行），基于上游 DIYMC
+（`ctpwa ≥ 0.3.15`）的 `PhaseSpaceGenerator` / `generateMC` / `getIntensity` / `writeMC`。
+
+产物与 `fit.py` 的读取约定一致：`.dat` **每事件 n_final 行**、每行 `E px py pz`
+（12 位小数、空格分隔），末态顺序 = config 的 `Data.order`；也支持 `.root`
+（`TTree "mc"`，TLorentzVector 分支）与 `.npy`（`(n, n_final, 4)`）。
+
+### 11.1 `gen_phsp_mc.py`：平坦相空间（P1，**不需要 GPU**）
+
+```bash
+python gen_phsp_mc.py --config config.yml -n 100000 --seed 42 -o phsp_flat.dat
+python gen_phsp_mc.py --config config.yml -n 5000000 --chunk 500000 -o phsp_flat.dat  # 分块追加写
+python gen_phsp_mc.py --config config.yml -n 200000 --format npy -o phsp_flat          # 给探测器模拟
+python gen_phsp_mc.py --config config.yml -n 200000 --format root -o phsp_flat.root
+```
+
+- 只解析 config 的 `Particles` / `Data.order` / `DecayChains`，**不读数据文件、不需 GPU**；
+- 内置自检并打印：母粒子与质量、末态顺序 vs `Data.order`、`weightMax`、四动量守恒、
+  各末态质量壳、`dat` 行数 = `n × n_final`；不一致时**退出**（`--force` 可放行）。
+- `--weighted`（导出 GENBOD 权重）只对 `root`/`npy` 有意义（`dat` 没有权重列）。
+
+> ⚠ 两个语义提醒：
+> 1. **它不等于生产 `phsp_truth`**：后者是同一批探测器 MC 的 truth 级版本，可能带 truth 级
+>    fiducial 选择；用平坦 PS 顶替它会改变"效率"的定义（∫|A|²ε/∫|A|²）。它适合
+>    ① closure/toy 研究里当理想 truth 样本 ② 作为**外部探测器模拟的输入**（重建后才得到 `phsp`）。
+> 2. **用于 closure 时样本量要能分辨最窄的共振**：上游实测 4.5 MeV 宽的 φ(1020) 只给 10k
+>    phsp 时，toy 真值不是 NLL 极小（拟合把宽度顶到边界），加到 200k 才恢复。本仓库共振宽度
+>    是 MeV 级 → 建议**百万级**。
+
+### 11.2 `gen_toy_mc.py`：振幅加权 toy → pseudo-data（P2/P3，**需要 backend**）
+
+```bash
+# 5 万信号 toy + Poisson + 真本底 → pseudo-data（并派生 config、写 stats）
+python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
+    -n 50000 --seed 42 --poisson --nobs-from-data --bkg \
+    -o toy_data.dat --write-config config_toy.yml --stats-json toy.json
+
+# 纯信号等权 / 带权（快）样本
+python gen_toy_mc.py --config config.yml --params-from results/best_params.pt -n 100000 -o toy.dat
+python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
+    -n 500000 --mode weighted --format root -o toy_w.root
+
+# 自洽性检查：生成分布 vs |M|² 加权平坦样本（多生成一份加权样本）
+python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
+    -n 50000 --check-distribution -o toy.dat
+```
+
+要点：
+
+| 参数 | 说明 |
+|---|---|
+| `--params-from` | 拟合参数 `best_params.pt`（`[Re.., Im.., θ]` float64；长度按 config 校验） |
+| `--mode unweighted`（默认） | AR 舍选等权样本（`stats.acceptance`/`max_weight` 会打印） |
+| `--mode weighted` | 全部平坦事例 + 权重（快）；未加 `--poisson` 时**不能写 dat**（无权重列） |
+| `--poisson` | 抽成等权 pseudo-data：`nobs ~ Poisson(目标事件数)`（等权无放回 / 带权按 w 有放回） |
+| `--nobs N` / `--nobs-from-data` | 目标事件数；后者取 config 的 `data` 文件事件数（默认） |
+| `--allow-short` | 可用信号 < nobs 时取 min 并警告（默认报错） |
+| `--bkg` / `--no-bkg` | 叠加 config 的 `bkg`（按 `bkg_weights` 加权抽样）；默认"有 bkg 就叠" |
+| `--bkg-scale` | 本底产额缩放：`Poisson(scale·Σw)` |
+| `--write-config` | 派生 config（把 `data` 指向 toy），可直接 `fit.py --config config_toy.yml` |
+| `--stats-json` | seed / 参数 md5 / 事件数 / bkg 产额 / `generateMC` 的 `stats` |
+| `--check-distribution` | 自洽性：`m²(i,j)` 分布 AR vs `|M|²` 加权（`max|Δ|`，经验阈值 0.05） |
+
+> ⚠ 本脚本**不做拟合**。想验证"toy 真值是否 NLL 极小"（闭包），用 `--write-config` 派生 config
+> 后跑 `fit.py`。样本量要求同上（MeV 级宽度 → 百万级）。
+> ⚠ `fit.py` 目前仍**硬要求 CUDA**（`torch.cuda.is_available()`）；ctpwa 的 CPU 后端只用于
+> 开发/小样本 API（本脚本可跑，但慢 20–60×）。
