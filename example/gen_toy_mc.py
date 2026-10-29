@@ -236,6 +236,23 @@ def backend_device(bi):
     return "cuda" if str((bi or {}).get("backend", "")).lower() == "cuda" else "cpu"
 
 
+def as_torch(x):
+    """numpy / 序列 → `torch.Tensor`（CPU, float64）；`None` 原样返回。
+
+    `analysis.writeMC()` / `PhaseSpaceGenerator.write()` 的第一个形参是 `torch::Tensor`
+    （pybind11 不做 numpy→torch 自动转换），而本脚本内部一律用 numpy 处理事件数组
+    → 写 root 前必须显式转换（2026-10-29 第四轮 GPU 冒烟踩过：
+    `TypeError: writeMC(): incompatible function arguments ... events: torch.Tensor`）。
+    """
+    import torch
+
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor):
+        return x
+    return torch.as_tensor(np.ascontiguousarray(x), dtype=torch.float64)
+
+
 # ============================================================================
 # 主流程
 # ============================================================================
@@ -562,9 +579,8 @@ def main():
             np.save(str(args.output) + ".weights.npy", sig_w)
         print(f"[gen_toy_mc] npy 已写: {args.output}")
     else:  # root
-        ana.writeMC(
-            sig, args.output, None if sig_w is None else torch.from_numpy(sig_w)
-        )
+        # writeMC 的 events 形参是 torch::Tensor（pybind11 不自动转 numpy）
+        ana.writeMC(as_torch(sig), args.output, as_torch(sig_w))
         print(f"[gen_toy_mc] root 已写: {args.output}")
 
     # ---- 派生 config ----
