@@ -10,6 +10,44 @@ MC 生成脚本（`gen_phsp_mc.py` / `gen_toy_mc.py`）——统一放在最后�
 
 ---
 
+## 目录
+
+- [0. TL;DR](#0-tldr)
+- [1. 运行前提](#1-运行前提)
+- [2. 快速开始](#2-快速开始)
+- [3. 优化器区别（重点）](#3-优化器区别重点)
+  - [3.1 `reparam`（默认，推荐）](#31-reparam默认推荐)
+  - [3.2 `projected`](#32-projected)
+  - [3.3 `lbfgs`（legacy，仅 A/B 对照）](#33-lbfgslegacy仅-ab-对照)
+  - [3.4 对比（示例数据，`--runs`/`--niter` 见备注）](#34-对比示例数据--runs--niter-见备注)
+  - [3.5 推荐工作流（随机多起点 → 取最优 → polish）](#35-推荐工作流随机多起点--取最优--polish)
+- [4. 参数总表](#4-参数总表)
+  - [配置 / 日志](#配置--日志)
+  - [核心运行参数](#核心运行参数)
+  - [约束 / 数值稳定](#约束--数值稳定)
+  - [误差估计（Hessian 非正定回退）](#误差估计hessian-非正定回退)
+  - [Warm start](#warm-start)
+  - [Polish（二阶抛光）](#polish二阶抛光)
+  - [权重文件](#权重文件)
+  - [Checkpoint / Resume](#checkpoint--resume)
+  - [输出](#输出)
+  - [参数化 / 参数削减 / 边界诊断（见 §8）](#参数化--参数削减--边界诊断见-8)
+- [5. 环境变量](#5-环境变量)
+- [6. 输出文件](#6-输出文件)
+- [7. 已知问题与备注](#7-已知问题与备注)
+- [8. 参数化 / 参数削减 / 误差截断 / 边界诊断（上游 `bc70a79` 并入）](#8-参数化--参数削减--误差截断--边界诊断上游-bc70a79-并入)
+  - [8.1 `--fit-mode {0,1}`：参数化](#81---fit-mode-01参数化)
+  - [8.2 `--reduce-params`：有效秩降维 + 降维重拟合](#82---reduce-params有效秩降维--降维重拟合)
+  - [8.3 `--no-errors-truncate`：非正定误差口径](#83---no-errors-truncate非正定误差口径)
+  - [8.4 `--bound-margin`：贴边参数诊断](#84---bound-margin贴边参数诊断)
+- [9. 后端选择（CPU / GPU）与 `CTPWA_DEVICE`（ctpwa ≥ 0.3.15）](#9-后端选择cpu--gpu与-ctpwa_devicectpwa--0315)
+- [10. 其它脚本（不属于 `fit.py` 用法）](#10-其它脚本不属于-fitpy-用法)
+  - [10.1 `plot.py` 使用说明](#101-plotpy-使用说明)
+  - [10.2 `gen_phsp_mc.py`：平坦相空间（P1，**不需要 GPU**）](#102-gen_phsp_mcpy平坦相空间p1不需要-gpu)
+  - [10.3 `gen_toy_mc.py`：振幅加权 toy → pseudo-data（P2/P3，**需要 backend**）](#103-gen_toy_mcpy振幅加权-toy--pseudo-datap2p3需要-backend)
+
+---
+
 ## 0. TL;DR
 
 ```bash
