@@ -535,6 +535,10 @@ python -u fit.py --config config.yml --runs 10
 （12 位小数、空格分隔），末态顺序 = config 的 `Data.order`；也支持 `.root`
 （`TTree "mc"`，TLorentzVector 分支）与 `.npy`（`(n, n_final, 4)`）。
 
+> ⚠ **`.dat` 每行固定 4 个数，没有权重列**（C++ 读取端按「每事件 4×n_final 个数」解析，多一列会错位）。
+> 要带权重：写 `root`（权重分支）/`npy`（另存 `<path>.weights.npy`），或按 config 的
+> `data_weights` / `bkg_weights` / `phsp_weights` 约定**另存一个每事件 1 行的独立权重文件**。
+
 ### 10.1 `plot.py` 使用说明
 
 从 `<output-dir>/weight_best.root`（或指定 run 的参数）读取直方图并生成 PDF 图集。
@@ -561,7 +565,7 @@ python plot.py --nll 3        # 画第 3 个 run 的 NLL 历史
 | `hdata` | 原始数据计数 |
 | `hfit` | 信号模型（振幅²×phsp）× `normFactor`（即信号产额） |
 | `hbkg` | 预期本底计数（本底事件 × `bkg_weights`，不 Scale） |
-| `h_<分波名>` | 各分波形状（`|A_i|²` 加权） |
+| `h_<分波名>` | 各分波形状（`\|A_i\|²` 加权） |
 | `interference` | 干涉矩阵（`TMatrixD`，完整对称矩阵） |
 | `legends` | 分波图例 |
 
@@ -596,7 +600,7 @@ python gen_phsp_mc.py --config config.yml -n 200000 --format root -o phsp_flat.r
 | `--format {dat,root,npy}` | 输出格式；默认按 `-o` 的扩展名，无扩展名时用 `dat` | 按扩展名 |
 | `--mother` | 母粒子名 | 从 config 的 `DecayChains` 推 |
 | `--mother-mass` | 覆盖母粒子质量 (GeV) | config 值 |
-| `--weighted` | 导出 GENBOD 权重（`dat` 只有动量列，故仅 `root`/`npy` 有意义） | False |
+| `--weighted` | 导出 GENBOD 权重；`.dat` 每行固定 4 个数、无权重列，故仅 `root`/`npy` 有意义（见章首 ⚠） | False |
 | `--chunk` | 分块生成的事件数（>0 逐块生成并追加写；仅 dat/npy，用于千万级样本） | `0`（不分块） |
 | `--force` | 末态顺序与 `Data.order` 不一致时仍继续 | False |
 | `--no-check` | 跳过我方物理自检（守恒/质量壳） | False |
@@ -607,6 +611,7 @@ python gen_phsp_mc.py --config config.yml -n 200000 --format root -o phsp_flat.r
 - 只解析 config 的 `Particles` / `Data.order` / `DecayChains`，**不读数据文件、不需 GPU**；
 - 内置自检并打印：母粒子与质量、末态顺序 vs `Data.order`、`weightMax`、四动量守恒、
   各末态质量壳、`dat` 行数 = `n × n_final`；不一致时**退出**（`--force` 可放行）。
+- `--weighted`（GENBOD 权重）只写 `root`/`npy`；`--weighted` + `--format dat` **直接报错退出**。
 
 > ⚠ 两个语义提醒：
 > 1. **它不等于生产 `phsp_truth`**：后者是同一批探测器 MC 的 truth 级版本，可能带 truth 级
@@ -641,7 +646,7 @@ python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
 | `-n`, `--nevents` | 目标事例数（`unweighted` 时为输出事件数；`--poisson` 且未给 `-n` 时默认 = `nobs`） | None |
 | `-o`, `--output` | 输出文件（dat/root/npy） | — |
 | `--seed` | 随机种子 | `0` |
-| `--mode {unweighted,weighted}` | `unweighted`=AR 舍选等权（`stats.acceptance`/`max_weight` 会打印）；`weighted`=全收+权重（快） | `unweighted` |
+| `--mode {unweighted,weighted}` | `unweighted`=平坦相空间 + `\|M\|²` **舍选（AR）** → **等权**；`weighted`=**全收** + 每事件权重 `I` → **快**（详见下方要点） | `unweighted` |
 | `--batch` | 每批平坦事例数（传给 `generateMC`） | `100000` |
 | `--max-trials` | 平坦事例数上限（安全检查） | None（不限） |
 | `--format {dat,root,npy}` | 输出格式；默认按 `-o` 的扩展名 | 按扩展名 |
@@ -654,13 +659,23 @@ python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
 | `--no-shuffle` | 信号与本底拼接后不打乱（默认打乱） | False |
 | `--write-config` | 派生 config（把 `data` 指向 toy），可直接 `fit.py --config config_toy.yml` | None |
 | `--stats-json` | seed / 参数 md5 / 事件数 / bkg 产额 / `generateMC` 的 `stats` | None |
-| `--check-distribution` | 自洽性：`m²(i,j)` 分布 AR vs `|M|²` 加权（`max|Δ|`，经验阈值 0.05） | False |
+| `--check-distribution` | 自洽性：`m²(i,j)` 分布 AR vs `\|M\|²` 加权（`max\|Δ\|`，经验阈值 0.05） | False |
 | `--check-events` | 自洽性检查用的事件数 | `20000` |
 | `--check-pair` | 自洽性检查投影的两个末态下标 | `0,1` |
 | `--check-bins` | 自洽性检查直方图 bin 数 | `25` |
 
-> ⚠ `--mode weighted` 未加 `--poisson` 时**不能写 dat**（无权重列）；所有便宜的错误路径
-> （参数文件/长度、`weighted`+`dat` 组合）都在构造 `analysis` **之前**报错。
+要点：
+
+- **`--mode unweighted`（默认）**：平坦相空间 → 按 `\|M\|²` **舍选（AR）** 得**等权**样本，可直接写
+  `dat`。日志 `stats` 里的 `acceptance` = **接受率**（接受数 / 平坦事例数）、`max_weight` = 舍选上界
+  `Imax`（判据 `u·Imax < I`；未给 `--max-weight` 时用首批 pilot 自适应）——**接受率越低越费时**
+  （本模型实测 ≈2%）。同批还会打印 `flat_acceptance`（平坦 / GENBOD 试探比）、`n_genbod_trials`、
+  `truncated` 等。
+- **`--mode weighted`**：平坦事例**全收** + 每事件权重 `I`（不做舍选）→ **快**（≈`1/acceptance` 倍）；
+  但 `.dat` 每行固定 4 个数、无权重列，故**只能写 `root`/`npy`**。要拿到等权的 `dat`，配 `--poisson`
+  （按权重 `p=w/Σw` 有放回抽成等权 pseudo-data）。
+
+> ⚠ 所有便宜的错误路径（参数文件/长度、`weighted`+`dat` 组合）都在构造 `analysis` **之前**报错。
 > ⚠ 本脚本**不做拟合**。想验证"toy 真值是否 NLL 极小"（闭包），用 `--write-config` 派生 config
 > 后跑 `fit.py`。样本量要求同上（MeV 级宽度 → 百万级）。
 > ⚠ `fit.py` 目前仍**硬要求 CUDA**（`torch.cuda.is_available()`）；ctpwa 的 CPU 后端只用于

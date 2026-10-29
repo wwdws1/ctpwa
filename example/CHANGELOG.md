@@ -73,8 +73,12 @@
 - 2026-10-29（PR #20）新增 **§10 MC 生成（`gen_phsp_mc.py` / `gen_toy_mc.py`）**。
 - 2026-10-29（PR #22）**章节重组**：把**不属于 `fit.py` 用法**的脚本归入最后一章
   **§10「其它脚本」**（10.1 `plot.py` / 10.2 `gen_phsp_mc.py` / 10.3 `gen_toy_mc.py`）；
-  原 §9/§10/§11 顺次重编为 **§8/§9/§10**，一级标题改为 `example 使用说明（fit.py 为主）`。
-  **10.2 新增参数表**、**10.3 表补全**为三列（参数/说明/默认）。
+  原 §9/§10/§11 顺次重编为 **§8/§9/§10**，一级标题改为 `example 使用说明（fit.py 为主）`；
+  开头加**两级目录（TOC，33 条）**。**10.2 新增参数表**、**10.3 表补全**为三列
+  （参数/说明/默认），并补充：`.dat` 每行固定 4 个数、**无权重列**（权重走 `root`/`npy` 或
+  config 的 `data_weights`/`bkg_weights`/`phsp_weights` 独立权重文件），以及
+  `--mode unweighted`（平坦 + `\|M\|²` 舍选 AR → 等权，`stats.acceptance`/`max_weight`）与
+  `weighted`（全收 + 权重 → 快，需配 `--poisson` 才得到等权 `dat`）的语义。
 
 ### `example/gen_phsp_mc.py`
 
