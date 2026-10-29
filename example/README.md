@@ -539,9 +539,9 @@ python -u fit.py --config config.yml --runs 10
 > 要带权重：写 `root`（权重分支）/`npy`（另存 `<path>.weights.npy`），或按 config 的
 > `data_weights` / `bkg_weights` / `phsp_weights` 约定**另存一个每事件 1 行的独立权重文件**。
 
-> ⚠ **`--seed` 默认 `0`、固定**：两个生成脚本同参数、同命令**默认可复现**。这点与 `fit.py`
-> **不同**——`fit.py` 的 `--seed` 默认取**当前 Unix 时间戳**（每次作业都不同，要复现得把日志里
-> `[seed] base seed=…` 的值传回来）。
+> ⚠ **`--seed` 默认取当前 Unix 时间戳**（与 `fit.py` 一致）→ **每次运行都不同**，避免"忘了改
+> seed"导致重复样本；要复现就把启动打印的 `[seed]`（或 `--stats-json` 里的 `seed`）用
+> `--seed N` 传回来。
 
 ### 10.1 `plot.py` 使用说明
 
@@ -600,7 +600,7 @@ python gen_phsp_mc.py --config config.yml -n 200000 --format root -o phsp_flat.r
 | `--config` | `config.yml` 路径 | `config.yml` |
 | `-n`, `--nevents` | 目标事件数（**必填**） | — |
 | `-o`, `--output` | 输出文件（dat/root 带扩展名；npy 可省） | — |
-| `--seed` | 随机种子；**默认 `0`（固定 → 默认可复现）**。分块时第 k 块用 `seed+k`（块间不重复） | `0` |
+| `--seed` | 随机种子；**默认取当前 Unix 时间戳（每次运行不同）**。分块时第 k 块用 `seed+k`（块间不重复）；复现请传回启动打印的 seed | 当前时间 |
 | `--format {dat,root,npy}` | 输出格式；默认按 `-o` 的扩展名，无扩展名时用 `dat` | 按扩展名 |
 | `--mother` | 母粒子名 | 从 config 的 `DecayChains` 推 |
 | `--mother-mass` | 覆盖母粒子质量 (GeV) | config 值 |
@@ -649,7 +649,7 @@ python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
 | `--params-from` | 拟合参数 `best_params.pt`（`[Re.., Im.., θ]` float64；长度按 config 校验；**会自动搬到当前后端设备**——CUDA 后端要求 CUDA 张量，而 `best_params.pt` 是 CPU 张量） | `results/best_params.pt` |
 | `-n`, `--nevents` | 目标事例数（`unweighted` 时为输出事件数；`--poisson` 且未给 `-n` 时默认 = `nobs`） | None |
 | `-o`, `--output` | 输出文件（dat/root/npy） | — |
-| `--seed` | 随机种子；**默认 `0`（固定 → 默认可复现）**。同时喂给 `generateMC`（平坦相空间 + 舍选）和本地 RNG（Poisson 抽样 / 重抽样 / 本底 / 打乱，内部用 `seed+20260101`）；`--check-distribution` 的参照样本用 `seed+9999` | `0` |
+| `--seed` | 随机种子；**默认取当前 Unix 时间戳（每次运行不同）**。同时喂给 `generateMC`（平坦相空间 + 舍选）和本地 RNG（Poisson 抽样 / 重抽样 / 本底 / 打乱，内部用 `seed+20260101`）；`--check-distribution` 的参照样本用 `seed+9999`；复现请传回启动打印的 seed | 当前时间 |
 | `--mode {unweighted,weighted}` | `unweighted`=平坦相空间 + `\|M\|²` **舍选（AR）** → **等权**；`weighted`=**全收** + 每事件权重 `I` → **快**（详见下方要点） | `unweighted` |
 | `--batch` | 每批平坦事例数（传给 `generateMC`） | `100000` |
 | `--max-trials` | 平坦事例数上限（安全检查） | None（不限） |

@@ -79,7 +79,7 @@
   config 的 `data_weights`/`bkg_weights`/`phsp_weights` 独立权重文件），以及
   `--mode unweighted`（平坦 + `|M|²` 舍选 AR → 等权，`stats.acceptance`/`max_weight`）与
   `weighted`（全收 + 权重 → 快，需配 `--poisson` 才得到等权 `dat`）的语义；另补
-  **`--seed` 默认 `0`（固定、默认可复现；与 `fit.py` 默认当前时间戳不同）** 和
+  **`--seed` 默认取当前 Unix 时间戳（与 `fit.py` 一致、每次运行不同）** 和
   **`--check-distribution` 自洽性检查的详解**（独立加权平坦参照样本 → `m²(i,j)` 归一化直方图
   `max|Δ|<0.05`、统计涨落、等权前提、与闭包的区别）；并修掉**列表里多余的反斜杠转义**
   （`|M|²`/`max|Δ|` 等——转义只在**表格单元格**里需要，列表/正文里会原样显示反斜杠）。
@@ -92,6 +92,9 @@
   末态顺序 = `Data.order`；内置自检（末态顺序 vs `Data.order`、守恒、质量壳、行数 = n×n_final、
   `weightMax`）；`--chunk` 分块追加写以支持千万级样本。**不需要 GPU，也不读数据文件**。
   文档里写清两条语义：平坦 PS ≠ 生产 `phsp_truth`；closure 用途需百万级样本（窄共振）。
+- 2026-10-29（PR #22）`--seed` 默认由 `0` 改为**当前 Unix 时间戳**（与 `fit.py` 一致）：
+  每次运行都不同，避免"忘了改 seed"导致重复样本；启动打印 `[seed] … 复现本作业请加 --seed N`，
+  分块时第 k 块仍用 `seed+k`。要复现就显式传 `--seed`。
 
 ### `example/gen_toy_mc.py`
 
@@ -110,6 +113,10 @@
   numpy→torch 自动转换，脚本内部又是 numpy 数组 → 第四轮 GPU 冒烟抛
   `TypeError: writeMC(): incompatible function arguments`（`gen_phsp_mc.py` 走
   `gen.write(ev, …)`，`ev` 本来就是 torch 张量，故未踩到）。
+- 2026-10-29（PR #22）`--seed` 默认由 `0` 改为**当前 Unix 时间戳**（与 `fit.py` 一致）：
+  每次运行都不同（避免"忘了改 seed"导致重复 toy）；启动打印 `[seed] … 复现本作业请加
+  --seed N`，`--stats-json` 里的 `seed` 也记录实际值。`--check-distribution` 参照样本仍用
+  `seed+9999`、本地 RNG 用 `seed+20260101`。
 
 ### `example/CHANGELOG.md`
 
