@@ -1835,6 +1835,15 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                             for (int j = 0; j < 256; ++j) d2Fr[j] = d2Fi[j] = 0.0;
                             interpEval(aux + target_res.aux_offset, mm,
                                        Fr, Fi, dFr, dFi, P);
+                        } else if (target_res.bwr_flag && target_res.param_count == 2) {
+                            // BWR 解析快路径：原生函数代替字节码解释器（math 与
+                            // buildModelAST 逐项一致，见 bwrSpecEval 注释/回归）
+                            bwrSpecEval(target_rp[0], target_rp[1], mm, qq,
+                                        md1_q0, md2_q0, target_res.bwr_d,
+                                        target_res.bwr_lmin, L,
+                                        target_res.bwr_has_bf != 0,
+                                        Fr, Fi, dFr, dFi, d2Fr, d2Fi,
+                                        /*want_2nd=*/false);
                         } else {
                             // JIT 物化读取（pass-1 已算 F/dF；nvals = 2+2P，同流顺序保证）
                             int joff = B.d_jit_slice ? B.d_jit_slice[nodeIdx] : -1;
@@ -1848,12 +1857,21 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                                     dFi[j] = jb[2 + 2 * j + 1];
                                 }
                             } else {
-                                double p1_P = pD1.P(), p1_E = pD1.E;
-                                double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
-                                double p1_phi = atan2(pD1.Py, pD1.Px);
-                                double p2_P = pD2.P(), p2_E = pD2.E;
-                                double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
-                                double p2_phi = atan2(pD2.Py, pD2.Px);
+                                // 极角量只有 Custom/Interp 的 DSL 引用；内置模型的
+                                // AST 不含这些变量，无条件算 atan2 会拖成延迟受限
+                                const bool need_polar =
+                                    (target_res.type == ResModelType::Custom
+                                     || target_res.type == ResModelType::Interp);
+                                double p1_P = 0.0, p1_E = 0.0, p1_ct = 0.0, p1_phi = 0.0;
+                                double p2_P = 0.0, p2_E = 0.0, p2_ct = 0.0, p2_phi = 0.0;
+                                if (need_polar) {
+                                    p1_P = pD1.P(); p1_E = pD1.E;
+                                    p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
+                                    p1_phi = atan2(pD1.Py, pD1.Px);
+                                    p2_P = pD2.P(); p2_E = pD2.E;
+                                    p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
+                                    p2_phi = atan2(pD2.Py, pD2.Px);
+                                }
                                 evalCustomAll(aux, target_res.aux_offset, mm, qq, q0, L, node.bf_d,
                                     md1_q0, md2_q0,
                                     p1_P, p1_E, p1_ct, p1_phi,
@@ -1959,6 +1977,13 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                     if (res.type == ResModelType::Interp) {
                         for (int jj = 0; jj < 256; ++jj) d2Fr_tmp[jj] = d2Fi_tmp[jj] = 0.0;
                         interpEval(aux + res.aux_offset, mm, Fr, Fi, dFr, dFi, P_r);
+                    } else if (res.bwr_flag && res.param_count == 2) {
+                        // BWR 解析快路径（同 R==1 分支）
+                        bwrSpecEval(rp[0], rp[1], mm, qq, md1_q0, md2_q0,
+                                    res.bwr_d, res.bwr_lmin, L,
+                                    res.bwr_has_bf != 0,
+                                    Fr, Fi, dFr, dFi, d2Fr_tmp, d2Fi_tmp,
+                                    /*want_2nd=*/false);
                     } else {
                         // JIT 物化读取（pass-1 已算 F/dF；nvals = 2+2P_r）
                         int joff = B.d_jit_slice ? B.d_jit_slice[nodeIdx] : -1;
@@ -1972,12 +1997,21 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                                 dFi[j] = jb[2 + 2 * j + 1];
                             }
                         } else {
-                            double p1_P = pD1.P(), p1_E = pD1.E;
-                            double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
-                            double p1_phi = atan2(pD1.Py, pD1.Px);
-                            double p2_P = pD2.P(), p2_E = pD2.E;
-                            double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
-                            double p2_phi = atan2(pD2.Py, pD2.Px);
+                            // 极角量只有 Custom/Interp 的 DSL 引用；内置模型的 AST
+                            // 不含这些变量，无条件算 atan2 会拖成延迟受限
+                            const bool need_polar =
+                                (res.type == ResModelType::Custom
+                                 || res.type == ResModelType::Interp);
+                            double p1_P = 0.0, p1_E = 0.0, p1_ct = 0.0, p1_phi = 0.0;
+                            double p2_P = 0.0, p2_E = 0.0, p2_ct = 0.0, p2_phi = 0.0;
+                            if (need_polar) {
+                                p1_P = pD1.P(); p1_E = pD1.E;
+                                p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
+                                p1_phi = atan2(pD1.Py, pD1.Px);
+                                p2_P = pD2.P(); p2_E = pD2.E;
+                                p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
+                                p2_phi = atan2(pD2.Py, pD2.Px);
+                            }
                             evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, node.bf_d,
                                 md1_q0, md2_q0,
                                 p1_P, p1_E, p1_ct, p1_phi,
@@ -1997,12 +2031,87 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                         dln_im[j_glob] += (dFi[p] * Fr - dFr[p] * Fi) / den;
                     }
 
+                    // 跨共振 q0 项（**模型线形内部**）:
+                    // BWR/GS/Flatte 的线形里 γ = g0·(q/q0)^(2L+1)·(m0/m)·Bf²，
+                    // q0 = breakup(m0, md1, md2) 依赖"子粒子是另一个自由共振态"的
+                    // 质量参数；但 aux 里 md1/md2 是 CVAR_MD1/2（VAR，对参数导数为 0），
+                    // 于是 ∂F_this/∂m_child 整项缺失（该子共振态的质量梯度与 θθ
+                    // Hessian 因此错）。这里对子质量做两次数值扰动求导（解释器与 JIT
+                    // 数值一致），补进该子共振态的 mass 槽位。
+                    // 只在"本节点确有自由共振态子粒子"时触发，代价是多两次模型求值。
+                    if (res.type != ResModelType::BW && res.type != ResModelType::ONE) {
+                        const double e1_P = pD1.P(), e1_E = pD1.E;
+                        const double e1_ct = (e1_P > 0) ? pD1.Pz / e1_P : 0.0;
+                        const double e1_phi = atan2(pD1.Py, pD1.Px);
+                        const double e2_P = pD2.P(), e2_E = pD2.E;
+                        const double e2_ct = (e2_P > 0) ? pD2.Pz / e2_P : 0.0;
+                        const double e2_phi = atan2(pD2.Py, pD2.Px);
+                        for (int r2 = 0; r2 < R; ++r2) {
+                            if (r2 == match_r || B.d_res[r2].param_count <= 0) continue;
+                            const bool d1_free = (node.mass[1] <= 0
+                                && node.daug1_idx == B.d_res[r2].particle_idx);
+                            const bool d2_free = (node.mass[2] <= 0
+                                && node.daug2_idx == B.d_res[r2].particle_idx);
+                            if (!d1_free && !d2_free) continue;
+                            const int off2 = B.res_dF_offset[r2];
+                            const int cnt2 = B.res_dF_count[r2];
+                            bool slot_free = false;
+                            for (int j_loc = 0; j_loc < cnt2; ++j_loc)
+                                if (B.d_param_map[off2 + j_loc] == 0) { slot_free = true; break; }
+                            if (!slot_free) continue;
+
+                            const double m_child = d1_free ? md1_q0 : md2_q0;
+                            const double hh = 1e-6 * (m_child > 0.05 ? m_child : 0.05);
+                            const double md1p = md1_q0 + (d1_free ? hh : 0.0);
+                            const double md2p = md2_q0 + (d2_free ? hh : 0.0);
+                            const double md1m = md1_q0 - (d1_free ? hh : 0.0);
+                            const double md2m = md2_q0 - (d2_free ? hh : 0.0);
+                            double Fp_r, Fp_i, Fm_r, Fm_i;
+                            double dFr2[16], dFi2[16], d2Fr2[256], d2Fi2[256];
+                            evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, node.bf_d,
+                                md1p, md2p, e1_P, e1_E, e1_ct, e1_phi,
+                                e2_P, e2_E, e2_ct, e2_phi,
+                                rp, P_r, Fp_r, Fp_i, dFr2, dFi2, d2Fr2, d2Fi2, false);
+                            evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, node.bf_d,
+                                md1m, md2m, e1_P, e1_E, e1_ct, e1_phi,
+                                e2_P, e2_E, e2_ct, e2_phi,
+                                rp, P_r, Fm_r, Fm_i, dFr2, dFi2, d2Fr2, d2Fi2, false);
+                            const double dF_dm_re = (Fp_r - Fm_r) / (2.0 * hh);
+                            const double dF_dm_im = (Fp_i - Fm_i) / (2.0 * hh);
+                            const double lq_re = (dF_dm_re * Fr + dF_dm_im * Fi) / den;
+                            const double lq_im = (dF_dm_im * Fr - dF_dm_re * Fi) / den;
+                            for (int j_loc = 0; j_loc < cnt2; ++j_loc) {
+                                const int j_glob = off2 + j_loc;
+                                if (B.d_param_map[j_glob] == 0) {
+                                    dln_re[j_glob] += lq_re;
+                                    dln_im[j_glob] += lq_im;
+                                }
+                            }
+                        }
+                    }
+
                     // 跨共振 Bf 项: 匹配节点 aux 内含的 Bf 因子其 q0 链含共振态子粒子
                     // 质量（CVAR_MD1/2 为 VAR，aux 无该导数）→ 补 ∂lnBf/∂q0·∂q0/∂m
                     // （仅 mass 参数受影响；BW 的 aux 不含 Bf，与 K0 固定路径一致）
                     if (node.has_bf && res.type != ResModelType::BW) {
+                        const bool model_q0_term = (res.type != ResModelType::ONE);
                         for (int r = 0; r < R; ++r) {
                             if (B.d_res[r].param_count <= 0) continue;
+                            // 该子粒子若是本块内的自由共振态，上面"跨共振 q0 项"已经用
+                            // 数值扰动把 ∂F/∂m **整项**（含 aux 里的 Bf 与 γ 的 q0 链）
+                            // 补齐了；这里再加 Bf 那一半就重复计数。
+                            if (model_q0_term) {
+                                bool covered = false;
+                                for (int side = 0; side < 2 && !covered; ++side) {
+                                    const double dmass = (side == 0) ? node.mass[1] : node.mass[2];
+                                    const int didx = (side == 0) ? node.daug1_idx : node.daug2_idx;
+                                    if (dmass > 0.0 || didx != B.d_res[r].particle_idx) continue;
+                                    const int o2 = B.res_dF_offset[r], c2 = B.res_dF_count[r];
+                                    for (int j2 = 0; j2 < c2; ++j2)
+                                        if (B.d_param_map[o2 + j2] == 0) { covered = true; break; }
+                                }
+                                if (covered) continue;
+                            }
                             double dq0_dm = 0.0;
                             if (node.mass[1] <= 0 && node.daug1_idx == B.d_res[r].particle_idx)
                                 dq0_dm += breakup_dq_dm(1, m0_q0, md1_q0, md2_q0);
@@ -2510,6 +2619,24 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
         off[r] = cur;
         cur += cnt[r];
     }
+
+    if (getenv("CTPWA_GRAD_DEBUG")) {
+        const auto& bb = blocks_.back();
+        fprintf(stderr, "[ctpwa][blk %d] site=%d R=%d nFree=%d res_off=[",
+                block_idx, bb.site, R, bb.nFree);
+        for (int r = 0; r < R; ++r) fprintf(stderr, "%d%s", off[r], r + 1 < R ? "," : "");
+        fprintf(stderr, "] cnt=[");
+        for (int r = 0; r < R; ++r) fprintf(stderr, "%d%s", cnt[r], r + 1 < R ? "," : "");
+        fprintf(stderr, "] global_idx=[");
+        for (size_t j = 0; j < bb.free_global_idx.size(); ++j)
+            fprintf(stderr, "%d%s", bb.free_global_idx[j],
+                    j + 1 < bb.free_global_idx.size() ? "," : "");
+        fprintf(stderr, "] param_idx=[");
+        for (size_t j = 0; j < bb.free_param_idx.size(); ++j)
+            fprintf(stderr, "%d%s", bb.free_param_idx[j],
+                    j + 1 < bb.free_param_idx.size() ? "," : "");
+        fprintf(stderr, "]\n");
+    }
 }
 
 void AmpCalc::applyVarEqual(const std::vector<std::vector<std::string>>& groups)
@@ -2659,6 +2786,18 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
     int n_gpu = static_cast<int>(d_amplitudes.size());
     int n_free = nFreeResParams();
     if (n_free == 0 || blocks_.empty()) return;
+
+    // CTPWA_PROF: 分段时间（含 sync），定位 reComputeAmps 的瓶颈段
+    auto _prof_ad = getenv("CTPWA_PROF") != nullptr;
+    auto _prof_t = std::chrono::high_resolution_clock::now();
+    auto prof_tick = [&](const char* tag) {
+        if (!_prof_ad) return;
+        cudaDeviceSynchronize();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        fprintf(stderr, "[PROF-AD] %-18s %8.2f ms\n", tag,
+                std::chrono::duration<double, std::milli>(t1 - _prof_t).count());
+        _prof_t = t1;
+    };
 
     // primary = d_params 所在设备（调用方显式传入）。
     // 不能在此 cudaGetDevice——torch 的 .to() 会把运行时当前设备切走，
@@ -2851,7 +2990,12 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 if (dr.type == ResModelType::Interp || dr.aux_size <= 0 ||
                     dr.param_count < 1 || dr.param_count > 16)
                     continue;
-                if (hessian_target < 0 && mr == 0) hessian_target = (int)specs.size();
+                // JIT 只物化 F/dF（grad 变体）；二阶（full）变体只在显式要求 Hessian
+                // JIT 时生成 —— 默认不生成：full 版段是 grad 的 5~10 倍长，pass-1 每次
+                // NLL 都要算，320k 事例下反而比解释器慢（实测 3.07s → 4.15s）。
+                // Hessian 走解释器（正确，只是慢），拟合主循环吃 JIT 收益。
+                if (getenv("CTPWA_JIT_HESSIAN") && hessian_target < 0 && mr == 0)
+                    hessian_target = (int)specs.size();
                 JitNodeSpec sp;
                 sp.node_idx = ni;
                 sp.mother_idx = n.mother_idx;
@@ -3034,6 +3178,7 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                     break;
                 }
             };
+            prof_tick("jit+desc");
             float2* f2a = reinterpret_cast<float2*>(d_amplitudes[gpu]);
             if (dF_float_)
                 launchCustom(f2a, static_cast<float2*>(nullptr));
@@ -3041,12 +3186,14 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 launchCustom(f2a, static_cast<ctComplex*>(nullptr));
             else
                 launchCustom(d_amplitudes[gpu], static_cast<ctComplex*>(nullptr));
+            prof_tick("ad-kernel");
         }
 
         // 非 AD block（无自由参数）：振幅 A 只依赖四动量，与 θ 无关，
         // 初始化时 getAmps 已计算，fit 循环中跳过重算（纯浪费）
     }
 
+    prof_tick("tail");
     // 恢复 primary device
     cudaSetDevice(primary_dev);
 }
