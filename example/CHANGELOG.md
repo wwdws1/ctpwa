@@ -1,12 +1,35 @@
 # CHANGELOG（`example/`）
 
 本文件记录对上游 `BHXiang/ctpwa` 的改动中、**`example/` 目录内**各文件的内容变化
-（PR #1–#22）。其它目录随上游维护，不在本表。
+（PR #1–#24）。其它目录随上游维护，不在本表。
 **组织方式：先按合并进 `main` 的日期（`##`）分组，日期内再按文件（`###`）分组**；
 不涉及 `example/` 的上游同步提交也按日期归入各日期的「上游同步」小节。
 “PR #n”指 `wwdws1/ctpwa` 的合并请求。
 
 > 只列**行为/接口/文档**变化；纯格式（ruff-format/空白）只在首次记录。
+
+---
+
+## 2026-10-30
+
+### `example/fit.py`
+
+- 2026-10-30（PR #24）新增 **`--cpu`**：**默认仍要求 GPU**——后端不是 `cuda` 时**直接报错退出**
+  （提示可加 `--cpu`）；只有显式要 CPU 才继续：
+  - `--cpu`（或在外面显式 `CTPWA_DEVICE=cpu`）→ 用 CPU 后端拟合，打印「比 GPU 慢 20–60 倍，仅适合
+    小样本/调试」警告；`--cpu` 会**覆盖**已有 `CTPWA_DEVICE`（覆盖时打印一行提示）。
+  - 实现要点：① `--cpu` 在 **`import ctpwa` 之前**从 argv 取——ctpwa（≥0.3.15）在 import 期就按
+    `CTPWA_DEVICE` **互斥加载** `_cuda`/`_cpu`，import 后再换来不及；② 新增模块级 `_DEV`
+    （由 `ctpwa.backend()` 推导、带 stub 兜底），把原先写死的 3 处 `device="cuda"`
+    （`_generate_initial_params` / 兼容包装器 / `UnifiedPWAOptimizer`）改为 `_DEV`——否则 CPU 后端下
+    会把 CUDA 张量喂给 `_cpu.so`；③ P4.1 由「无 CUDA 直接退出」改为「**非显式 CPU 才退出**」。
+  - ⚠ **与上游分歧**：上游 `example/fit.py` 硬要求 CUDA、无此开关；将来合并上游时注意。
+  - GPU 路径行为不变（`test14` T0–T8 + golden 回归通过）；CPU 回退另有 `test17`。
+
+### `example/README.md`
+
+- 2026-10-30（PR #24）§1 运行前提补 **CPU 回退（`--cpu`）** 一条；§4 参数总表加 `--cpu` 行；
+  §9 后端选择加「`fit.py` 自己的策略（默认要求 GPU，`--cpu`/`CTPWA_DEVICE=cpu` 才用 CPU）」小节。
 
 ---
 

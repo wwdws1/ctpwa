@@ -10,10 +10,31 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Optional, TypedDict
+
+# ---- 后端：`--cpu` 必须在 `import ctpwa` **之前**生效 ----
+# ctpwa（≥0.3.15）在 import 期就按 `CTPWA_DEVICE` 探测并**互斥加载** `_cuda`/`_cpu`，
+# import 之后再想换后端已经来不及。因此和 `--config`/`--fit-mode` 一样，先在 argv 里找它。
+_ARGV = sys.argv[1:]
+_FORCE_CPU = "--cpu" in _ARGV
+if _FORCE_CPU:
+    if os.environ.get("CTPWA_DEVICE", "").lower() == "cuda":
+        print("注意：命令行 --cpu 覆盖环境变量 CTPWA_DEVICE=cuda")
+    os.environ["CTPWA_DEVICE"] = "cpu"
+# “显式要求 CPU”：加了 `--cpu`，或用户自己设了 `CTPWA_DEVICE=cpu`（两种都算有意为之）
+_EXPLICIT_CPU = _FORCE_CPU or os.environ.get("CTPWA_DEVICE", "").lower() == "cpu"
+
 import ctpwa
 from ctpwa.diagnostics import analyze_hessian, map_errors_to_params
 
 log = logging.getLogger("pwa-fit")
+
+# 实际加载的后端（'cuda'/'cpu'）→ 张量设备。fit.py 的张量必须与后端同设备，
+# 否则会把 CUDA 张量喂给 `_cpu.so`（反之亦然）。单测里 ctpwa 被 stub 掉，故做兜底。
+try:
+    _BACKEND = str(ctpwa.backend()).lower()
+except Exception:  # pragma: no cover - stub/异常兜底
+    _BACKEND = "cpu"
+_DEV = "cuda" if _BACKEND == "cuda" else "cpu"
 
 
 # ============================================================
@@ -211,7 +232,7 @@ def _generate_initial_params(
     n_coupling_free: int,
     free_res_info: torch.Tensor,
     seed: int = 42,
-    device: str = "cuda",
+    device: str = _DEV,
 ) -> torch.Tensor:
     """生成统一参数向量 [real_coupling | imag_coupling | theta]。
 
@@ -265,7 +286,7 @@ def generate_initial_params(
     n_coupling_free: int,
     free_res_info: torch.Tensor,
     seed: int = 42,
-    device: str = "cuda",
+    device: str = _DEV,
 ) -> torch.Tensor:
     """向后兼容包装器。新代码请用 optimizer.generate_initial_params(seed)。"""
     import warnings
@@ -813,7 +834,7 @@ class UnifiedPWAOptimizer:
     ):
         self.analysis = ana
         self.params_names = params_names
-        self.device = "cuda"
+        self.device = _DEV
         self.best_nll = float("inf")
         self.best_params = None
         self.all_results = []
@@ -3110,6 +3131,13 @@ def build_parser():
         default="config.yml",
         help="config.yml 路径 (默认: 当前目录下的 config.yml)",
     )
+    p.add_argument(
+        "--cpu",
+        action="store_true",
+        default=False,
+        help="强制用 CPU 后端拟合（比 GPU 慢 20–60 倍，仅适合小样本/调试）。"
+        "不加时默认要求 GPU：检测不到可用 CUDA 就直接退出",
+    )
 
     # --- 日志 ---
     g_log = p.add_mutually_exclusive_group()
@@ -3702,12 +3730,24 @@ def main():
         print(f"切换到配置目录: {config_dir}")
         os.chdir(config_dir)
 
-    # ---- P4.1: GPU 前置检查 ----
-    if not torch.cuda.is_available():
-        log.error("未检测到 CUDA GPU。ctpwa 需要 GPU 加速。")
+    # ---- P4.1: 后端前置检查（默认要求 GPU；显式 --cpu / CTPWA_DEVICE=cpu 才允许 CPU）----
+    if _DEV != "cuda" and not _EXPLICIT_CPU:
+        log.error("未检测到可用的 CUDA GPU。默认要求 GPU 拟合。")
         log.error(f"  PyTorch version: {torch.__version__}")
         log.error(f"  CUDA available:  {torch.cuda.is_available()}")
+        log.error(
+            "如确需在 CPU 上跑（慢 20–60 倍，仅适合小样本/调试），请加 --cpu"
+            "（或 export CTPWA_DEVICE=cpu）。"
+        )
         sys.exit(1)
+    if _DEV != "cuda":
+        log.warning(
+            "使用 CPU 后端（--cpu / CTPWA_DEVICE=cpu）：比 GPU 慢 20–60 倍，"
+            "仅适合小样本/调试；正式拟合请在 GPU 上跑（slurm 里 export CTPWA_DEVICE=cuda）。"
+        )
+        log.warning(
+            f"  PyTorch version: {torch.__version__}  CUDA available: {torch.cuda.is_available()}"
+        )
     # GPU 型号不打印（DeviceManager 输出已含设备信息/显存）
 
     output_dir = cfg["output_dir"]
@@ -3751,8 +3791,8 @@ def main():
         )
         if str(ctpwa.backend()).lower() != "cuda":
             log.warning(
-                f"当前用的是 {ctpwa.backend()} 后端（比 GPU 慢 20~60 倍）；"
-                "若本作业应在 GPU 上跑，请检查 CTPWA_DEVICE / GPU 申请。"
+                f"当前用的是 {ctpwa.backend()} 后端（--cpu / CTPWA_DEVICE=cpu；比 GPU 慢 20~60 倍）；"
+                "正式拟合请在 GPU 上跑（slurm 里 export CTPWA_DEVICE=cuda）。"
                 f"回退原因: {getattr(ctpwa, 'FALLBACK_REASON', '')}"
             )
     except Exception as e:  # noqa: BLE001
