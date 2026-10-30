@@ -61,11 +61,15 @@ python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-4  # 显式�
 
 ## 1. 运行前提
 
-- 需要 **ctpwa 包**与 **NVIDIA GPU**。本版本要求的 ctpwa 最低版本：
+- 需要 **ctpwa 包**与 **NVIDIA GPU**（默认）。本版本要求的 ctpwa 最低版本：
   - `≥ 0.3.10`：`ctpwa.analysis(config, fit_mode)`（`--fit-mode`）；
   - `≥ 0.3.15`：新门面 `import ctpwa`（单 wheel 双后端）+ `build_info()`/`backend()`；
   - `≥ 0.3.17`：`ctpwa.diagnostics`（可行子空间 PD 判据，见 §7/§8）。
   本机当前：**0.3.18**。
+- **CPU 回退（`--cpu`）**：`fit.py` **默认要求 GPU**（检测不到可用 CUDA 就直接退出）；
+  如确需在 CPU 上跑（慢 20–60 倍，仅适合小样本/调试），加 `--cpu` 强制 CPU 后端——
+  它会在 `import ctpwa` **之前**把 `CTPWA_DEVICE` 置为 `cpu`（覆盖已有 env 并提示）。
+  只设 `CTPWA_DEVICE=cpu`（不加 `--cpu`）也算显式要 CPU、同样放行。详见 §9。
 - **后端自动选择**（ctpwa ≥ 0.3.15）：`import ctpwa` 时会真跑一次 kernel 探测，
   GPU 可用则用 `_cuda`，否则**回退 CPU**（慢 20–60 倍，会打印警告）。
   用 `CTPWA_DEVICE=auto|cuda|cpu` 控制：**显式 `cuda` 时探测失败直接报错**（推荐在
@@ -240,6 +244,7 @@ python fit.py --optimizer projected --runs 5
 | 参数 | 说明 | 默认 | 环境变量 |
 |---|---|---|---|
 | `--config` | `config.yml` 路径（见 §1 注意事项） | `config.yml` | — |
+| `--cpu` | 强制 CPU 后端拟合（慢 20–60 倍，见 §9）；不加则**默认要求 GPU**，检测不到就退出 | False | （看 `CTPWA_DEVICE`） |
 | `-v`, `-vv` | 提高日志详细度（info / debug） | 0 | — |
 | `-q` | 安静模式（只输出最终结果） | False | — |
 
@@ -507,6 +512,18 @@ torch kernel** —— 编译架构与卡不匹配 / 卡被 MIG 切分或占满�
 export CTPWA_DEVICE=cuda        # slurm 作业推荐：GPU 拿不到就失败，别静默跑 CPU
 python -u fit.py --config config.yml --runs 10
 ```
+
+**`fit.py` 自己的策略（PR #24）**：**默认要求 GPU**——后端不是 `cuda` 就直接报错退出
+（提示可以加 `--cpu`）；显式要 CPU 时才继续：
+
+```bash
+python -u fit.py --config config.yml --cpu --runs 1 --niter 100   # 小样本/调试：CPU 上跑（慢 20–60×）
+```
+
+- `--cpu` 会在 `import ctpwa` **之前**把 `CTPWA_DEVICE` 置为 `cpu`（覆盖已有 env，并打印一行提示）；
+  之所以必须在 import 前做，是因为后端在 import 期就**互斥加载**好了，之后再换来不及。
+- **只设** `CTPWA_DEVICE=cpu`（不加 `--cpu`）也算"显式要 CPU"，同样放行。
+- 想"拿不到 GPU 就失败、绝不静默降级"的作业，仍然照旧 `export CTPWA_DEVICE=cuda`。
 
 其它相关接口/环境变量：
 
