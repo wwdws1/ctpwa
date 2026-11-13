@@ -1,12 +1,50 @@
 # CHANGELOG（`example/`）
 
 本文件记录对上游 `BHXiang/ctpwa` 的改动中、**`example/` 目录内**各文件的内容变化
-（PR #1–#24）。其它目录随上游维护，不在本表。
+（PR #1–#26）。其它目录随上游维护，不在本表。
 **组织方式：先按合并进 `main` 的日期（`##`）分组，日期内再按文件（`###`）分组**；
 不涉及 `example/` 的上游同步提交也按日期归入各日期的「上游同步」小节。
 “PR #n”指 `wwdws1/ctpwa` 的合并请求。
 
 > 只列**行为/接口/文档**变化；纯格式（ruff-format/空白）只在首次记录。
+
+---
+
+## 2026-11-12
+
+### 上游同步（不涉及 `example/`）
+
+- 2026-11-13（PR #26）并入上游 `e3cf387 → 267254f`（**v0.3.19**，2 个提交）：干涉矩阵宿主累加器
+  未初始化（`new double[n*n]` → `new double[n*n]()`，NaN/1e170）+ 非对角干涉 `float→double`，
+  新增 `tests/test_interference.py`；发布相关（版本号、根 `CHANGELOG.md`/`README.en.md`、`MANIFEST.in`）。
+
+### `example/fit.py`
+
+- 2026-11-13（PR #27）**`--amp-lambda` 默认值 `1e-4` → `0`（默认关闭幅度罚项）**：
+  - 改动点：`UnifiedPWAOptimizer.__init__` 的 env 兜底 `FIT_AMP_LAMBDA` 默认 `"1e-4"` → `"0"`；
+    `resolve_args` 的 `_env_float("FIT_AMP_LAMBDA", 1e-4)` → `0.0`；argparse 帮助文本同步。
+  - 启动 dump 改为 `lambda=0(off)` / `lambda=0.001`，一眼可见本作业开没开。
+  - 逻辑无需改：两处罚项（主循环 `1147`、降维重拟合 `2094`）都已有 `> 0` 守卫。
+  - ⚠ **与上游分歧**：上游默认 `1e-4`。
+  - 前向数值影响可忽略：`λ` 等价于 σ=1/√(2λ) 的高斯先验（`1e-4` → σ≈70.7，以参考波 `|v_0|=1`
+    为单位），对现实干涉深度（`d=0.1–0.95`）远小于“开始咬人”的阈值（`λ ≳ 3e-2`）。推导见
+    README §11.3。
+  - ⚠ **复现旧结果**需显式 `--amp-lambda 1e-4` / `FIT_AMP_LAMBDA=1e-4`。
+
+### `example/tests/test_errors.py`
+
+- 2026-11-13（PR #27）`test_default_optimizer_and_err_mode_policy`：`amp_lambda` 默认断言
+  `1e-4` → `0.0`；并新增「显式 `--amp-lambda 1e-3` 生效」的断言。
+
+### `example/README.md`
+
+- 2026-11-13（PR #27）**新增 §11「干涉与幅度控制三参数」**（11.1 干涉简并方向 / 11.2 三者分工 /
+  11.3 由预期干涉强度反推 `--amp-lambda` / 11.4 推荐流程 / 11.5 默认值变更与复现），含
+  `d = 1 − T/D`、`a(d) = (1−√(1−d²))/d`、`λ ≤ 1/(2k²a²)` 与数值表；并从 `weight_best.root`
+  的 `interference` 矩阵取 `d` 的代码片段（含口径说明：对角**无**因子 2，与内部 `scattering`
+  不是同一套）。
+- 2026-11-13（PR #27）同步更新 `--amp-lambda` 默认值的所有出现：§0 TL;DR、§3.1、§3.4、§4 参数总表、
+  §5 环境变量示例、§7 备注；并修正 §10.3 末尾「`fit.py` 仍硬要求 CUDA」的过期表述（PR #24 起有 `--cpu`）。
 
 ---
 
