@@ -869,11 +869,14 @@ class UnifiedPWAOptimizer:
             else float(os.environ.get("FIT_AMP_MAX", "1000.0"))
         )
         # reparam 幅度罚项（S2）: loss = NLL + λ·Σ|A_i|²，只进优化 loss，
-        # 报告 NLL/Hessian 仍用真实 NLL。默认 1e-4（防简并方向漂移到软墙帽）。
+        # 报告 NLL/Hessian 仍用真实 NLL。**默认 0（关闭）**：等价于给每个非参考
+        # 耦合一个 σ=1/√(2λ) 的高斯先验，λ=1e-4 时 σ≈70.7（相对参考波 |v0|=1），
+        # 对现实干涉深度（d=0.1~0.95）几乎不咬人 —— 详见 README §11。开启后可用于
+        # 抑制"同共振不同 LS 两波相互抵消"的简并方向把幅度吹到 --amp-max 软墙帽。
         self.amp_lambda = (
             amp_lambda
             if amp_lambda is not None
-            else float(os.environ.get("FIT_AMP_LAMBDA", "1e-4"))
+            else float(os.environ.get("FIT_AMP_LAMBDA", "0"))
         )
         # 优化器种类（默认 "reparam"，与上游一致）:
         #   "reparam" (默认)   = 重参数化软墙（耦合 sigmoid 幅度极坐标 + 共振态
@@ -3266,7 +3269,7 @@ def build_parser():
         type=float,
         default=None,
         help="reparam 幅度罚项 λ·Σ|A|²（只进优化 loss，不进报告 NLL；"
-        "env: FIT_AMP_LAMBDA, 默认: 1e-4；设 0 关闭）",
+        "env: FIT_AMP_LAMBDA, 默认: 0(关闭)；设 >0 开启，量级见 README §11）",
     )
     p.add_argument(
         "--err-mode",
@@ -3522,7 +3525,7 @@ def resolve_args(args):
     cfg["amp_lambda"] = (
         args.amp_lambda
         if args.amp_lambda is not None
-        else _env_float("FIT_AMP_LAMBDA", 1e-4)
+        else _env_float("FIT_AMP_LAMBDA", 0.0)
     )
     # optimizer: CLI --optimizer > FIT_OPTIMIZER > 默认 reparam（与上游一致）
     cfg["optimizer_kind"] = (
@@ -3771,9 +3774,10 @@ def main():
     print(f"  vmax={cfg['v_max']}, project_grad={cfg['project_grad']}")
     print(f"  optimizer={cfg['optimizer_kind']}")
     if cfg["optimizer_kind"] == "reparam":
+        _lam = cfg["amp_lambda"]
         print(
             f"  reparam: coupling=polar(amp=sigmoid, amp_max={cfg['amp_max']}, "
-            f"lambda={cfg['amp_lambda']}), res=sigmoid, "
+            f"lambda={_lam}{'' if _lam > 0 else '(off)'}), res=sigmoid, "
             f"line_search=strong_wolfe"
         )
     print(f"  err_mode={cfg['err_mode']}, err_tau={cfg['err_tau']:.1e}")

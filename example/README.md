@@ -45,6 +45,12 @@ MC 生成脚本（`gen_phsp_mc.py` / `gen_toy_mc.py`）——统一放在最后�
   - [10.1 `plot.py` 使用说明](#101-plotpy-使用说明)
   - [10.2 `gen_phsp_mc.py`：平坦相空间（P1，**不需要 GPU**）](#102-gen_phsp_mcpy平坦相空间p1不需要-gpu)
   - [10.3 `gen_toy_mc.py`：振幅加权 toy → pseudo-data（P2/P3，**需要 backend**）](#103-gen_toy_mcpy振幅加权-toy--pseudo-datap2p3需要-backend)
+- [11. 干涉与幅度控制三参数](#11-干涉与幅度控制三参数)
+  - [11.1 问题：干涉简并方向](#111-问题干涉简并方向)
+  - [11.2 三个参数的分工](#112-三个参数的分工)
+  - [11.3 由预期干涉强度反推 `--amp-lambda`](#113-由预期干涉强度反推---amp-lambda)
+  - [11.4 推荐流程](#114-推荐流程)
+  - [11.5 默认值变更与复现](#115-默认值变更与复现)
 
 ---
 
@@ -54,7 +60,7 @@ MC 生成脚本（`gen_phsp_mc.py` / `gen_toy_mc.py`）——统一放在最后�
 # 在放有 config.yml 的目录里运行
 python -u fit.py --config config.yml --runs 10 --niter 3000            # 默认优化器 reparam
 python -u fit.py --optimizer projected --runs 2 --niter 3000           # 对照（慢）
-python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-4  # 显式指定 reparam 参数
+python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-3  # 可选：开启幅度罚项（默认 0=关闭，见 §11）
 ```
 
 ---
@@ -131,11 +137,12 @@ python -u fit.py --runs 20 --niter 3000 --resume
 - 固定参考 `re_0=1, im_0=0` 不进入 `u`。
 - 优化期可选**幅度罚项** `loss = NLL + λ·Σ|A_i|²`（S2，只进优化 loss；`nll_history`、
   报告 NLL、Hessian **仍用真实 NLL**），抑制“同共振不同 LS 两波相互抵消”的简并方向把
-  幅度吹大。
+  幅度吹大。**默认关闭（`λ=0`）**；是否开启、取多大见 **§11**。
 - polish 阶段按“当前 |A|”限制耦合步长、并对候选点做 `amp_max` 硬帽（S4）。
 
 **优点**：收敛快（典型 ~1000–1800 次求值、~300–500 s/run）、NLL 好、振幅可控。
-**代价**：`λ` 是对耦合幅度的弱先验，会轻微改变优化落点（默认 1e-4，影响很小）。
+**代价**：开启罚项（`λ>0`）时 `λ` 是对耦合幅度的弱先验，会轻微改变优化落点
+（`λ=1e-4` 影响可忽略，量级见 §11）。
 
 相关参数：`--amp-max`、`--amp-lambda`、`--lr`、`--tol-grad`、`--tol-change`、`--history-size`。
 
@@ -178,8 +185,8 @@ python -u fit.py --runs 20 --niter 3000 --resume
 100~700）。多起点流程（best-of-N）下这没问题；**单次结果不要只看 status 判定成功**。
 
 **如何选**：默认用 `reparam`。做 A/B 或复现历史行为时用 `--optimizer projected` 或
-`--optimizer lbfgs`。若 reparam 偶发振幅偏大，可调大 `--amp-lambda`（如 1e-3）或调小
-`--amp-max`。
+`--optimizer lbfgs`。若 reparam 偶发振幅偏大（贴到 `--amp-max` 软墙帽），可开启幅度罚项
+`--amp-lambda`（建议从 `1e-3` 起，取值方法见 **§11**）或调小 `--amp-max`。
 
 ### 3.5 推荐工作流（随机多起点 → 取最优 → polish）
 
@@ -231,8 +238,8 @@ python fit.py --optimizer projected --runs 5
    或更差（中段交接在 3/3 起点上差 12~373 NLL）——两者停在不同局部极小。
    polish 本来就是两条路共用的同一个 `polish_damped_newton`。
 3. **`--amp-max`（默认 1000）**要确认大于该分析的最大 `|A|`，否则会撞软墙；
-   `--amp-lambda`（默认 1e-4）是只进优化目标的幅度罚项，报告 NLL 仍为真实值，
-   设 0 可关闭。
+   `--amp-lambda` 是只进优化目标的幅度罚项，报告 NLL 仍为真实值，**默认 0（关闭）**，
+   需要保险丝时再开（取值方法见 §11）。
 
 ---
 
@@ -262,9 +269,9 @@ python fit.py --optimizer projected --runs 5
 ### 约束 / 数值稳定
 | 参数 | 说明 | 默认 | 环境变量 | 适用优化器 |
 |---|---|---|---|---|
-| `--vmax` | 耦合幅度硬上界（`vmax`，防发散的保险丝） | 10000 | `FIT_VMAX` | projected / lbfgs |
-| `--amp-max` | reparam 幅度软墙上限 `amp = amp_max·sigmoid(u)` | 1000 | `FIT_AMP_MAX` | reparam |
-| `--amp-lambda` | reparam 幅度罚项 `λ·ΣA²`（只进优化 loss；0=关闭） | 1e-4 | `FIT_AMP_LAMBDA` | reparam |
+| `--vmax` | 耦合幅度硬上界（`vmax`，防发散的保险丝，见 §11） | 10000 | `FIT_VMAX` | projected / lbfgs |
+| `--amp-max` | reparam 幅度软墙上限 `amp = amp_max·sigmoid(u)`（见 §11） | 1000 | `FIT_AMP_MAX` | reparam |
+| `--amp-lambda` | reparam 幅度罚项 `λ·ΣA²`（只进优化 loss；**0=关闭，默认关**；取值见 §11） | 0 | `FIT_AMP_LAMBDA` | reparam |
 | `--no-project` | 关闭 legacy 路径的边界梯度清零 | False | `FIT_PROJECT=0` | lbfgs |
 | `--optimizer` | 优化器：`reparam`/`projected`/`lbfgs` | `reparam` | `FIT_OPTIMIZER` | — |
 | `--opt-verbose` | 每轮打印 projected 的 `pg/active/ΔNLL` | False | `FIT_OPT_VERBOSE=1` | projected |
@@ -348,7 +355,8 @@ FIT_OPT_PROF  FIT_DETERMINISTIC  FIT_OPT_M  FIT_OPT_TWOLOOP  FIT_OPT_HONEST
 FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
 ```
 
-例：`FIT_OPTIMIZER=reparam FIT_AMP_LAMBDA=1e-4 python -u fit.py --runs 20 --niter 3000`
+例：`FIT_OPTIMIZER=reparam FIT_AMP_LAMBDA=1e-3 python -u fit.py --runs 20 --niter 3000`
+（`FIT_AMP_LAMBDA` 默认 `0`=关闭，取值方法见 §11）
 
 - `FIT_OPT_PROF=1`：打印**每次 run 的求值次数与耗时占比**（`[pLBFGS-prof]`/`[reparam-prof]`，
   含 `ms/eval`、`n_iter`、停机状态），用于“求值次数 × 单次成本”的归因。
@@ -401,7 +409,8 @@ FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
    （import 期解析成绝对路径，并在构造 analysis 前 chdir 到 config 目录）。
    路径口径见 §1 的两条规则（config 内相对路径 → config 目录；CLI 路径 → 调用目录）。
 2. `reparam` 的 `--amp-lambda` 是作用在**优化 loss** 上的弱先验；报告/保存的 NLL、
-   Hessian、误差全部基于**真实 NLL**，不受罚项影响。
+   Hessian、误差全部基于**真实 NLL**，不受罚项影响。**默认 `0`（关闭）**，开启方法与
+   取值见 §11。
 3. 结果普遍 `正定性=False`：精确 Hessian 存在 ~20–30 维近平坦/简并子空间（诊断显示
    沿负特征值方向 NLL 两侧都不下降，说明是数值/秩亏而非真鞍点）。
    **2026-10-29 起（PR #19）正定判据改为“可行子空间”（KKT 二阶条件）**：先剔固定参考
@@ -714,5 +723,133 @@ python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
 > ⚠ 所有便宜的错误路径（参数文件/长度、`weighted`+`dat` 组合）都在构造 `analysis` **之前**报错。
 > ⚠ 本脚本**不做拟合**。想验证"toy 真值是否 NLL 极小"（闭包），用 `--write-config` 派生 config
 > 后跑 `fit.py`。样本量要求同上（MeV 级宽度 → 百万级）。
-> ⚠ `fit.py` 目前仍**硬要求 CUDA**（`torch.cuda.is_available()`）；ctpwa 的 CPU 后端只用于
-> 开发/小样本 API（本脚本可跑，但慢 20–60×）。
+> ⚠ `fit.py` **默认要求 CUDA**（检测不到可用 GPU 直接退出）；确需 CPU 时加 `--cpu`
+> （或 `CTPWA_DEVICE=cpu`），见 §1 / §9。
+
+---
+
+## 11. 干涉与幅度控制三参数
+
+本节讲 `--amp-lambda` / `--amp-max` / `--vmax` 这三个“幅度控制”参数，以及**如何按预期的干涉强度
+反推 `--amp-lambda`**。三者都只影响**优化路径**，不改变报告的 NLL / Hessian / FF 的定义。
+
+### 11.1 问题：干涉简并方向
+
+同一个共振态可以有多条 LS 波。若两条波相位差 π，它们会**互相抵消**：总强度 `|Σ A_i v_i|²` 几乎
+不变，但各自幅度可以任意放大 —— 这条方向的 NLL **近乎平坦**。后果：
+
+- 拟合会沿该方向“漂移”，把 `|v|` 推到软墙帽（`--amp-max`）附近；
+- 表达干涉靠“两个大数相减”，数值精度差、误差估计不稳；
+- 不同起点落到这条平坦方向的不同位置 → best-of-N 的 NLL 看着差不多，但参数/FF 会发散。
+
+```
+抵消前:  |1|² = 1
+抵消后:  |1 + a·e^{iπ}|² = (1−a)² ，但 Σ|v_i|² = 1 + a² 随 a 一起变大
+```
+
+### 11.2 三个参数的分工
+
+| 参数 | 层级 | 数学形式 | 标度（单位） | 生效优化器 | 默认 |
+|---|---|---|---|---|---|
+| `--vmax` | **硬**盒约束 | `\|v\| ≤ vmax`（KKT / 活跃集；不做 clamp） | 直接是耦合幅度 | `projected` / `lbfgs` | `10000` |
+| `--amp-max` | **软**墙 | `amp = amp_max·sigmoid(u)`，逼近上限时 `damp/du → 0` 自限幅；polish 阶段另按 `amp_max` 做硬帽 | 极坐标幅度 | `reparam` | `1000` |
+| `--amp-lambda` | **罚项**（弱先验） | `loss = NLL + λ·Σ_{i≥1}\|v_i\|²`（参考波 `idx0` 不计） | 等价高斯先验 `σ = 1/√(2λ)`，以参考波 `\|v_0\| = 1` 为单位 | `reparam` | **`0`（关闭）** |
+
+要点：
+
+- **互斥**：`reparam` 下 `--vmax` 不生效；`projected` / `lbfgs` 下 `--amp-max` 不生效
+  （内部 `amp_cap = amp_max if reparam else v_max`）。
+- **只进优化 loss**：`λ` 这一项不进 `nll_history`、不进报告 NLL、不进 Hessian —— 它像一个弱先验，
+  改变的是**落点**，不是物理量的定义。
+- `λ` 与“先验尺度”的换算（`σ = 1/√(2λ)`，相对参考波 `|v_0| = 1`）：
+
+  | `λ` | `1e-4` | `1e-3` | `1e-2` | `1e-1` | `1` |
+  |---|---|---|---|---|---|
+  | `σ` | 70.7 | 22.4 | 7.07 | 2.24 | 0.71 |
+
+- 启动 dump 会打印 `lambda=0(off)` 或 `lambda=0.001`，便于确认本作业到底开没开。
+
+### 11.3 由预期干涉强度反推 `--amp-lambda`
+
+#### Step 1：量出“干涉深度” `d`
+
+```
+D = Σ_i ∫|A_i|²          （对角和）
+T = ∫|Σ_i A_i|²          （总强度，含干涉）
+d = 1 − T/D              （d = 0 无干涉；d → 1 完全抵消）
+```
+
+**两种取法**（⚠ 不能用 ctpwa 当前的 FF 列表：它的分母就是 `D`，恒 `Σ FF = 1`，读不出 `d`；
+参见 §7 与 `HANDOFF.md` §7.1 的记录）：
+
+| 来源 | 公式 |
+|---|---|
+| tf-pwa 输出 | `d = 1 − sum_diag`（`sum_diag = Σ_i FF_i`） |
+| 本仓 `weight_best.root` 的 `interference` 矩阵 | 见下面的片段 |
+
+```python
+import uproot, numpy as np
+m = uproot.open("weight_best.root")["interference"]
+M = m.member("fElements").reshape(m.member("fNrows"), m.member("fNcols"))
+D, T = float(np.trace(M)), float(M.sum())
+d = 1.0 - T / D                     # 干涉深度
+# 自检（ctpwa ≥ 0.3.19 起可靠；更早版本该矩阵有未初始化 bug，见 CHANGELOG）：
+#   np.trace(M) + np.triu(M, 1).sum() == 1
+```
+
+> 该矩阵口径：`M_ii = ∫|A_i|²/T`（**对角线无因子 2**）、`M_ij = 2∫Re(A_i A_j*)/T`，
+> 因此 `Σ_i M_ii + Σ_{i<j} M_ij = 1`。
+> ⚠ 这与 `getFitFractions` 内部用的 `scattering` 矩阵（**对角含因子 2**）**不是**同一套，别混用。
+
+#### Step 2：反解“需要的伙伴幅度” `a`
+
+2 波模型（参考 `v_0 = 1` + 伙伴 `a`、相位差 π）可严格求解：
+
+```
+d = 2a / (1 + a²)        ⇒        a(d) = (1 − √(1 − d²)) / d
+```
+
+- 若干涉由 `m` 对平摊：每对取 `d_i = d/m`，再算 `a = a(d/m)`；
+- 若物理上本来就需要较大的 `|v|`（窄共振、相空间压低等），取
+  `a_need = max( a(d), max_i|v_i| )`，后者从一次 `λ = 0` 拟合的 `parameters.txt` 里读。
+
+#### Step 3：定 `λ`
+
+```
+弱先验判据（推荐）：  λ ≤ 1 / (2·k²·a_need²)              k = 5（推荐）/ 3（中等）/ 1（明显压低）
+严格判据（有误差时）：λ ≤ ε·H_flat / 2 = ε / (2·σ_flat²)   ε = 允许的相对偏移（如 0.1）
+```
+
+第二式的来历：罚项把该方向的最小点按 `H/(H + 2λ)` 收缩（`H` 为该方向的 NLL 曲率），相对偏移
+`≈ 2λ/H`；而 `H` 与参数误差满足 `σ_flat = 1/√H`。
+
+代入 `a(d)`（单对，取 `k = 5` 与 `k = 1` 两档）：
+
+| 干涉深度 `d` | 0.05 | 0.10 | 0.30 | 0.50 | 0.70 | 0.90 | 0.95 | 0.99 |
+|---|---|---|---|---|---|---|---|---|
+| 需要幅度 `a` | 0.025 | 0.050 | 0.154 | 0.268 | 0.408 | 0.627 | 0.724 | 0.868 |
+| `λ_max`（`k=5`，弱先验） | 88.8 | 22.1 | 2.36 | 0.279 | 0.120 | 5.1e-2 | 3.8e-2 | 2.7e-2 |
+| `λ_max`（`k=1`，明显压低） | 799 | 199 | 21.2 | 6.96 | 3.00 | 1.27 | 0.95 | 0.66 |
+
+多对平摊时（总深度 `d = 0.9`）：`m=1 → λ_max ≈ 5.1e-2`、`m=2 → 0.35`、`m=4 → 1.5`、`m=8 → 6.3`。
+
+**这张表最重要的结论**：对任何现实干涉深度（`d = 0.1–0.95`），“先验不咬人”的上限是
+`λ ≲ 3e-2 ~ 2e1`；而实用区间 `λ = 1e-4 … 1e-3` 比它小 1–5 个数量级。所以
+
+- **默认关掉（`λ = 0`）与原来的 `1e-4` 在物理上几乎没有差别**，`1e-4` 原本只起“防跑飞”；
+- 反过来，`λ ≳ 3e-2` 才真正开始压缩干涉 —— 想主动压干涉时才用这个量级。
+
+### 11.4 推荐流程
+
+1. **默认 `λ = 0` 直接跑**（当前默认已如此）；
+2. 看 `parameters.txt` 里各 `|v_i|` 有没有贴 `--amp-max`：贴了说明在沿简并方向漂移；
+3. 需要保险丝时按 §11.3 的表取 `λ`（一般 `1e-4` 或 `1e-3` 就够，且不改变结论）；
+4. 想**主动**压掉“两波抵消”的虚假解 → 用 `k = 1` 档（`λ ~ 1e-2`）并把 `--amp-max` 调小，
+   再用多起点 best-of-N 交叉检查；
+5. 无论开不开，`--amp-max` 都要确认大于该分析真实的最大 `|A|`。
+
+### 11.5 默认值变更与复现
+
+> **2026-11-12 起 `--amp-lambda` 默认 `0`（原 `1e-4`）。**
+> 复现旧结果（用 `1e-4` 跑出来的）需显式 `--amp-lambda 1e-4` 或 `FIT_AMP_LAMBDA=1e-4`。
+> 因为 `λ` 只影响落点，两者 NLL 差异通常远小于多起点的散布；但若要与历史逐位对齐，请显式指定。
