@@ -1,5 +1,31 @@
 # Changelog
 
+## [v0.3.21] - 2026-11-16
+
+### Fixed
+
+- Stop `writeResult` / `writeInterfResult` from exhausting device memory on
+  analyses with slightly more than 50 partial waves. `computeModWithInterference`
+  kept a per-thread `npartials*(npartials+1)/2` accumulator in local memory even
+  when no per-event interference was requested, and CUDA reserves local memory for
+  the maximum resident thread count (V100: 2048 x 80 threads). The 200-slot bucket
+  therefore demanded ~25 GiB of local memory at kernel launch while the amplitude
+  tables were resident, so the fit ran fine and only the result-writing step died
+  with `computeModWithInterference failed: out of memory`. The accumulator is now
+  compiled out when no per-event export is requested (164 KB -> 3.2 KB per thread)
+  and otherwise bounded by the number of exported pairs (32/128/512/2048 buckets,
+  at most 2048 pairs per call).
+- Warn when a result-writing kernel's local-memory pool would exceed a quarter of
+  the free device memory, so the failure points at the partial-wave count instead
+  of the phase-space sample size.
+
+### Improved
+
+- Report the partial-wave count in the initialization banner and print the SL
+  amplitude count next to it. The line previously printed only the SL amplitude
+  count under the label "Number of partial waves", which hid which
+  `computeModWithInterference` bucket a configuration lands in.
+
 ## [v0.3.20] - 2026-11-13
 
 ### Fixed
