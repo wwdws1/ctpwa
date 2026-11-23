@@ -853,3 +853,21 @@ d = 2a / (1 + a²)        ⇒        a(d) = (1 − √(1 − d²)) / d
 > **2026-11-12 起 `--amp-lambda` 默认 `0`（原 `1e-4`）。**
 > 复现旧结果（用 `1e-4` 跑出来的）需显式 `--amp-lambda 1e-4` 或 `FIT_AMP_LAMBDA=1e-4`。
 > 因为 `λ` 只影响落点，两者 NLL 差异通常远小于多起点的散布；但若要与历史逐位对齐，请显式指定。
+
+---
+
+## 12. 读取 `weight_best.root` 里的干涉矩阵（上游 v0.3.22）
+
+`writeResult` 现在会把两张**已按本样本相干总额归一**的对称矩阵写进 `weight_best.root`：`interference_rec`（重建侧，带效率 MC）与 `interference_gen`（产生侧，`phsp_truth`）。对角 = 文献口径 fit fraction `F_i`，上三角 = 干涉项 `I_ij`，`ΣF + ΣI = 1`。配套还有 `interference_rec_err` / `interference_gen_err`（参数误差矩阵，`writeResult` 传了 hessian 才写）和 `integrals` 树（`N_rec/N_gen/W_rec/W_gen`）。
+
+`read_interference.py` 把上面这些读出来打成表：
+
+```bash
+python3 read_interference.py weight_best.root                 # 两张表 + 派生量
+python3 read_interference.py weight_best.root --sample gen    # 只看产生侧
+python3 read_interference.py weight_best.root --bf-total 8.7e-4 --csv frac.csv
+```
+
+输出包含：逐波 `F_i ± σ`、完整 n×n 矩阵（对角 = fit fraction，上三角 = 干涉项）、闭合检验 `ΣF + ΣI = 1`、非相干份额 `F_i/ΣF`、平均效率 `ε̄ = W_rec/W_gen`、每波效率 `ε_i = (P_ii/N_rec)/(T_ii/N_gen)`；给 `--bf-total` 还会逐波算 `BF_i = BF_total × F_i`（合计 ≠ BF_total 的差额正是干涉项）。
+
+> `CTPWA_WR_NO_INTEGRALS=1` 可跳过两次积分（不写矩阵也不写 `integrals` 树）；`CTPWA_WR_NO_ERR=1` 跳过误差矩阵。

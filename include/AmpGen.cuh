@@ -261,6 +261,14 @@ struct ADBlockDesc {
     int nPolar;
     int sl_start;                // grid.x 累积偏移（组内）
     int site;                    // 振幅列偏移
+    // SL 复用：每个 (共振态, 事例) 的"与 L 无关"整块 [R,I,Rm,Im,Rg,Ig]
+    // 布局 [res][nEvents][6]；nullptr = 不启用（逐 SL 现算）
+    double* d_prop6;
+    int nPropRes;                // 表中共振态数（= resonance_count）
+    // 固定节点预算：静态链因子表 Π(静态节点因子)
+    // 布局 [sigma][evt][sl] 复数（2 doubles）；nullptr = 不启用（全部节点留在热循环）
+    double* d_static;
+    unsigned int node_free_mask; // bit i = 节点 i 留在热循环；其余已折进 d_static
 };
 
 // ============================================================
@@ -276,6 +284,14 @@ public:
         std::vector<double*> d_all_channels;          // 每个 GPU：flat channel masses（Flatte）
         std::vector<ctComplex*> d_T;                  // 每个 GPU：有效耦合 T_{e,p}（nEvents×nPolar）
         std::vector<ctComplex*> d_dF;                 // 每个 GPU：∂F/∂θ 复数导数 [nEv×nSL×Nfree]（符号微分 aux 输出）
+        // SL 复用表（每 GPU）：[res][nSigma][nEv][8] = [R,I,Rm,Im,Rg,Ig,∂q0ln re,im]
+        // BWR 节点"与 L 无关"的传播子整块；主 kernel 每 SL 只补顶点 Bv。
+        std::vector<double*> d_prop6;
+        // 固定节点预算（每 GPU）：[sigma][nEv][nSL] 复数 = Π(静态节点因子)
+        std::vector<double*> d_static;
+        std::vector<char> static_ready;                // 每 GPU：表已填充（只填一次）
+        unsigned int node_free_mask_ = 0xFFFFFFFFu;    // bit i = 节点 i 留在热循环
+        int n_static_nodes_ = 0;                       // 折进表的节点数（诊断）
         int resonance_count;
         std::vector<int> res_dF_offset_;               // per-resonance: d_dF_tab local free index offset
         std::vector<int> res_dF_count_;                // per-resonance: number of free params
@@ -387,6 +403,13 @@ public:
     int nFreeResParams() const { return static_cast<int>(slots_.size()); }
     bool empty() const { return blocks_.empty(); }
     const std::vector<ParamSlot>& slots() const { return slots_; }
+    // host 侧：block bi 的 (res_idx, param_idx, 全局θ下标) 绑定表。
+    // 与 reComputeAmps 上传给 updateResonanceParamsKernel 的三张表同源：
+    //   1) 本块自由参数槽；2) var_equal ghost（指向 owner 槽）；
+    //   3) conjugate broadcast（跨链/同名共享：把 owner 的自由参数写给伙伴共振态）。
+    // 用途：从配���粒子对象重建振幅时（calculateAmplitudes），必须按同一张表
+    // 覆盖 θ，否则伙伴共振态会留在配置初值（实测多链配置差 1e-2~1e-1）。
+    std::vector<std::array<int, 3>> paramBindings(int block_idx) const;
     const std::vector<std::shared_ptr<AmpCasDecay>>& casList() const { return cas_list_; }
     // 混合精度: 振幅缓冲按 float2 存储（double .so 上 precision:float 或默认 auto）。
     // 由 analysis initialize 设置；reComputeAmps 的写出与读取按此选实例。

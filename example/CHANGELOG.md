@@ -10,6 +10,54 @@
 
 ---
 
+## 2026-11-23
+
+### 上游同步（库 + `example/fit.py`）
+
+- （PR #30）并入上游 `5c1811a → cf4a23c`（**v0.3.22**，约 30 个提交）：
+  - **FF 口径修复**：`writeResult` 写两张**按本样本相干总额归一**的对称矩阵
+    `interference_rec`（重建侧）/ `interference_gen`（产生侧，`phsp_truth`）
+    与参数误差矩阵 `interference_{rec,gen}_err`，另附 `integrals` 树
+    （`N_rec/N_gen/W_rec/W_gen`）；`getFitFractions` 的"非相干分母"问题随之作废
+    （HANDOFF §7.1 关闭，函数本身被标为待删）。
+  - **θ 传播修复**：自由共振态参数现在真正进入 truth/efficiency 积分与 FF 矩阵
+    （此前一律用配置初值，θ 导数恒为 0，参数误差无法传播）。
+  - AmpGen：静态链因子显存预算 + 每 `(σ,事例,SL)` 物化一次、SL 复用、
+    级联 BWR 闭式、缩并（lift）路径；64 位索引；新增
+    `tests/{test_efficiency,test_matrix_errors,test_matrix_validation,test_static_budget,test_theta_propagation}.py`
+    与 `scripts/cluster/multigpu_parity.py`。
+
+### `example/fit.py`
+
+- 6 处合并冲突按"两边并集"解决：
+  - 保留 fork 的 7 个开关：`--cpu`、`--seed`（含 `FIT_SEED`）、`--cal-ff`、
+    `--cal-eff`、`--ff-only`、`--err-mode`、`--err-tau`；
+  - 采纳上游 `--polish-all` / `FIT_POLISH_ALL`：默认只抛 best，`--polish-all` 逐 run
+    抛光，写 `polish_history.json`、`all_params/run_XX.pt`，`checkpoint.pt` 的
+    `start_run` 顺延；抛光后按"正定优先、NLL 次之"重排（`_result_sort_key`）；
+  - 抛光采纳规则与误差重算统一为"在**最终点**重算"（含未采纳分支），
+    `_err_full` 始终与最终参数同步；
+  - 摘要表增加 `polish` / `polishΔNLL` 两列（仅当有 run 被抛光时显示）；
+  - `FitConfig` 新增 `polish_all: bool`（本地私有测试的字段集合已同步，测试不进仓库）。
+
+### `example/README.md`
+
+- 保留 fork 原有 §1–§11；新增 **§12 读取 `weight_best.root` 里的干涉矩阵**：
+  两张矩阵的含义、闭合检验 `ΣF + ΣI = 1`、`read_interference.py` 用法，
+  以及 `CTPWA_WR_NO_INTEGRALS` / `CTPWA_WR_NO_ERR` 开关。
+
+### `example/read_interference.py`（新增）
+
+- 取上游 v0.3.22 原文件：读 `interference_rec`/`interference_gen`（及 `*_err`、
+  `integrals`），输出 `F_i ± σ`、n×n 表、闭合检验、非相干份额、平均/逐波效率，
+  可选 `--bf-total` 折算分支比。
+
+### 未做（本轮）
+
+- 生产目录 `jlsp/pwa/all/single/fit.py` **未同步**（等 `example/` 定稿后再定）。
+- `example/gen_phsp_mc.py`、`gen_toy_mc.py`、`.pre-commit-config.yaml` 为 fork 私有
+  资产，保留不动（上游本次也未改动这三个文件）。
+
 ## 2026-11-12
 
 ### 上游同步（不涉及 `example/`）
