@@ -27,6 +27,13 @@
   `compute_param_errors` + `_err_fields` 重算）。
 - `example/gen_phsp_mc.py`：文件头/`--help` 的 `phsp_truth` 对比改为中性表述。
 
+### Changed（fork `wwdws1/ctpwa`：PR #32，章节归位）
+
+- `example/README.md`：把「读取 `weight_best.root` 里的干涉矩阵」从独立的 §12 移进 **§10.4**
+  （`read_interference.py` 与 `plot.py`、两个 MC 脚本一样属于"不属于 `fit.py` 用法"的脚本），
+  子节编号改为 10.4.1–10.4.5；§6 / §10.1 / §11.3 的交叉引用同步改为 §10.4；§10 引言由
+  "三个脚本"改为"四个脚本"。
+
 
 ## [v0.3.22] - 2026-11-22
 

@@ -4,9 +4,9 @@
 Hessian / 参数误差 → 保存结果与摘要。
 
 本文以 **`fit.py` 为主**：§1–§7 讲运行、参数、输出，§8 讲参数削减/误差截断/边界诊断/
-`--fit-mode`，§9 讲后端选择，§11 讲干涉与幅度控制三参数，§12 讲怎么读 `weight_best.root`
-里的干涉矩阵。**不属于 `fit.py` 用法的脚本**——画图 `plot.py` 与两个 MC 生成脚本
-（`gen_phsp_mc.py` / `gen_toy_mc.py`）——统一放在 **§10「其它脚本」**（不是最后一章，后面还有 §11、§12）。
+`--fit-mode`，§9 讲后端选择，§11 讲干涉与幅度控制三参数。**不属于 `fit.py` 用法的脚本**——
+画图 `plot.py`、两个 MC 生成脚本（`gen_phsp_mc.py` / `gen_toy_mc.py`）和读干涉矩阵的
+`read_interference.py`——统一放在 **§10「其它脚本」**（§10.1–§10.4）。
 各文件的变更历史见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ---
@@ -46,18 +46,13 @@ Hessian / 参数误差 → 保存结果与摘要。
   - [10.1 `plot.py` 使用说明](#101-plotpy-使用说明)
   - [10.2 `gen_phsp_mc.py`：平坦相空间（P1，**不需要 GPU**）](#102-gen_phsp_mcpy平坦相空间p1不需要-gpu)
   - [10.3 `gen_toy_mc.py`：振幅加权 toy → pseudo-data（P2/P3，**需要 backend**）](#103-gen_toy_mcpy振幅加权-toy--pseudo-datap2p3需要-backend)
+  - [10.4 `read_interference.py`：读取 `weight_best.root` 里的干涉矩阵（上游 v0.3.22）](#104-read_interferencepy读取-weight_bestroot-里的干涉矩阵上游-v0322)
 - [11. 干涉与幅度控制三参数](#11-干涉与幅度控制三参数)
   - [11.1 问题：干涉简并方向](#111-问题干涉简并方向)
   - [11.2 三个参数的分工](#112-三个参数的分工)
   - [11.3 由预期干涉强度反推 `--amp-lambda`](#113-由预期干涉强度反推---amp-lambda)
   - [11.4 推荐流程](#114-推荐流程)
   - [11.5 默认值变更与复现](#115-默认值变更与复现)
-- [12. 读取 `weight_best.root` 里的干涉矩阵（上游 v0.3.22）](#12-读取-weight_bestroot-里的干涉矩阵上游-v0322)
-  - [12.1 `weight_best.root` 里多了什么](#121-weight_bestroot-里多了什么)
-  - [12.2 矩阵口径与三个「份额」的区别](#122-矩阵口径与三个份额的区别)
-  - [12.3 `read_interference.py` 用法与参数](#123-read_interferencepy-用法与参数)
-  - [12.4 输出长什么样（真实例子）](#124-输出长什么样真实例子)
-  - [12.5 常见问题](#125-常见问题)
 
 ---
 
@@ -390,7 +385,7 @@ FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
 | `optimization_summary.txt` | 各 run 的 NLL / 迭代 / **eval数 / n_iter** / 耗时 / 正定性 / **误差模式 / 平坦维** / 优化器状态，及最佳解 |
 | `best_params.pt` | 最佳参数（供 warm start） |
 | `checkpoint.pt` | 续跑状态（`--resume` 用；含 base seed） |
-| `weight_best.root` | 最佳解的权重文件（供 `plot.py` 画图）；另含 `interference_rec` / `interference_gen` / `*_err` / `integrals`（见 §12） |
+| `weight_best.root` | 最佳解的权重文件（供 `plot.py` 画图）；另含 `interference_rec` / `interference_gen` / `*_err` / `integrals`（见 §10.4） |
 | `param_covariance.csv` | **最佳点**的参数协方差矩阵（完整 N×N，`--err-mode` 回退口径） |
 | `param_correlation.csv` | **最佳点**的参数关联系数矩阵 `ρ_ij=C_ij/(σ_iσ_j)`（完整 N×N；`σ=0` 处置 `nan`） |
 | `polish_history.json` | 每次抛光一条记录（默认只有 best 一条；`--polish-all` 时逐 run 各一条）：before/trial/final 的 NLL 与正定、步数、Hessian 次数、是否采纳 |
@@ -569,7 +564,8 @@ python -u fit.py --config config.yml --cpu --runs 1 --niter 100   # 小样本/�
 
 ## 10. 其它脚本（不属于 `fit.py` 用法）
 
-本章三个脚本都**自包含**（不 import 本仓库其它文件，可单独拷到任何目录运行）。后两个 MC 生成
+本章四个脚本都**自包含**（不 import 本仓库其它文件，可单独拷到任何目录运行）：§10.1 画图、
+§10.2–§10.3 生成 MC、§10.4 读 `weight_best.root` 里的干涉矩阵。后两个 MC 生成
 脚本基于上游 DIYMC（`ctpwa ≥ 0.3.15`）的 `PhaseSpaceGenerator` / `generateMC` / `getIntensity` /
 `writeMC`，产物与 `fit.py` 的读取约定一致：`.dat` **每事件 n_final 行**、每行 `E px py pz`
 （12 位小数、空格分隔），末态顺序 = config 的 `Data.order`；也支持 `.root`
@@ -610,7 +606,7 @@ python plot.py --nll 3        # 画第 3 个 run 的 NLL 历史
 | `hfit` | 信号模型（振幅²×phsp）× `normFactor`（即信号产额） |
 | `hbkg` | 预期本底计数（本底事件 × `bkg_weights`，不 Scale） |
 | `h_<分波名>` | 各分波形状（`\|A_i\|²` 加权） |
-| `interference_rec` / `interference_gen` | 干涉矩阵（`TMatrixD`，完整对称矩阵）；**0.3.22 起**取代旧的 `interference`，`plot.py` 不读它，读法见 §12 |
+| `interference_rec` / `interference_gen` | 干涉矩阵（`TMatrixD`，完整对称矩阵）；**0.3.22 起**取代旧的 `interference`，`plot.py` 不读它，读法见 §10.4 |
 | `legends` | 分波图例 |
 
 #### 输出内容
@@ -740,146 +736,13 @@ python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
 > ⚠ `fit.py` **默认要求 CUDA**（检测不到可用 GPU 直接退出）；确需 CPU 时加 `--cpu`
 > （或 `CTPWA_DEVICE=cpu`），见 §1 / §9。
 
----
-
-## 11. 干涉与幅度控制三参数
-
-本节讲 `--amp-lambda` / `--amp-max` / `--vmax` 这三个“幅度控制”参数，以及**如何按预期的干涉强度
-反推 `--amp-lambda`**。三者都只影响**优化路径**，不改变报告的 NLL / Hessian / FF 的定义。
-
-### 11.1 问题：干涉简并方向
-
-同一个共振态可以有多条 LS 波。若两条波相位差 π，它们会**互相抵消**：总强度 `|Σ A_i v_i|²` 几乎
-不变，但各自幅度可以任意放大 —— 这条方向的 NLL **近乎平坦**。后果：
-
-- 拟合会沿该方向“漂移”，把 `|v|` 推到软墙帽（`--amp-max`）附近；
-- 表达干涉靠“两个大数相减”，数值精度差、误差估计不稳；
-- 不同起点落到这条平坦方向的不同位置 → best-of-N 的 NLL 看着差不多，但参数/FF 会发散。
-
-```
-抵消前:  |1|² = 1
-抵消后:  |1 + a·e^{iπ}|² = (1−a)² ，但 Σ|v_i|² = 1 + a² 随 a 一起变大
-```
-
-### 11.2 三个参数的分工
-
-| 参数 | 层级 | 数学形式 | 标度（单位） | 生效优化器 | 默认 |
-|---|---|---|---|---|---|
-| `--vmax` | **硬**盒约束 | `\|v\| ≤ vmax`（KKT / 活跃集；不做 clamp） | 直接是耦合幅度 | `projected` / `lbfgs` | `10000` |
-| `--amp-max` | **软**墙 | `amp = amp_max·sigmoid(u)`，逼近上限时 `damp/du → 0` 自限幅；polish 阶段另按 `amp_max` 做硬帽 | 极坐标幅度 | `reparam` | `1000` |
-| `--amp-lambda` | **罚项**（弱先验） | `loss = NLL + λ·Σ_{i≥1}\|v_i\|²`（参考波 `idx0` 不计） | 等价高斯先验 `σ = 1/√(2λ)`，以参考波 `\|v_0\| = 1` 为单位 | `reparam` | **`0`（关闭）** |
-
-要点：
-
-- **互斥**：`reparam` 下 `--vmax` 不生效；`projected` / `lbfgs` 下 `--amp-max` 不生效
-  （内部 `amp_cap = amp_max if reparam else v_max`）。
-- **只进优化 loss**：`λ` 这一项不进 `nll_history`、不进报告 NLL、不进 Hessian —— 它像一个弱先验，
-  改变的是**落点**，不是物理量的定义。
-- `λ` 与“先验尺度”的换算（`σ = 1/√(2λ)`，相对参考波 `|v_0| = 1`）：
-
-  | `λ` | `1e-4` | `1e-3` | `1e-2` | `1e-1` | `1` |
-  |---|---|---|---|---|---|
-  | `σ` | 70.7 | 22.4 | 7.07 | 2.24 | 0.71 |
-
-- 启动 dump 会打印 `lambda=0(off)` 或 `lambda=0.001`，便于确认本作业到底开没开。
-
-### 11.3 由预期干涉强度反推 `--amp-lambda`
-
-#### Step 1：量出“干涉深度” `d`
-
-```
-D = Σ_i ∫|A_i|²          （对角和）
-T = ∫|Σ_i A_i|²          （总强度，含干涉）
-d = 1 − T/D              （d = 0 无干涉；d → 1 完全抵消）
-```
-
-**两种取法**（⚠ 不能用 `--cal-ff` 输出的那个 FF 列表：它的分母就是 `D`，恒 `Σ FF = 1`，读不出 `d`；
-要用**按相干总额归一**的矩阵，见 §12）：
-
-| 来源 | 公式 |
-|---|---|
-| tf-pwa 输出 | `d = 1 − sum_diag`（`sum_diag = Σ_i FF_i`，那边 FF 用相干分母） |
-| 本仓 `weight_best.root` 的 `interference_gen` | `d = 1 − 1/Σ_i diag_i`，见下面的片段 |
-
-```python
-import uproot, numpy as np
-m = uproot.open("weight_best.root")["interference_gen"]   # 0.3.22+；旧版叫 "interference"
-M = np.asarray(m.member("fElements"), dtype=float).reshape(
-    m.member("fNrows"), m.member("fNcols"))
-D, T = float(np.trace(M)), float(M.sum())     # T ≡ 1（已按相干总额归一）
-d = 1.0 - T / D                               # 等价于 1 − 1/ΣF
-# 自检：T == 1（ΣF + ΣI = 1，见 §12）
-```
-
-> 该矩阵口径（0.3.22 起）：`M_ii = Σw|A_i|²/W`、`M_ij = Σw·2Re(A_iA_j*)/W`，
-> `W = Σ_i M_ii + Σ_{i<j} M_ij`，因此 `Σ_i M_ii + Σ_{i<j} M_ij = 1`。
-> ⚠ 这与 `getFitFractions` 内部用的 `scattering` 矩阵（**对角含因子 2**）**不是**同一套，别混用。
-> 另外 0.3.21 及以前那个 `interference` 矩阵（`T` 归一、对角 `∫|A_i|²/T`）在 0.3.22 **已不再写**；
-> 旧脚本读 `["interference"]` 会 KeyError，改成 `interference_gen`（产生侧）或 `interference_rec`
-> （重建侧，带效率）即可，定义相同、只是按样本拆开。
-
-#### Step 2：反解“需要的伙伴幅度” `a`
-
-2 波模型（参考 `v_0 = 1` + 伙伴 `a`、相位差 π）可严格求解：
-
-```
-d = 2a / (1 + a²)        ⇒        a(d) = (1 − √(1 − d²)) / d
-```
-
-- 若干涉由 `m` 对平摊：每对取 `d_i = d/m`，再算 `a = a(d/m)`；
-- 若物理上本来就需要较大的 `|v|`（窄共振、相空间压低等），取
-  `a_need = max( a(d), max_i|v_i| )`，后者从一次 `λ = 0` 拟合的 `parameters.txt` 里读。
-
-#### Step 3：定 `λ`
-
-```
-弱先验判据（推荐）：  λ ≤ 1 / (2·k²·a_need²)              k = 5（推荐）/ 3（中等）/ 1（明显压低）
-严格判据（有误差时）：λ ≤ ε·H_flat / 2 = ε / (2·σ_flat²)   ε = 允许的相对偏移（如 0.1）
-```
-
-第二式的来历：罚项把该方向的最小点按 `H/(H + 2λ)` 收缩（`H` 为该方向的 NLL 曲率），相对偏移
-`≈ 2λ/H`；而 `H` 与参数误差满足 `σ_flat = 1/√H`。
-
-代入 `a(d)`（单对，取 `k = 5` 与 `k = 1` 两档）：
-
-| 干涉深度 `d` | 0.05 | 0.10 | 0.30 | 0.50 | 0.70 | 0.90 | 0.95 | 0.99 |
-|---|---|---|---|---|---|---|---|---|
-| 需要幅度 `a` | 0.025 | 0.050 | 0.154 | 0.268 | 0.408 | 0.627 | 0.724 | 0.868 |
-| `λ_max`（`k=5`，弱先验） | 88.8 | 22.1 | 2.36 | 0.279 | 0.120 | 5.1e-2 | 3.8e-2 | 2.7e-2 |
-| `λ_max`（`k=1`，明显压低） | 799 | 199 | 21.2 | 6.96 | 3.00 | 1.27 | 0.95 | 0.66 |
-
-多对平摊时（总深度 `d = 0.9`）：`m=1 → λ_max ≈ 5.1e-2`、`m=2 → 0.35`、`m=4 → 1.5`、`m=8 → 6.3`。
-
-**这张表最重要的结论**：对任何现实干涉深度（`d = 0.1–0.95`），“先验不咬人”的上限是
-`λ ≲ 3e-2 ~ 2e1`；而实用区间 `λ = 1e-4 … 1e-3` 比它小 1–5 个数量级。所以
-
-- **默认关掉（`λ = 0`）与原来的 `1e-4` 在物理上几乎没有差别**，`1e-4` 原本只起“防跑飞”；
-- 反过来，`λ ≳ 3e-2` 才真正开始压缩干涉 —— 想主动压干涉时才用这个量级。
-
-### 11.4 推荐流程
-
-1. **默认 `λ = 0` 直接跑**（当前默认已如此）；
-2. 看 `parameters.txt` 里各 `|v_i|` 有没有贴 `--amp-max`：贴了说明在沿简并方向漂移；
-3. 需要保险丝时按 §11.3 的表取 `λ`（一般 `1e-4` 或 `1e-3` 就够，且不改变结论）；
-4. 想**主动**压掉“两波抵消”的虚假解 → 用 `k = 1` 档（`λ ~ 1e-2`）并把 `--amp-max` 调小，
-   再用多起点 best-of-N 交叉检查；
-5. 无论开不开，`--amp-max` 都要确认大于该分析真实的最大 `|A|`。
-
-### 11.5 默认值变更与复现
-
-> **2026-11-12 起 `--amp-lambda` 默认 `0`（原 `1e-4`）。**
-> 复现旧结果（用 `1e-4` 跑出来的）需显式 `--amp-lambda 1e-4` 或 `FIT_AMP_LAMBDA=1e-4`。
-> 因为 `λ` 只影响落点，两者 NLL 差异通常远小于多起点的散布；但若要与历史逐位对齐，请显式指定。
-
----
-
-## 12. 读取 `weight_best.root` 里的干涉矩阵（上游 v0.3.22）
+### 10.4 `read_interference.py`：读取 `weight_best.root` 里的干涉矩阵（上游 v0.3.22）
 
 0.3.21 及以前 `weight_best.root` 里只有一个 `interference` 矩阵，分母是"对角和 `D`"，只能看形状；
 **0.3.22 起** `writeResult` 改写成两张**按本样本相干总额 `W` 归一**的对称矩阵，外加参数误差矩阵和
 `integrals` 树，并配了脚本 `read_interference.py` 直接打表。本节讲这些对象是什么、口径怎么算、怎么读。
 
-### 12.1 `weight_best.root` 里多了什么
+#### 10.4.1 `weight_best.root` 里多了什么
 
 | 对象 | 类型 | 归一化 | 含义 |
 |---|---|---|---|
@@ -907,7 +770,7 @@ SL 振幅耦合的下标；两者不能按下标一一对应。
 > 里最贵的一步；跳过时矩阵与 `integrals` 都不写，直方图照写。
 > `save_weight_file` 会先把拟合缓存里的 Hessian 递给 `writeResult`，所以正常情况下误差矩阵不需要额外算 Hessian。
 
-### 12.2 矩阵口径与三个「份额」的区别
+#### 10.4.2 矩阵口径与三个「份额」的区别
 
 ```
 M_ii = Σ_e w·|A_i|² / W                    （对角：无因子 2）
@@ -931,7 +794,7 @@ W    = Σ_i M_ii + Σ_{i<j} M_ij = Σ_e w·|Σ_i A_i|²
 > `["interference"]` 会 `KeyError`，换成 `interference_gen`（产生侧）或 `interference_rec`
 > （重建侧，带效率）；`plot.py` 里那个跳过 `"interference"` 目录的名单是历史残留，无影响。
 
-### 12.3 `read_interference.py` 用法与参数
+#### 10.4.3 `read_interference.py` 用法与参数
 
 ```bash
 # 基本：两张表 + 派生量全打
@@ -957,7 +820,7 @@ python3 read_interference.py results/weight_best.root --bf-total 3.7e-4 --csv ff
 依赖 `uproot`（`pip install uproot`）。本机 `envs/ctpwa` 里没装，`dev-pytorch` / `dev-tf-pwa` 里有；
 它只读 ROOT，和拟合本身用哪个环境无关。
 
-### 12.4 输出长什么样（真实例子）
+#### 10.4.4 输出长什么样（真实例子）
 
 下面是 `test/test26/` 的真实产物：1/10 样本（30,591 数据事例 / 474,986 `phsp` / 500,000 `phsp_truth`）、
 `--runs 4 --niter 500 --seed 42`、ctpwa 0.3.22 编译版。先看产生侧（对外报 FF 用这侧）：
@@ -1023,7 +886,7 @@ $ python3 read_interference.py results/weight_best.root --sample gen
 | `Σ_{i<j} I_ij = -1.129` | 干涉项之和，本例为负（相消）；与上一行相加必须 = 1 |
 | `闭合 (ΣF+ΣI) = 1.000000` | 自检。不等于 1（比如 0.99998）说明矩阵被截断/读错 |
 | `非相干份额` | `diag/Σdiag`；与 `fit.py` 末尾打印的 `fit fractions (Σ=1)` 应该一致（本例 0.0609 ↔ 0.060864，0.2405 ↔ 0.240524） |
-| 逐波表 `F_i` / `σF_i` | 文献口径 fit fraction；`σF_i = -` 表示没有误差矩阵（本例 Hessian 非正定，§12.5） |
+| 逐波表 `F_i` / `σF_i` | 文献口径 fit fraction；`σF_i = -` 表示没有误差矩阵（本例 Hessian 非正定，§10.4.5） |
 | 矩阵 | 对角 = `F_i`，上三角 = `I_ij`。本例 `I(10,4) = -0.228`、`I(10,5) = -0.178` 是最大的两对相消，`F_10 = 0.512` 也因此被抬得最高 |
 | 效率块 | `ε̄ = W_rec/W_gen`；逐波 `ε_i` 只在两样本同源产生时可解释 |
 | `--bf-total` 块 | `BF_i = BF_total × F_i`；合计大于 `BF_total` 同样是因为干涉项为负 |
@@ -1032,7 +895,7 @@ $ python3 read_interference.py results/weight_best.root --sample gen
 > （`F_10` 从 0.512 掉到 0.241）——两种口径都能算，但论文里必须写清楚用的是哪一种。
 
 
-### 12.5 常见问题
+#### 10.4.5 常见问题
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
@@ -1042,3 +905,136 @@ $ python3 read_interference.py results/weight_best.root --sample gen
 | `--bf-total` 的 `ΣBF_i ≠ BF_total` | 差额 = 干涉项 `ΣI`（同一张表里有） | 物理上正常；要"非相干"合计就用 `ΣF` |
 | 读的是 rec 还是 gen？ | rec 带效率（`phsp`），gen 是产生侧（`phsp_truth`） | 报 fit fraction / 与文献比 → gen；与数据、效率相关 → rec |
 | 跑得很慢 / 占显存 | 矩阵本身很小；贵的是 `fit.py` 里那两趟全样本积分 | 大规模扫描可临时 `CTPWA_WR_NO_INTEGRALS=1`；日志有 `[writeResult] phsp 原始积分矩阵完成: ... ms` |
+
+---
+
+## 11. 干涉与幅度控制三参数
+
+本节讲 `--amp-lambda` / `--amp-max` / `--vmax` 这三个“幅度控制”参数，以及**如何按预期的干涉强度
+反推 `--amp-lambda`**。三者都只影响**优化路径**，不改变报告的 NLL / Hessian / FF 的定义。
+
+### 11.1 问题：干涉简并方向
+
+同一个共振态可以有多条 LS 波。若两条波相位差 π，它们会**互相抵消**：总强度 `|Σ A_i v_i|²` 几乎
+不变，但各自幅度可以任意放大 —— 这条方向的 NLL **近乎平坦**。后果：
+
+- 拟合会沿该方向“漂移”，把 `|v|` 推到软墙帽（`--amp-max`）附近；
+- 表达干涉靠“两个大数相减”，数值精度差、误差估计不稳；
+- 不同起点落到这条平坦方向的不同位置 → best-of-N 的 NLL 看着差不多，但参数/FF 会发散。
+
+```
+抵消前:  |1|² = 1
+抵消后:  |1 + a·e^{iπ}|² = (1−a)² ，但 Σ|v_i|² = 1 + a² 随 a 一起变大
+```
+
+### 11.2 三个参数的分工
+
+| 参数 | 层级 | 数学形式 | 标度（单位） | 生效优化器 | 默认 |
+|---|---|---|---|---|---|
+| `--vmax` | **硬**盒约束 | `\|v\| ≤ vmax`（KKT / 活跃集；不做 clamp） | 直接是耦合幅度 | `projected` / `lbfgs` | `10000` |
+| `--amp-max` | **软**墙 | `amp = amp_max·sigmoid(u)`，逼近上限时 `damp/du → 0` 自限幅；polish 阶段另按 `amp_max` 做硬帽 | 极坐标幅度 | `reparam` | `1000` |
+| `--amp-lambda` | **罚项**（弱先验） | `loss = NLL + λ·Σ_{i≥1}\|v_i\|²`（参考波 `idx0` 不计） | 等价高斯先验 `σ = 1/√(2λ)`，以参考波 `\|v_0\| = 1` 为单位 | `reparam` | **`0`（关闭）** |
+
+要点：
+
+- **互斥**：`reparam` 下 `--vmax` 不生效；`projected` / `lbfgs` 下 `--amp-max` 不生效
+  （内部 `amp_cap = amp_max if reparam else v_max`）。
+- **只进优化 loss**：`λ` 这一项不进 `nll_history`、不进报告 NLL、不进 Hessian —— 它像一个弱先验，
+  改变的是**落点**，不是物理量的定义。
+- `λ` 与“先验尺度”的换算（`σ = 1/√(2λ)`，相对参考波 `|v_0| = 1`）：
+
+  | `λ` | `1e-4` | `1e-3` | `1e-2` | `1e-1` | `1` |
+  |---|---|---|---|---|---|
+  | `σ` | 70.7 | 22.4 | 7.07 | 2.24 | 0.71 |
+
+- 启动 dump 会打印 `lambda=0(off)` 或 `lambda=0.001`，便于确认本作业到底开没开。
+
+### 11.3 由预期干涉强度反推 `--amp-lambda`
+
+#### Step 1：量出“干涉深度” `d`
+
+```
+D = Σ_i ∫|A_i|²          （对角和）
+T = ∫|Σ_i A_i|²          （总强度，含干涉）
+d = 1 − T/D              （d = 0 无干涉；d → 1 完全抵消）
+```
+
+**两种取法**（⚠ 不能用 `--cal-ff` 输出的那个 FF 列表：它的分母就是 `D`，恒 `Σ FF = 1`，读不出 `d`；
+要用**按相干总额归一**的矩阵，见 §10.4）：
+
+| 来源 | 公式 |
+|---|---|
+| tf-pwa 输出 | `d = 1 − sum_diag`（`sum_diag = Σ_i FF_i`，那边 FF 用相干分母） |
+| 本仓 `weight_best.root` 的 `interference_gen` | `d = 1 − 1/Σ_i diag_i`，见下面的片段 |
+
+```python
+import uproot, numpy as np
+m = uproot.open("weight_best.root")["interference_gen"]   # 0.3.22+；旧版叫 "interference"
+M = np.asarray(m.member("fElements"), dtype=float).reshape(
+    m.member("fNrows"), m.member("fNcols"))
+D, T = float(np.trace(M)), float(M.sum())     # T ≡ 1（已按相干总额归一）
+d = 1.0 - T / D                               # 等价于 1 − 1/ΣF
+# 自检：T == 1（ΣF + ΣI = 1，见 §10.4）
+```
+
+> 该矩阵口径（0.3.22 起）：`M_ii = Σw|A_i|²/W`、`M_ij = Σw·2Re(A_iA_j*)/W`，
+> `W = Σ_i M_ii + Σ_{i<j} M_ij`，因此 `Σ_i M_ii + Σ_{i<j} M_ij = 1`。
+> ⚠ 这与 `getFitFractions` 内部用的 `scattering` 矩阵（**对角含因子 2**）**不是**同一套，别混用。
+> 另外 0.3.21 及以前那个 `interference` 矩阵（`T` 归一、对角 `∫|A_i|²/T`）在 0.3.22 **已不再写**；
+> 旧脚本读 `["interference"]` 会 KeyError，改成 `interference_gen`（产生侧）或 `interference_rec`
+> （重建侧，带效率）即可，定义相同、只是按样本拆开。
+
+#### Step 2：反解“需要的伙伴幅度” `a`
+
+2 波模型（参考 `v_0 = 1` + 伙伴 `a`、相位差 π）可严格求解：
+
+```
+d = 2a / (1 + a²)        ⇒        a(d) = (1 − √(1 − d²)) / d
+```
+
+- 若干涉由 `m` 对平摊：每对取 `d_i = d/m`，再算 `a = a(d/m)`；
+- 若物理上本来就需要较大的 `|v|`（窄共振、相空间压低等），取
+  `a_need = max( a(d), max_i|v_i| )`，后者从一次 `λ = 0` 拟合的 `parameters.txt` 里读。
+
+#### Step 3：定 `λ`
+
+```
+弱先验判据（推荐）：  λ ≤ 1 / (2·k²·a_need²)              k = 5（推荐）/ 3（中等）/ 1（明显压低）
+严格判据（有误差时）：λ ≤ ε·H_flat / 2 = ε / (2·σ_flat²)   ε = 允许的相对偏移（如 0.1）
+```
+
+第二式的来历：罚项把该方向的最小点按 `H/(H + 2λ)` 收缩（`H` 为该方向的 NLL 曲率），相对偏移
+`≈ 2λ/H`；而 `H` 与参数误差满足 `σ_flat = 1/√H`。
+
+代入 `a(d)`（单对，取 `k = 5` 与 `k = 1` 两档）：
+
+| 干涉深度 `d` | 0.05 | 0.10 | 0.30 | 0.50 | 0.70 | 0.90 | 0.95 | 0.99 |
+|---|---|---|---|---|---|---|---|---|
+| 需要幅度 `a` | 0.025 | 0.050 | 0.154 | 0.268 | 0.408 | 0.627 | 0.724 | 0.868 |
+| `λ_max`（`k=5`，弱先验） | 88.8 | 22.1 | 2.36 | 0.279 | 0.120 | 5.1e-2 | 3.8e-2 | 2.7e-2 |
+| `λ_max`（`k=1`，明显压低） | 799 | 199 | 21.2 | 6.96 | 3.00 | 1.27 | 0.95 | 0.66 |
+
+多对平摊时（总深度 `d = 0.9`）：`m=1 → λ_max ≈ 5.1e-2`、`m=2 → 0.35`、`m=4 → 1.5`、`m=8 → 6.3`。
+
+**这张表最重要的结论**：对任何现实干涉深度（`d = 0.1–0.95`），“先验不咬人”的上限是
+`λ ≲ 3e-2 ~ 2e1`；而实用区间 `λ = 1e-4 … 1e-3` 比它小 1–5 个数量级。所以
+
+- **默认关掉（`λ = 0`）与原来的 `1e-4` 在物理上几乎没有差别**，`1e-4` 原本只起“防跑飞”；
+- 反过来，`λ ≳ 3e-2` 才真正开始压缩干涉 —— 想主动压干涉时才用这个量级。
+
+### 11.4 推荐流程
+
+1. **默认 `λ = 0` 直接跑**（当前默认已如此）；
+2. 看 `parameters.txt` 里各 `|v_i|` 有没有贴 `--amp-max`：贴了说明在沿简并方向漂移；
+3. 需要保险丝时按 §11.3 的表取 `λ`（一般 `1e-4` 或 `1e-3` 就够，且不改变结论）；
+4. 想**主动**压掉“两波抵消”的虚假解 → 用 `k = 1` 档（`λ ~ 1e-2`）并把 `--amp-max` 调小，
+   再用多起点 best-of-N 交叉检查；
+5. 无论开不开，`--amp-max` 都要确认大于该分析真实的最大 `|A|`。
+
+### 11.5 默认值变更与复现
+
+> **2026-11-12 起 `--amp-lambda` 默认 `0`（原 `1e-4`）。**
+> 复现旧结果（用 `1e-4` 跑出来的）需显式 `--amp-lambda 1e-4` 或 `FIT_AMP_LAMBDA=1e-4`。
+> 因为 `λ` 只影响落点，两者 NLL 差异通常远小于多起点的散布；但若要与历史逐位对齐，请显式指定。
+
+---
