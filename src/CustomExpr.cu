@@ -1002,7 +1002,7 @@ __device__ void evalCustomSeg(
     double md1, double md2,
     double p1p, double p1e, double p1costheta, double p1phi,
     double p2p, double p2e, double p2costheta, double p2phi,
-    const double* params, double* out)
+    const double* params, double* out, const double* lifts)
 {
     // 栈式复数求值
     constexpr int kStack = 32;
@@ -1046,6 +1046,12 @@ __device__ void evalCustomSeg(
                     case CVAR_P2E: v = p2e; break;
                     case CVAR_P2COSTHETA: v = p2costheta; break;
                     case CVAR_P2PHI: v = p2phi; break;
+                    default:
+                        // 缩并提升量：100+k → lifts[k]（未提供时 0，旧 aux 不受影响）
+                        if ((int)a0 >= CVAR_LIFT_BASE &&
+                            (int)a0 < CVAR_LIFT_BASE + CVAR_LIFT_MAX && lifts)
+                            v = lifts[(int)a0 - CVAR_LIFT_BASE];
+                        break;
                 }
                 push(v, 0.0); break;
             }
@@ -1220,6 +1226,7 @@ __device__ void evalCustomSeg(
     else { out[0] = 0; out[1] = 0; }
 }
 
+template <bool Want2nd>
 __device__ void evalCustomAll(
     const double* aux, int aux_offset,
     double m, double q, double q0, int L, double d,
@@ -1230,37 +1237,87 @@ __device__ void evalCustomAll(
     double& Fr, double& Fi,
     double* dFr, double* dFi,
     double* d2Fr, double* d2Fi,
-    bool compute_2nd)
+    bool compute_2nd, const double* lifts)
 {
-    int seg_off = aux_offset + 2;
+    // 提升量（缩并）区：先算一次，结果给所有段共享
+    double liftv[CVAR_LIFT_MAX];
+    for (int i = 0; i < CVAR_LIFT_MAX; ++i) liftv[i] = 0.0;
+    int n_liftv = 0;
+    {
+        const double* base = aux + aux_offset;
+        if (base[2] == AUX_MAGIC_LIFT) {
+            int n_lift = (int)base[3];
+            int off = 4;
+            int slot = 0;                       // 槽位按"声明的段数"累加，与是否求值无关
+            for (int i = 0; i < n_lift; ++i) {
+                int nl = (int)base[off];
+                int ng = (int)base[off + 1];
+                off += 2;
+                // 梯度路径只求前 ng 段；其余段跳过（槽保持 0），但游标照走
+                int need = (Want2nd && compute_2nd) ? nl : (ng < nl ? ng : nl);
+                for (int sg = 0; sg < nl; ++sg) {
+                    int ni = (int)base[off];
+                    if (sg < need && slot + sg < CVAR_LIFT_MAX) {
+                        double lo[2] = {0.0, 0.0};
+                        // 提升量之间有依赖（γ 的公式里引用了 B 的槽），必须把
+                        // 已经算好的 liftv 传进去，否则后算的会读到 0
+                        evalCustomSeg(base + off + 1, ni, m, q, q0, L, d, md1, md2,
+                                      p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi,
+                                      params, lo, liftv);
+                        liftv[slot + sg] = lo[0];
+                    }
+                    off += 1 + 3 * ni;
+                }
+                slot += nl;
+            }
+            n_liftv = slot < CVAR_LIFT_MAX ? slot : CVAR_LIFT_MAX;
+        }
+    }
+    int seg_off = aux_offset + auxSegBase(aux + aux_offset);
     double out[2];
     // 值段
     int n_instr = (int)aux[seg_off];
     evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, md1, md2,
-                  p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi, params, out);
+                  p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi, params, out,
+                      n_liftv ? liftv : lifts);
     Fr = out[0]; Fi = out[1];
     seg_off += 1 + 3 * n_instr;
     // 一阶段
     for (int j = 0; j < P; ++j) {
         n_instr = (int)aux[seg_off];
         evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, md1, md2,
-                      p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi, params, out);
+                      p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi, params, out,
+                      n_liftv ? liftv : lifts);
         dFr[j] = out[0]; dFi[j] = out[1];
         seg_off += 1 + 3 * n_instr;
     }
     // 二阶段（段序 j≤k，对称填充）
+    if constexpr (Want2nd)
     if (compute_2nd)
     for (int j = 0; j < P; ++j)
         for (int k = j; k < P; ++k) {
             n_instr = (int)aux[seg_off];
             evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, md1, md2,
-                          p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi, params, out);
+                          p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi, params, out,
+                      n_liftv ? liftv : lifts);
             d2Fr[j * P + k] = out[0]; d2Fi[j * P + k] = out[1];
             d2Fr[k * P + j] = out[0]; d2Fi[k * P + j] = out[1];
             seg_off += 1 + 3 * n_instr;
         }
 }
 
+
+// 显式实例化：AmpGen 的振幅 kernel 只用 <false>，Hessian/其它保持 <true>
+template __device__ void evalCustomAll<true>(
+    const double*, int, double, double, double, int, double, double, double,
+    double, double, double, double, double, double, double, double,
+    const double*, int, double&, double&, double*, double*,
+    double*, double*, bool, const double*);
+template __device__ void evalCustomAll<false>(
+    const double*, int, double, double, double, int, double, double, double,
+    double, double, double, double, double, double, double, double,
+    const double*, int, double&, double&, double*, double*,
+    double*, double*, bool, const double*);
 
 // ============================================================================
 // host 编译入口
@@ -1296,6 +1353,8 @@ std::vector<double> compileCustomExpr(
     std::vector<double> aux;
     aux.push_back((double)P);
     aux.push_back((double)segs.size());
+    aux.push_back(AUX_MAGIC_LIFT);   // 新格式哨兵
+    aux.push_back(0.0);              // n_lift（缩并层暂未生成）
     for (const auto& seg_tree : segs) {
         std::vector<double> seg;
         compileNode(seg_tree, seg);

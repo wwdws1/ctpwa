@@ -7,6 +7,7 @@ import sys
 import csv
 import argparse
 import logging
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Optional, TypedDict
@@ -104,6 +105,14 @@ _RES_NOISE_FRAC = 0.1  # 共振态初值噪声幅度（占 free_range 区间的�
 #   DIAG    → log.info：内部诊断（pLBFGS/polish 的迭代与统计）
 #   VERBOSE → log.info/debug：仅在 --opt-verbose / FIT_OPT_PROF / -vv 等开关下输出
 #   WARN/ERR→ log.warning/error
+
+
+def _result_sort_key(res, prefer_pd=False):
+    """结果排序：polish-all 可先做物理有效性筛选，再比较 NLL。"""
+    nll = float(res["final_nll"])
+    if prefer_pd:
+        return (0 if bool(res.get("is_positive_definite", False)) else 1, nll)
+    return (nll,)
 
 
 # ============================================================
@@ -2396,6 +2405,8 @@ class UnifiedPWAOptimizer:
     def compute_fit_fractions(self, params=None):
         """拟合分数 (fit fractions): FF_i = ∫|A_i|² / Σ_j ∫|A_j|²。
         只用 phsp_truth（无效率 MC）→ 与效率/归一化无关，跨实验可比。
+        配了 phsp_truth_weights 时改为 Σw|A_i|²（带模型产生的 truth 样本
+        用 w∝1/|M_gen|² 重加权即可当平坦 PHSP MC）。
         误差传播用拟合同源的统一 Hessian（缓存命中直接复用）。"""
         if params is None:
             if self.best_params is None:
@@ -2426,9 +2437,10 @@ class UnifiedPWAOptimizer:
 
     # --------------------------------------------------------
     def compute_efficiency(self, params=None):
-        """分波效率: ε_i = (Σ_{phsp}|A_i|²/N_phsp) / (Σ_{phsp_truth}|A_i|²/N_truth)。
+        """分波效率: ε_i = (Σ_{phsp}w|A_i|²/Σw) / (Σ_{phsp_truth}w|A_i|²/Σw)。
         phsp(如 cut 后 MC)=带效率样本, phsp_truth=无效率 MC truth,
         即分波加权的探测/选择效率 ∫|A_i|²ε(x)dΦ / ∫|A_i|²dΦ (tf-pwa get_efficiency 语义)。
+        权重来自 phsp_weights / phsp_truth_weights（缺省 w≡1）。
         效率依赖拟合结果(振幅形状含共振参数), 用拟合后 params 计算。
         误差 = 参数误差(拟合同源 Hessian) ⊕ MC 统计误差(tf-pwa add_int_error 同款)。
         配置缺 phsp 或 phsp_truth 时返回空张量 [0,2] → 这里自然跳过。"""
@@ -2660,7 +2672,14 @@ class UnifiedPWAOptimizer:
             if event_data is None:
                 event_data = os.environ.get("FIT_EVENT_DATA", "0") == "1"
             flag = 1 if event_data else 0
-            self.analysis.writeResult(params, filename, flag, waves)
+            # 顺带写参数误差矩阵（interference_rec_err / interference_gen_err）：
+            # 优先用缓存/已算过的统一 Hessian；拿不到就让 writeResult 自己算。
+            hess = None
+            try:
+                hess = self._get_hessian_cached(params)
+            except Exception as e:
+                log.warning(f"Hessian 不可用，跳过矩阵误差: {e}")
+            self.analysis.writeResult(params, filename, flag, waves, hess)
             if waves:
                 print(
                     f"权重文件已保存: {filename} (waves 子集: {waves}, "
@@ -2929,7 +2948,10 @@ class UnifiedPWAOptimizer:
             log.warning("没有结果!")
             return
 
-        sorted_results = sorted(self.all_results, key=lambda x: x["final_nll"])
+        prefer_pd = bool(getattr(self, "prefer_pd", False))
+        sorted_results = sorted(
+            self.all_results, key=lambda x: _result_sort_key(x, prefer_pd)
+        )
         os.makedirs(output_dir, exist_ok=True)
         summary_file = os.path.join(output_dir, "optimization_summary.txt")
         with open(summary_file, "w") as f:
@@ -2962,18 +2984,27 @@ class UnifiedPWAOptimizer:
             f.write("\n")
 
             f.write("=" * 100 + "\n")
-            f.write("运行结果 (按NLL排序):\n")
+            f.write(
+                "运行结果 (正定优先，再按NLL排序):\n"
+                if prefer_pd
+                else "运行结果 (按NLL排序):\n"
+            )
             f.write("=" * 100 + "\n")
+            show_polish = any(
+                r.get("polish_attempted", False) for r in self.all_results
+            )
             f.write(
                 f"{'排名':<4} {'运行ID':<6} {'NLL':<12} {'迭代':<8} "
                 f"{'eval数':<8} {'n_iter':<7} "
                 f"{'耗时':<10} {'Hessian耗时':<12} {'正定(可行)':<10} {'贴边':<6} "
-                f"{'误差模式':<12} {'平坦维':<6} {'优化器状态':<20}\n"
+                f"{'误差模式':<12} {'平坦维':<6} {'优化器状态':<20}"
+                + (f" {'polish':<10} {'polishΔNLL':<14}" if show_polish else "")
+                + "\n"
             )
-            f.write("-" * 130 + "\n")
+            f.write("-" * (144 if show_polish else 130) + "\n")
 
             for rank, res in enumerate(sorted_results):
-                f.write(
+                line = (
                     f"{rank + 1:<4} {res['run_id']:<6} {res['final_nll']:<12.6f} "
                     f"{res['iterations']:<8} "
                     f"{res.get('evals', res['iterations']):<8} "
@@ -2984,8 +3015,14 @@ class UnifiedPWAOptimizer:
                     f"{str(res.get('n_active', '-')):<6} "
                     f"{str(res.get('err_mode_used', '-')):<12} "
                     f"{str(res.get('n_flat_dirs', '-')):<6} "
-                    f"{res.get('optimizer_status', '-'):<20}\n"
+                    f"{res.get('optimizer_status', '-'):<20}"
                 )
+                if show_polish:
+                    line += (
+                        f" {res.get('polish_status', '-'):<10} "
+                        f"{res.get('polish_trial_delta_nll', float('nan')):<14.3e}"
+                    )
+                f.write(line + "\n")
 
             if fit_values is not None:
                 f.write("=" * 100 + "\n")
@@ -3104,7 +3141,7 @@ def build_parser():
   FIT_RUNS, FIT_NITER, FIT_LR, FIT_TOL_GRAD, FIT_TOL_CHANGE,
   FIT_HISTORY_SIZE, FIT_VMAX, FIT_PROJECT, FIT_WAVES, FIT_EVENT_DATA,
   FIT_WARM, FIT_POLISH, FIT_CHECKPOINT_INTERVAL,
-  FIT_OPTIMIZER, FIT_AMP_MAX, FIT_AMP_LAMBDA, FIT_OPT_VERBOSE
+  FIT_OPTIMIZER, FIT_AMP_MAX, FIT_AMP_LAMBDA, FIT_OPT_VERBOSE, FIT_POLISH_ALL
 
 示例:
   # 快速扫描（早期调试）
@@ -3112,6 +3149,9 @@ def build_parser():
 
   # 正式拟合
   python fit.py --runs 10 --niter 500
+
+  # 多起点 + 每个 run 分别做 damped-Newton polish
+  python fit.py --runs 20 --niter 500 --polish-all
 
   # warm start 继续优化
   python fit.py --runs 5 --niter 1000 --warm-start results/best_params.pt
@@ -3363,6 +3403,14 @@ def build_parser():
     g_polish.add_argument(
         "--no-polish", dest="polish", action="store_false", help="关闭抛光"
     )
+    p.add_argument(
+        "--polish-all",
+        action="store_true",
+        default=None,
+        help="对所有 run 分别执行 damped-Newton polish；最终 best 与汇总按 "
+        "正定优先、NLL 次之排序；保存逐 run 精确参数和 polish_history.json "
+        "(env: FIT_POLISH_ALL=1)",
+    )
 
     # --- 权重文件选项 ---
     p.add_argument(
@@ -3433,6 +3481,7 @@ class FitConfig(Mapping):
     bound_margin: float
     rank_scale: str
     polish: bool
+    polish_all: bool
     warm_start_path: Optional[str]
     waves: list
     event_data: bool
@@ -3558,6 +3607,11 @@ def resolve_args(args):
         cfg["polish"] = args.polish
     else:
         cfg["polish"] = _env_bool("FIT_POLISH", True)
+    cfg["polish_all"] = (
+        bool(args.polish_all)
+        if args.polish_all is not None
+        else _env_bool("FIT_POLISH_ALL", False)
+    )
 
     # warm start
     if args.warm_start is not None:
@@ -3781,7 +3835,7 @@ def main():
             f"line_search=strong_wolfe"
         )
     print(f"  err_mode={cfg['err_mode']}, err_tau={cfg['err_tau']:.1e}")
-    print(f"  polish={cfg['polish']}")
+    print(f"  polish={cfg['polish']}, polish_all={cfg['polish_all']}")
     print(f"  warm_start={cfg['warm_start_path']}")
     print(f"  waves={cfg['waves'] if cfg['waves'] else '(all)'}")
     print(f"  event_data={cfg['event_data']}")
@@ -3843,6 +3897,8 @@ def main():
     optimizer.bound_margin = cfg["bound_margin"]
     optimizer.rank_scale = cfg["rank_scale"]
     optimizer.fit_mode = _FIT_MODE
+    # 多起点 polish 的物理结果先筛正定，再比 NLL；单-best 历史模式仍纯 NLL。
+    optimizer.prefer_pd = bool(cfg["polish_all"])
 
     # ---- P4.4: Resume ----
     resume_from = None
@@ -3944,10 +4000,13 @@ def main():
             sys.exit(1)
 
         print(f"\n{'=' * 80}")
-        print("所有优化结果总结:")
+        print("所有优化结果总结（polish 前）:")
         print(f"{'=' * 80}")
 
-        sorted_results = sorted(optimizer.all_results, key=lambda x: x["final_nll"])
+        sorted_results = sorted(
+            optimizer.all_results,
+            key=lambda x: _result_sort_key(x, optimizer.prefer_pd),
+        )
         for i, res in enumerate(sorted_results):
             print(
                 f"运行 {res['run_id']:2d}: NLL = {res['final_nll']:12.6f}, "
@@ -3958,74 +4017,182 @@ def main():
                 f"优化器 = {res.get('optimizer_status', '-')}"
             )
 
-        print(f"\n{'=' * 80}")
-        print("最佳结果:")
-        print(f"{'=' * 80}")
-
         best_res = sorted_results[0]
+        print(
+            f"polish 前最佳NLL: {best_res['final_nll']:.6f} "
+            f"(来自第 {best_res['run_id']} 次运行)"
+        )
+
+        # ---- 精确 Hessian 抛光：默认只抛 best；--polish-all 逐 run 执行 ----
+        polish_records = []
+
+        def polish_one_result(res):
+            """抛光并就地更新一个 run；采纳规则与历史单-best 路径一致。"""
+            nll0 = float(res["final_nll"])
+            old_pd = bool(res["is_positive_definite"])
+            res["polish_attempted"] = True
+            res["polish_status"] = "running"
+            record = {
+                "run_id": int(res["run_id"]),
+                "before_nll": nll0,
+                "before_pd": old_pd,
+                "status": "running",
+            }
+            polish_records.append(record)
+            print(f"\n[polish] run {res['run_id']} 开始: NLL={nll0:.6f}, PD={old_pd}")
+            _tp0 = time.time()
+            try:
+                p2, nll2, pd2 = optimizer.polish_damped_newton(
+                    res["final_params"],
+                    max_steps=int(optimizer.optimizer_polish_steps),
+                )
+            except Exception as e:  # 一个 run 失败不应中断其它 run
+                res["polish_status"] = f"failed({type(e).__name__})"
+                record.update(status=res["polish_status"], error=str(e))
+                log.exception(f"run {res['run_id']} 抛光失败: {e}")
+                return
+            _t_polish = time.time() - _tp0
+            _ps = getattr(optimizer, "_polish_stats", {}) or {}
+            res["polish_time"] = _t_polish
+            res["polish_steps"] = int(_ps.get("steps", 0))
+            res["polish_trial_nll"] = float(nll2)
+            res["polish_trial_delta_nll"] = float(nll2 - nll0)
+            res["polish_trial_pd"] = bool(pd2)
+            record.update(
+                trial_nll=float(nll2),
+                trial_pd=bool(pd2),
+                trial_delta_nll=float(nll2 - nll0),
+                time_sec=_t_polish,
+                steps=int(_ps.get("steps", 0)),
+                hessian_calls=int(_ps.get("n_hess", 0)),
+                n_evals=int(_ps.get("n_evals", 0)),
+            )
+            print(
+                f"run {res['run_id']} 抛光耗时 = {_t_polish:.2f}s, "
+                f"steps = {_ps.get('steps', '?')}, "
+                f"Hessian 次数 = {_ps.get('n_hess', '?')}, "
+                f"polish 内求值 = {_ps.get('n_evals', '?')}"
+            )
+
+            # NLL 变差不超过 1e-6 仍可采纳；若从不定变为正定，也按历史规则采纳，
+            # 以便给出可行子空间误差。非有限 NLL 一律不采纳。
+            accept = bool(
+                np.isfinite(nll2) and (nll2 <= nll0 + 1e-6 or (pd2 and not old_pd))
+            )
+            res["polish_accepted"] = accept
+            if accept:
+                print(
+                    f"run {res['run_id']} 抛光: NLL {nll0:.6f} → {nll2:.6f} "
+                    f"(Δ={nll2 - nll0:+.3e}), 可行子空间正定 {old_pd} → {pd2}"
+                )
+                res["final_params"] = p2.clone()
+                res["final_nll"] = float(nll2)
+                # 抛光终点的 Hessian 已在 polish 内算过（缓存命中），重算子空间字段。
+                try:
+                    H2 = optimizer._get_hessian_cached(p2)
+                    rep2, _, _ = optimizer._hessian_diagnosis(p2, H2)
+                    res.update(optimizer._hessian_fields(rep2))
+                except Exception as _e:  # noqa: BLE001
+                    log.warning(
+                        f"run {res['run_id']} 抛光后 Hessian 子空间诊断失败: {_e}"
+                    )
+                    res["is_positive_definite"] = bool(pd2)
+            else:
+                print(
+                    f"run {res['run_id']} 抛光点不采纳: NLL {nll0:.6f} → {nll2:.6f}, "
+                    f"PD {old_pd} → {pd2}"
+                )
+
+            # 无论是否采纳，都在**最终点**重算误差（可行子空间判据 + 非正定回退 auto/
+            # 截断/pinv/psd），并把子空间字段同步回该 run —— 摘要/CSV 与最终参数一致。
+            (
+                res["coupling_real_errors"],
+                res["coupling_imag_errors"],
+                res["res_errors"],
+                res["_err_full"],
+            ) = optimizer.compute_param_errors(res["final_params"])
+            res.update(optimizer._err_fields(res["_err_full"]))
+            res["polish_status"] = "ok" if accept else "rejected"
+            record["accepted"] = accept
+            record["status"] = res["polish_status"]
+            record["final_nll"] = float(res["final_nll"])
+            record["final_pd"] = bool(res["is_positive_definite"])
+
+        for res in optimizer.all_results:
+            res.setdefault("polish_status", "disabled")
+        if cfg["polish_all"] and not cfg["polish"]:
+            log.warning("--polish-all 已指定，但总开关为 --no-polish；不执行任何抛光")
+        if cfg["polish"]:
+            polish_targets = (
+                sorted(optimizer.all_results, key=lambda r: r["run_id"])
+                if cfg["polish_all"]
+                else [best_res]
+            )
+            for res in polish_targets:
+                polish_one_result(res)
+            print(f"polish 状态 = {best_res.get('polish_status')}")
+
+        # polish 后重新选 best：--polish-all 时正定优先、NLL 次之；
+        # 因而非原 best 的 run 也可能成为最佳，且奇异的低 NLL 点不会压过正定解。
+        sorted_results = sorted(
+            optimizer.all_results,
+            key=lambda x: _result_sort_key(x, optimizer.prefer_pd),
+        )
+        best_res = sorted_results[0]
+        optimizer.best_result = best_res
+        optimizer.best_params = best_res["final_params"].clone()
+        optimizer.best_nll = float(best_res["final_nll"])
+        torch.save(
+            best_res["final_params"].cpu(),
+            os.path.join(output_dir, "best_params.pt"),
+        )
+
+        if polish_records:
+            with open(os.path.join(output_dir, "polish_history.json"), "w") as f:
+                json.dump(polish_records, f, ensure_ascii=False, indent=2)
+
+        if cfg["polish_all"] and cfg["polish"]:
+            # 保存每个 run 的完整双精度最终参数，避免 parameters.txt 的 8 位小数
+            # 在 I_bkg≈0 的奇异点改变 NLL/Hessian。
+            all_params_dir = os.path.join(output_dir, "all_params")
+            os.makedirs(all_params_dir, exist_ok=True)
+            params_base = os.path.join(output_dir, "parameters")
+            for res in sorted(optimizer.all_results, key=lambda r: r["run_id"]):
+                rid = int(res["run_id"])
+                torch.save(
+                    res["final_params"].cpu(),
+                    os.path.join(all_params_dir, f"run_{rid:02d}.pt"),
+                )
+                # run 0 重写表头，其余按 run_id 顺序追加，保证文本表与最终点一致。
+                optimizer.save_parameters(
+                    res["final_params"],
+                    res["coupling_real_errors"],
+                    res["coupling_imag_errors"],
+                    res["res_errors"],
+                    rid,
+                    params_base,
+                )
+            torch.save(
+                {
+                    "start_run": max(int(r["run_id"]) for r in optimizer.all_results)
+                    + 1,
+                    "best_nll": optimizer.best_nll,
+                    "best_params": optimizer.best_params.cpu(),
+                    "all_nlls": [r["final_nll"] for r in optimizer.all_results],
+                },
+                os.path.join(output_dir, "checkpoint.pt"),
+            )
+
+        print(f"\n{'=' * 80}")
+        print(
+            "最佳结果（polish 后；正定优先）:"
+            if optimizer.prefer_pd
+            else "最佳结果（polish 后）:"
+        )
+        print(f"{'=' * 80}")
         print(
             f"最佳NLL: {best_res['final_nll']:.6f} (来自第 {best_res['run_id']} 次运行)"
         )
-
-        # ---- 精确 Hessian 抛光 ----
-        best_res.setdefault("polish_status", "disabled")
-        if cfg["polish"]:
-            best_res["polish_status"] = "running"
-            try:
-                _tp0 = time.time()
-                p2, nll2, pd2 = optimizer.polish_damped_newton(
-                    best_res["final_params"],
-                    max_steps=int(optimizer.optimizer_polish_steps),
-                )
-                _t_polish = time.time() - _tp0
-                _ps = getattr(optimizer, "_polish_stats", {}) or {}
-                print(
-                    f"抛光耗时 = {_t_polish:.2f}s, steps = {_ps.get('steps', '?')}, "
-                    f"Hessian 次数 = {_ps.get('n_hess', '?')}, "
-                    f"polish 内求值 = {_ps.get('n_evals', '?')}"
-                )
-                _old_pd = bool(best_res["is_positive_definite"])
-                # 抛光即使 NLL 只变化 1e-6 量级，只要"贴边活跃"处理对，正定判据
-                # 就该更新（旧代码只在 nll2 严格更小时才采纳，会把一个可行子空间
-                # 正定的抛光点丢掉、误差仍然是空的）。
-                if nll2 <= best_res["final_nll"] + 1e-6 or (pd2 and not _old_pd):
-                    if nll2 > best_res["final_nll"]:
-                        print(
-                            f"抛光: NLL {best_res['final_nll']:.6f} → {nll2:.6f} "
-                            f"(Δ=+{nll2 - best_res['final_nll']:.2e})，"
-                            f"但可行子空间正定 {_old_pd} → {pd2}；采纳抛光点以便报误差"
-                        )
-                    else:
-                        print(
-                            f"抛光: NLL {best_res['final_nll']:.6f} → {nll2:.6f} "
-                            f"(Δ={nll2 - best_res['final_nll']:.3f}), "
-                            f"可行子空间正定={pd2}"
-                        )
-                    best_res["final_params"] = p2.clone()
-                    best_res["final_nll"] = nll2
-                    # 同步优化器内部状态：否则摘要里的"最佳共振态参数"表仍然打印
-                    # polish *之前* 的 self.best_params，与同一张表的 NLL/正定列不一致
-                    optimizer.best_params = p2.clone()
-                    optimizer.best_nll = nll2
-                    optimizer.best_result = best_res
-                    torch.save(p2.cpu(), os.path.join(output_dir, "best_params.pt"))
-                # 无论是否采纳抛光点，都在**最终点**重算误差（可行子空间判据 +
-                # 非正定回退 auto/截断/pinv/psd），并把子空间字段同步回 best_res
-                # —— 摘要/CSV 与最终参数始终一致。
-                (
-                    best_res["coupling_real_errors"],
-                    best_res["coupling_imag_errors"],
-                    best_res["res_errors"],
-                    best_res["_err_full"],
-                ) = optimizer.compute_param_errors(best_res["final_params"])
-                best_res.update(optimizer._err_fields(best_res["_err_full"]))
-                best_res["polish_status"] = "ok"
-            except Exception as e:
-                # 不要静默：打印完整 traceback，并在状态里标注失败（宽 except
-                # 曾把 polish 的 TypeError 吞成"抛光失败"却无人察觉）
-                best_res["polish_status"] = f"failed({type(e).__name__})"
-                log.exception(f"抛光失败: {e}")
-        print(f"polish 状态 = {best_res.get('polish_status')}")
 
     # ---- 参数削减: 有效秩降维 + 降维重拟合 (--reduce-params) ----
     if cfg["reduce_params"]:

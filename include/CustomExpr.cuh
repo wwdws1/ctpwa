@@ -40,8 +40,13 @@ enum CustomVarId : int {
     CVAR_P1P = 7,        CVAR_P1E = 8,        // |p1|, E1
     CVAR_P1COSTHETA = 9, CVAR_P1PHI = 10,     // cosθ1, φ1
     CVAR_P2P = 11,       CVAR_P2E = 12,       // |p2|, E2
-    CVAR_P2COSTHETA = 13,CVAR_P2PHI = 14      // cosθ2, φ2
+    CVAR_P2COSTHETA = 13,CVAR_P2PHI = 14,     // cosθ2, φ2
+    // 缩并"提升量"槽位：100 + k（k < 64）。值由调用方在解释某节点之前算好
+    // （每个提升量贡献 V、∂V/∂p … 若干个数），经 evalCustomSeg 的 lifts 形参
+    // 传入；未提供时按 0 处理（旧 aux 不会引用这些 id，行为不变）。
+    CVAR_LIFT_BASE = 100
 };
+constexpr int CVAR_LIFT_MAX = 64;             // lifts[] 的最大长度
 
 // 函数 id
 enum CustomFuncId : int {
@@ -86,13 +91,42 @@ __device__ void evalCustomSeg(
     double md1, double md2,
     double p1p, double p1e, double p1costheta, double p1phi,
     double p2p, double p2e, double p2costheta, double p2phi,
-    const double* params, double* out);
+    const double* params, double* out,
+    const double* lifts = nullptr);
+
+// ---------------------------------------------------------------------------
+// aux 头格式
+//   旧: [P, n_seg, 段...]
+//   新: [P, n_seg, AUX_MAGIC_LIFT, n_lift, {n_seg_l, n_grad_l, 段...} × n_lift, 段...]
+//   n_grad_l = 梯度路径（compute_2nd=false）只用前多少段，避免白算二阶表
+// 提升量（缩并）段是若干"子 aux"，在解释某节点之前算一次，结果依次写进
+// lifts[0..]，节点的各段通过 CVAR_LIFT_BASE + 槽位读取。
+// 用 aux[2] 的负哨兵区分新旧格式 → 旧 aux 仍逐字段可读。
+// ---------------------------------------------------------------------------
+constexpr double AUX_MAGIC_LIFT = -2.0;
+
+// 节点段区的起始下标（跳过提升量区）
+__host__ __device__ inline int auxSegBase(const double* aux)
+{
+    if (aux[2] != AUX_MAGIC_LIFT) return 2;      // 旧格式
+    int n_lift = (int)aux[3];
+    int off = 4;
+    for (int i = 0; i < n_lift; ++i) {
+        int nl = (int)aux[off];
+        off += 2;                          // [n_seg, n_grad]
+        for (int s = 0; s < nl; ++s) {
+            int ni = (int)aux[off];
+            off += 1 + 3 * ni;
+        }
+    }
+    return off;
+}
 
 // 获取第 s 段在 aux 中的偏移（host 和 device 共用逻辑）
 __host__ __device__ inline int customSegOffset(const double* aux, int s)
 {
     int P = (int)aux[0];
-    int off = 2;
+    int off = auxSegBase(aux);
     int seg = 0;
     while (seg < s) {
         int n_instr = (int)aux[off];
@@ -105,6 +139,9 @@ __host__ __device__ inline int customSegOffset(const double* aux, int s)
 // 全段解释器（src/CustomExpr.cu）：值段 + P 个一阶段 + P(P+1)/2 个二阶段
 // 布局与 evalCustomSeg 相同；d2 按 j≤k 段序读取，对称填充 d2[k][j]=d2[j][k]
 // compute_2nd=false（梯度路径）时跳过二阶段，d2Fr/d2Fi 不写（调用方不得读）
+// Want2nd=false → constexpr 关掉二阶段：调用方不必为 d2 缓冲预留 local memory
+// （拟合主循环只读 F/dF；实测该 kernel 因此从 20 KB 栈降到 ~6 KB）
+template <bool Want2nd = true>
 __device__ void evalCustomAll(
     const double* aux, int aux_offset,
     double m, double q, double q0, int L, double d,
@@ -115,7 +152,8 @@ __device__ void evalCustomAll(
     double& Fr, double& Fi,
     double* dFr, double* dFi,
     double* d2Fr, double* d2Fi,
-    bool compute_2nd = true);
+    bool compute_2nd = true,
+    const double* lifts = nullptr);
 
 // host 端编译入口（src/CustomExpr.cu）
 // expr: 表达式字符串; params: 参数名列表
