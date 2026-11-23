@@ -8,7 +8,7 @@
 
 ⚠ 语义提醒
 -----------
-* 本脚本产出的是**平坦相空间**（GENBOD 内部用 `wt` 舍选，`u < wt`），**不等于**生产用的
+* 本脚本产出的是**平坦相空间**（GENBOD 内部用 `wt` 舍选，`u < wt`），**不等于**带效率的
   `phsp_truth`：后者是同一批探测器 MC 在 truth 级的版本，可能带 truth 级 fiducial 选择。
   用平坦 PS 去顶替它，会改变"效率"的定义（∫|A|²ε/∫|A|²）。
 * 若用于 closure（toy 真值是否 NLL 极小），样本量必须能**分辨最窄的共振**：
@@ -169,7 +169,7 @@ def build_parser():
         description="DIYMC P1：由 config 生成平坦 n 体相空间 MC（无需 GPU）",
         formatter_class=_HelpFormatter,
         epilog=(
-            "⚠ 产出的是平坦相空间，不等于生产 phsp_truth（见脚本头部说明）；"
+            "⚠ 产出的是平坦相空间，不等于带效率的 phsp_truth（见脚本头部说明）；"
             "用于 closure 时样本量需能分辨最窄共振（建议百万级）。"
         ),
     )

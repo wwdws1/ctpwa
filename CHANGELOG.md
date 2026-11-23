@@ -14,6 +14,19 @@
   `weight_best.root` 的 `interference_rec` / `interference_gen`）；
 - 引入上游 `example/read_interference.py`。
 
+### Changed（fork `wwdws1/ctpwa`：PR #31，文档补全 + 去生产化）
+
+- `example/README.md`：目录补齐 §12；§12 重写为 12.1–12.5（对象表 + 写入条件 + 口径公式 +
+  「三个份额」对照表 + 用法/参数 + 真实输出 + 常见问题）；修 §11.3 里读旧 `interference`
+  对象的过期片段（v0.3.22 起不再写 → `KeyError`）；§3.4/§4/§5/§6/§10.1 补 `--polish-all`、
+  `FIT_POLISH_ALL`、`polish_history.json`、`all_params/` 与新矩阵名。
+- 文档与脚本里不再出现具体生产分析名/目录/路径（改用"某一 3 体强子末态分析""带效率的
+  `phsp_truth`"等中性说法）。
+- `example/fit.py`：删掉 `polish_one_result` 中多余的 `optimizer._hessian_fields(rep2)` 调用
+  （本分支优化器无此方法，只产生一行运行时 warning；子空间字段由随后的
+  `compute_param_errors` + `_err_fields` 重算）。
+- `example/gen_phsp_mc.py`：文件头/`--help` 的 `phsp_truth` 对比改为中性表述。
+
 
 ## [v0.3.22] - 2026-11-22
 

@@ -52,11 +52,50 @@
   `integrals`），输出 `F_i ± σ`、n×n 表、闭合检验、非相干份额、平均/逐波效率，
   可选 `--bf-total` 折算分支比。
 
-### 未做（本轮）
+### 未动（本轮）
 
-- 生产目录 `jlsp/pwa/all/single/fit.py` **未同步**（等 `example/` 定稿后再定）。
 - `example/gen_phsp_mc.py`、`gen_toy_mc.py`、`.pre-commit-config.yaml` 为 fork 私有
   资产，保留不动（上游本次也未改动这三个文件）。
+
+### 第二轮（PR #31：文档补全 + 去生产化）
+
+#### `example/README.md`
+
+- 目录补齐 §12（含 12.1–12.5 五个子节）；开头简介补上 §11/§12，并说明 §10 已不是最后一章。
+- **§12 整节重写**（原来只有 5 段说明）：12.1 列出 `weight_best.root` 新增的 6 个对象
+  （`interference_rec` / `interference_gen` / `*_err` / `integrals` / `legends`）+ 各自写入条件，
+  并写明"矩阵维度 = **partial wave**（本 config 17×17），不是 `parameters.txt` 里的 42 个
+  SL 耦合"；12.2 给出矩阵口径公式与「三个份额」对照表（`F_i` / `I_ij` / `FF_i` / `ε̄` /
+  `ε_i` / `BF_i` / 原始积分）；12.3 用法 + 参数表 + 输出块顺序；12.4 **真实输出例子**
+  （1/10 样本、`--runs 4 --niter 500`）逐项解读；12.5 常见问题 6 条。
+- **修 §11.3 的过期片段**：旧文读 `weight_best.root["interference"]`，而 v0.3.22 起该对象
+  不再写（→ `KeyError`）；改为 `interference_gen`、`d = 1 − 1/ΣF`，并注明 rec/gen 与旧矩阵的关系。
+- §3.5 补第 4 条（默认只抛 best vs `--polish-all` 的取舍）；§4 Polish 表加 `--polish-all`；
+  §5 加 `FIT_POLISH_ALL`；§6 加 `polish_history.json`（默认 polish 就有）与 `all_params/`，
+  并把 `weight_best.root` 一行指向 §12；§10.1 输入直方图表把 `interference` 换成
+  `interference_rec` / `interference_gen`。
+- **去掉全部"生产环境"表述**（不再出现具体分析名/目录/路径）：§1 的遮蔽提醒、§3.4/§3.5 的
+  数据集说明、§8.2 的默认值说明、§9 的作业目录说明、§10.2 的 `phsp_truth` 对比。
+
+#### `example/fit.py`
+
+- 删掉 `polish_one_result` 里多余的 `optimizer._hessian_fields(rep2)`：本分支的优化器没有
+  这个方法（上游 API 名不同），运行时只会打一行"抛光后 Hessian 子空间诊断失败"warning；
+  子空间字段本来就由随后的 `compute_param_errors` + `_err_fields` 在**最终点**重算。
+  删后 warning 消失，`pytest example/tests -q` → 55 passed。
+
+#### `example/gen_phsp_mc.py`
+
+- 文件头与 `--help` epilog：「不等于生产 `phsp_truth`」→「不等于带效率的 `phsp_truth`」。
+
+#### 验证（本轮）
+
+- `--runs 4 --niter 500 --seed 42`（1/10 样本、1×V100）：8:51、峰值 1.7 GB；polish 前
+  −5767.089 → polish 后 **−5851.279**；`weight_best.root` 闭合 `ΣF+ΣI = 1.000000`、
+  `ΣF = 2.129`、`ε̄ = 1.003`；`*_err` 因 Hessian 非正定未写（符合预期）。
+- `--runs 2 --niter 100 --polish-all`：两条记录都 accepted；`all_params/run_XX.pt`、
+  `polish_history.json`、`checkpoint.pt`（`start_run=2`）、`best_params.pt`（= best run 逐位相同）、
+  摘要表 `polish`/`polishΔNLL` 两列均正常；无 `Traceback`/`ERROR`。
 
 ## 2026-11-12
 
@@ -165,7 +204,7 @@
      的**解析结果**（绝对路径 + 是否存在；缺失标 `← 不存在!`）；只做文本粗读，不做 YAML 解析。
   - **行为变化**：`--output-dir`/`--warm-start`/`--resume` 由「相对 config 目录」（反直觉、会把
     结果写到 config 目录下）改为「相对调用目录」；`data/phsp/bkg` 的相对路径由「相对启动目录」
-    改为「相对 config 目录」（与 `phsp_truth` 一致）。**cwd == config 目录时（生产作业的用法）
+    改为「相对 config 目录」（与 `phsp_truth` 一致）。**cwd == config 目录时（最常见用法）
     全部是 no-op。**
   - 新增 `_ORIG_CWD`（记录 chdir 前的 cwd）；`_config_path_from_argv` 的 docstring 同步更正
     （原文那句"只影响 chdir"已过期）。
@@ -200,7 +239,7 @@
   --force --no-check --check-events]`；`dat` 输出 = 每事件 n_final 行 `E px py pz`（12 位小数），
   末态顺序 = `Data.order`；内置自检（末态顺序 vs `Data.order`、守恒、质量壳、行数 = n×n_final、
   `weightMax`）；`--chunk` 分块追加写以支持千万级样本。**不需要 GPU，也不读数据文件**。
-  文档里写清两条语义：平坦 PS ≠ 生产 `phsp_truth`；closure 用途需百万级样本（窄共振）。
+  文档里写清两条语义：平坦 PS ≠ 带效率的 `phsp_truth`；closure 用途需百万级样本（窄共振）。
 - 2026-10-29（PR #22）`--seed` 默认由 `0` 改为**当前 Unix 时间戳**（与 `fit.py` 一致）：
   每次运行都不同，避免"忘了改 seed"导致重复样本；启动打印 `[seed] … 复现本作业请加 --seed N`，
   分块时第 k 块仍用 `seed+k`。要复现就显式传 `--seed`。
@@ -245,7 +284,7 @@
     `include/cpu_shims/*`、`src/Backend.cpp`、`src/JitStubs_cpu.cpp`、`scripts/port_cuda_to_cpu.py`、
     `setup.py` 重写（含 CPU 构建路径）；
   - `fdd328c`（v0.3.16）恢复被门面裁掉的公开 API；
-  - `f82315a` `phsp_weights` 进入 NLL 归一化/梯度/Hessian（我们的生产 config 未用
+  - `f82315a` `phsp_weights` 进入 NLL 归一化/梯度/Hessian（当前 config 未用
     `phsp_weights` → 现有结果不受影响）；
   - `ecaa513` 修 bkg `g_v` 在耦合变换二阶项中的符号（**会改变带本底拟合的 Hessian/误差**，
     中心值不变）；
@@ -256,7 +295,7 @@
   - 涉及文件：`ctpwa/*`、`include/*`、`src/*`、`setup.py`、`tests/*`（新增 `test_cpu_*`、
     `test_mc*`、`test_hessian_diagnostics.py`）、`example/fit.py`（唯一冲突文件，7 处）。
   - 环境：`ctpwa` pip 需 ≥ 0.3.17（`ctpwa.diagnostics`）；本机 0.3.18。`CTPWA_DEVICE=cuda`
-    已在 `test14/sub.gpu` 与生产 `sub.gpu` 中显式设置（避免静默退 CPU）。
+    已在 `test14/sub.gpu` 等作业脚本中显式设置（避免静默退 CPU）。
 
 ---
 
@@ -290,7 +329,7 @@
 ### `example/README.md`
 
 - 2026-10-22（PR #18）新增 **§8 参数削减 / 误差截断 / 边界诊断 / `--fit-mode`** 参数表与
-  使用建议（含 `--reduce-params` 会替换最终解、生产默认不开的说明）。
+  使用建议（含 `--reduce-params` 会替换最终解、默认不开的说明）。
 
 ### 上游同步
 
@@ -305,8 +344,8 @@
   - 涉及文件：`include/AmpGen.cuh`、`src/{AmpGen,ComputeHessian,Info,Parameters}.cu`、
     `setup.py`、`tests/*`（新增 ident4 / trans_multi_step / dupjp / hess_mult 等回归）、`example/fit.py`。
   - 环境：`ctpwa` pip 包需 ≥ 0.3.10（`analysis(config, fit_mode)`）；本机 0.3.13
-    （含全部 v0.3.13 C++）。`50259f2` 只在生产配置存在“重复 `[J,P]` 块”时才影响结果，
-    经查 `jlsp/pwa/all/single` 无此结构 → 现有结果不受影响。
+    （含全部 v0.3.13 C++）。`50259f2` 只在 config 存在“重复 `[J,P]` 块”时才影响结果；
+    当前配置无此结构 → 现有结果不受影响。
 
 ---
 

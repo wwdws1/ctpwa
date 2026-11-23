@@ -4087,16 +4087,9 @@ def main():
                 )
                 res["final_params"] = p2.clone()
                 res["final_nll"] = float(nll2)
-                # 抛光终点的 Hessian 已在 polish 内算过（缓存命中），重算子空间字段。
-                try:
-                    H2 = optimizer._get_hessian_cached(p2)
-                    rep2, _, _ = optimizer._hessian_diagnosis(p2, H2)
-                    res.update(optimizer._hessian_fields(rep2))
-                except Exception as _e:  # noqa: BLE001
-                    log.warning(
-                        f"run {res['run_id']} 抛光后 Hessian 子空间诊断失败: {_e}"
-                    )
-                    res["is_positive_definite"] = bool(pd2)
+                # 子空间字段不用在这里单独刷：下面统一在**最终点**重算误差时
+                # 会给出 is_positive_definite / λmin / active 等，且 polish 已把
+                # 终点 Hessian 播种进缓存，不会多算一次。
             else:
                 print(
                     f"run {res['run_id']} 抛光点不采纳: NLL {nll0:.6f} → {nll2:.6f}, "
