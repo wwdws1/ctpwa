@@ -20,6 +20,13 @@
 - §10.4.1 里"本 config 的 `Number of partial waves: 17 (SL amplitudes: 42)`"改成通用写法
   （`N` / `M`，只说明"矩阵维度是分波数、不等于 SL 振幅数"）。
 - 结论不变：`fit.py` 打印的 `fit fractions` 就是 `read_interference.py` 里那张逐波表。
+- **README 只留"当前行为 + 用法"**，把"改了什么/以前怎样"统一放到本文件（`CHANGELOG.md`）：
+  - §10.4 开头删掉 v0.3.23/v0.3.24 的实现沿革块，改为一句现状（重建侧 `B̄` 收缩、产生侧一趟
+    `phsp_truth`、误差只含耦合）；
+  - §1 路径口径、§7.3 正定判据、§7.7 warm-start、§9 GPU 策略、§11.5 标题里的"PR #/日期/旧版"表述全部去掉；
+  - §8 标题去掉"（上游 `bc70a79` 并入）"，§11.5 改名"复现旧结果（`--amp-lambda`）"（只留操作步骤）；
+  - §6/§10.4/§11.3 里"0.3.22 起取代旧的 `interference`"改为当前事实："没有 `interference` 对象，
+    用 `interference_rec` / `interference_gen`"。
 
 ## 2026-11-24
 

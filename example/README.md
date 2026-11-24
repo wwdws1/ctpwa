@@ -36,7 +36,7 @@ Hessian / 参数误差 → 保存结果与摘要。
 - [5. 环境变量](#5-环境变量)
 - [6. 输出文件](#6-输出文件)
 - [7. 已知问题与备注](#7-已知问题与备注)
-- [8. 参数化 / 参数削减 / 误差截断 / 边界诊断（上游 `bc70a79` 并入）](#8-参数化--参数削减--误差截断--边界诊断上游-bc70a79-并入)
+- [8. 参数化 / 参数削减 / 误差截断 / 边界诊断](#8-参数化--参数削减--误差截断--边界诊断)
   - [8.1 `--fit-mode {0,1}`：参数化](#81---fit-mode-01参数化)
   - [8.2 `--reduce-params`：有效秩降维 + 降维重拟合](#82---reduce-params有效秩降维--降维重拟合)
   - [8.3 `--no-errors-truncate`：非正定误差口径](#83---no-errors-truncate非正定误差口径)
@@ -52,7 +52,7 @@ Hessian / 参数误差 → 保存结果与摘要。
   - [11.2 三个参数的分工](#112-三个参数的分工)
   - [11.3 由预期干涉强度反推 `--amp-lambda`](#113-由预期干涉强度反推---amp-lambda)
   - [11.4 推荐流程](#114-推荐流程)
-  - [11.5 默认值变更与复现](#115-默认值变更与复现)
+  - [11.5 复现旧结果（`--amp-lambda`）](#115-复现旧结果--amp-lambda)
 
 ---
 
@@ -75,7 +75,7 @@ python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-3  # 可选�
   - `≥ 0.3.17`：`ctpwa.diagnostics`（可行子空间 PD 判据，见 §7/§8）；
   - `≥ 0.3.22`：`writeResult` 往 `weight_best.root` 写 `interference_rec`/`interference_gen`/
     `*_err`/`integrals`，配 `read_interference.py`（§10.4）；
-  - `≥ 0.3.24`：干涉矩阵按分波**合并 LS**（0.3.23 会按 SL 振幅拆行、维度偏大）。
+  - `≥ 0.3.24`：干涉矩阵按分波**合并 LS**（维度 = 分波数）。
   本机当前：**0.3.24**（本地编译版）。
 - **从源码编译**：本 fork 的 `setup.py` 用 `-std=c++20`（上游是 `-std=c++17`），因为
   torch ≥ 2.13 的 C++ 头文件已需要 C++20。
@@ -92,15 +92,13 @@ python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-3  # 可选�
   `_config_path_from_argv()` 从 `sys.argv` 取出 `--config`（转绝对路径），**并在构造
   `ctpwa.analysis()` 之前 `chdir` 到 config 目录**，因此 `--config /path/to/other.yml`
   **真正生效**（无需 cd 到配置目录）。
-- **路径口径（PR #21 起，两条规则）**：
+- **路径口径（两条规则）**：
   - **config 内**的相对路径（`data` / `phsp` / `phsp_truth` / `bkg` / `bkg_weights`，以及
     `Resonances` / `Constraints.chains(_exact)` 引用的外部文件）= **相对 config 文件所在目录**；
   - **命令行**给的路径（`--config`、`--output-dir`、`--warm-start`、`--resume` 指向的
     `checkpoint.pt`）= **相对你调用 `fit.py` 的目录**。
   启动 dump 会打印 `output_dir=` / `warm_start=` 以及 config 里各数据文件的**解析结果**
   （绝对路径 + 是否存在，缺失会标 `← 不存在!`），便于一眼核对。
-  （改动前：`data/phsp/bkg` 跟**启动目录**、`phsp_truth` 跟 config 目录、CLI 路径跟 config
-  目录 —— 三者不一致；跨目录调用会出现「数据读到了、效率却是 0 事件」或结果落到 config 目录下。）
 - 建议用 `python -u`（无缓冲）以便实时看日志。
 - ⚠ **不要在仓库根目录 `import ctpwa`**：仓库根自带上游的 `ctpwa/` 门面包（源码目录，
   没有 `_cuda.so`/`_cpu.so`），在 `python -m pytest`/`python -c`（cwd 进 `sys.path`）时会
@@ -287,7 +285,7 @@ python fit.py --optimizer projected --runs 5
 | `--optimizer` | 优化器：`reparam`/`projected`/`lbfgs` | `reparam` | `FIT_OPTIMIZER` | — |
 | `--opt-verbose` | 每轮打印 projected 的 `pg/active/ΔNLL` | False | `FIT_OPT_VERBOSE=1` | projected |
 | `--ff-only` | 只算拟合分数：跳过拟合与 polish，用最佳参数（`--warm-start` 或 `<output-dir>/best_params.pt`） | False | `FIT_FF_ONLY=1` | — |
-| `--cal-ff` | 是否输出拟合分数（`True`/`False` 带值；默认开）。**从 `weight_best.root` 的干涉矩阵读**（相干分母 `F_i`，与 ROOT 一致）；读不到矩阵时**只提示、不输出**（旧的非相干口径已停用） | `True` | — | — |
+| `--cal-ff` | 是否输出拟合分数（`True`/`False` 带值；默认开）。**从 `weight_best.root` 的干涉矩阵读**（相干分母 `F_i`，与 ROOT 一致）；读不到矩阵时**只提示、不输出**（不再回退计算） | `True` | — | — |
 | `--cal-eff` | 是否计算分波效率（默认关；大 `phsp`/`phsp_truth` 上可能 C++ 崩溃，建议配小样本 config + `--ff-only`） | `False` | — | — |
 
 ### 误差估计（Hessian 非正定回退）
@@ -295,7 +293,7 @@ python fit.py --optimizer projected --runs 5
 |---|---|---|---|
 | `--err-mode` | `auto`=PD 直接求逆，否则**有效秩截断**（见下）；`strict`=原行为(非PD不给)；`pinv`=伪逆(丢 `λ<τλmax` 方向)；`psd`=把 `λ` 截到 `τλmax` 后求逆(更保守) | `reparam`→`auto`，其它→`strict` | `FIT_ERR_MODE` |
 | `--err-tau` | 相对阈值 `τ`（`λ<τ·λmax` 视为平坦/不可测） | `1e-6` | `FIT_ERR_TAU` |
-| `--no-errors-truncate` | 关闭“非正定时按有效秩截断传播误差”，退回旧的 `pinv` | 开启截断 | `FIT_ERRORS_TRUNCATE=0` |
+| `--no-errors-truncate` | 关闭“非正定时按有效秩截断传播误差”，退回 `pinv` | 开启截断 | `FIT_ERRORS_TRUNCATE=0` |
 
 > **默认策略**：显式 `--err-mode` > `FIT_ERR_MODE` > **优化器相关**（`reparam`→`auto`，
 > 其它→`strict`）。即：只有选 `reparam` 时默认才自动回退给误差；`projected`/`lbfgs`
@@ -305,7 +303,7 @@ python fit.py --optimizer projected --runs 5
 > **每个参数仍有有限误差**（只有被冻结的线性组合没有），日志打印保留维数/λmin/cond 与
 > 冻结方向数（`--reduce-params` 可看这些组合的物理内容）；
 > 输出会标注这是**秩亏下的可行估计，非严格统计误差**。
-> `--no-errors-truncate` 退回旧的伪逆（`σ=0` 的“无误差”口径）；
+> `--no-errors-truncate` 退回伪逆（`σ=0` 的“无误差”口径）；
 > `--err-mode strict` 恢复“非正定就不给误差”的行为。
 
 ### Warm start
@@ -412,7 +410,7 @@ FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
 
 > **随机初值 seed**：启动时打印一行 `[seed] base seed=...; run i 的 seed = base+i; 复现本作业请加 --seed ...`。
 > 默认 `base seed = 当前 Unix 时间戳`（每次作业不同）；要复现/要同 seed 系综对比，用日志里的值
-> 加 `--seed <base>`（或用 `FIT_SEED`）。`--seed 42` 等价于旧的固定 `42,43,44,…`。`--resume`
+> 加 `--seed <base>`（或用 `FIT_SEED`）；run i 的 seed = `base+i`。`--resume`
 > 以 `checkpoint.pt` 内记录的 seed 为准。
 
 ---
@@ -427,16 +425,16 @@ FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
    取值见 §11。
 3. 结果普遍 `正定性=False`：精确 Hessian 存在 ~20–30 维近平坦/简并子空间（诊断显示
    沿负特征值方向 NLL 两侧都不下降，说明是数值/秩亏而非真鞍点）。
-   **2026-10-29 起（PR #19）正定判据改为“可行子空间”（KKT 二阶条件）**：先剔固定参考
+   **正定判据是“可行子空间”（KKT 二阶条件）**：先剔固定参考
    （Re_0/Im_0）、再剔**活跃**参数（贴边且梯度朝外——该方向根本不可行），才判正定；
-   `is_positive_definite` = `reduced_pd`，旧口径放在 `is_positive_definite_full`。
+   `is_positive_definite` = `reduced_pd`；`is_positive_definite_full` 是全自由块口径。
    因此贴边参数的“朝外负曲率”不再假报警，`--bound-margin` 可列出贴边 θ 作为对照。
    **用 `reparam` 时**参数误差默认由 `--err-mode auto` **按有效秩截断传播**
    （保留 `λ>τλmax` 方向，`σ²_m=Σ E[m,i]²/λ_i`，被冻结组合单独列出）；`--no-errors-truncate`
-   退回旧的伪逆口径；`projected`/`lbfgs` 默认 `strict`（非正定不给误差）。
+   退回伪逆口径；`projected`/`lbfgs` 默认 `strict`（非正定不给误差）。
    **拟合分数**现在直接读 `weight_best.root` 的干涉矩阵（相干分母，与 ROOT 逐位一致）：
    中心值恒有；`σ` 需要 C++ 写出 `interference_*_err`（耦合自由块正定）。
-   **效率**仍走旧路径，不以真 PD 为门控：非正定时用与 `--err-mode` 一致的回退曲率传播误差
+   **效率**仍由 C++ `getEfficiency` 计算，不以真 PD 为门控：非正定时用与 `--err-mode` 一致的回退曲率传播误差
    （中心值恒输出）。
 4. `--lr` 只对 `reparam`/`lbfgs` 有意义；`projected` 不用 `lr`，其停机由
    `--tol-grad`（gtol）控制。
@@ -450,14 +448,13 @@ FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
    再算 FF/效率，并在计算前打印提示。要算效率时建议：**减小 `phsp` 与 `phsp_truth` 样本量**
    后用 `--ff-only --cal-eff True` 跳过拟合、直接以 `best_params.pt` 重算（两个样本都要减，
    效率同时用到它们）。
-7. **`--warm-start auto` / `FIT_WARM` 现在按 `--output-dir` 找 `best_params.pt`**
-   （旧版恒指向 `results/`，在非默认 `--output-dir` 下会找错）。
+7. **`--warm-start auto` / `FIT_WARM` 按 `--output-dir` 找 `best_params.pt`**（不是固定 `results/`）。
 8. **输出约定**：`print` 输出结果（配置/进度/结果表/落盘提示/可复现 tag），
    `log`（含 `-v/-q` 级别控制）输出内部诊断（`[pLBFGS]`/`[polish]` 迭代与统计）。
 
 ---
 
-## 8. 参数化 / 参数削减 / 误差截断 / 边界诊断（上游 `bc70a79` 并入）
+## 8. 参数化 / 参数削减 / 误差截断 / 边界诊断
 
 四组开关，**默认都保持既有行为**，按需开启。
 
@@ -502,7 +499,7 @@ python -u fit.py --reduce-params --rank-scale median   # 谱病态/跑飞解
 
 `--err-mode auto`（`reparam` 默认）下 Hessian 不定时，默认改为**有效秩截断**：
 只保留 `λ_i > τ·λmax` 的方向做误差传播 `σ²_m = Σ_{i∈keep} E[m,i]²/λ_i` →
-**每个参数仍有有限误差**，被冻结的只是那些线性组合。加 `--no-errors-truncate` 退回旧的
+**每个参数仍有有限误差**，被冻结的只是那些线性组合。加 `--no-errors-truncate` 退回
 伪逆口径（未测定方向 σ=0）。`--err-mode strict/pinv/psd` 显式指定时不受影响。
 
 ### 8.4 `--bound-margin`：贴边参数诊断
@@ -539,7 +536,7 @@ export CTPWA_DEVICE=cuda        # slurm 作业推荐：GPU 拿不到就失败，
 python -u fit.py --config config.yml --runs 10
 ```
 
-**`fit.py` 自己的策略（PR #24）**：**默认要求 GPU**——后端不是 `cuda` 就直接报错退出
+**`fit.py` 的策略**：**默认要求 GPU**——后端不是 `cuda` 就直接报错退出
 （提示可以加 `--cpu`）；显式要 CPU 时才继续：
 
 ```bash
@@ -614,7 +611,7 @@ python plot.py --nll 3        # 画第 3 个 run 的 NLL 历史
 | `hfit` | 信号模型（振幅²×phsp）× `normFactor`（即信号产额） |
 | `hbkg` | 预期本底计数（本底事件 × `bkg_weights`，不 Scale） |
 | `h_<分波名>` | 各分波形状（`\|A_i\|²` 加权） |
-| `interference_rec` / `interference_gen` | 干涉矩阵（`TMatrixD`，完整对称矩阵）；**0.3.22 起**取代旧的 `interference`，`plot.py` 不读它，读法见 §10.4 |
+| `interference_rec` / `interference_gen` | 干涉矩阵（`TMatrixD`，完整对称矩阵）；`plot.py` 不读它，读法见 §10.4 |
 | `legends` | 分波图例 |
 
 #### 输出内容
@@ -746,16 +743,12 @@ python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
 
 ### 10.4 `read_interference.py`：读取 `weight_best.root` 里的干涉矩阵
 
-0.3.21 及以前 `weight_best.root` 里只有一个 `interference` 矩阵，分母是"对角和 `D`"，只能看形状；
-**0.3.22 起** `writeResult` 改写成两张**按本样本相干总额 `W` 归一**的对称矩阵，外加参数误差矩阵和
-`integrals` 树，并配了脚本 `read_interference.py` 直接打表。本节讲这些对象是什么、口径怎么算、怎么读。
+`writeResult` 会把两张**按本样本相干总额 `W` 归一**的对称矩阵（`interference_rec` /
+`interference_gen`）连同参数误差矩阵和 `integrals` 树写进 `weight_best.root`；
+`read_interference.py` 直接把它们打成表。本节讲这些对象是什么、口径怎么算、怎么读。
 
-> **口径没变，实现变了两轮（用户看到的东西只有"更快"和"误差只含耦合"）**：
-> v0.3.23 起重建侧矩阵直接由常驻 `B̄ = Σ_e (w_e/W)A_e A_e^H`（NLL 的 `phsp` 分母，本来就在显存里）
-> 收缩得到，**不再读 `phsp` 文件**（1M 事例 `writeResult` 47.4 s → 24.3 s）；误差矩阵改为解析传播。
-> v0.3.24 又修了一个维度 bug：0.3.23 按"逐 SL 振幅"收缩，同一分波的多条 L/S 会各占一行
-> （例如 4×4 / 2×2 / 6×6），0.3.24 起按 `nSLvectors_` **合并 LS**，维度 = 分波数。
-> 所以**读到 0.3.23 生成的 ROOT 时矩阵会偏大**，重跑即可（口径与元素定义没变）。
+> 重建侧直接由常驻 `B̄ = Σ_e (w_e/W)A_e A_e^H` 收缩得到（不读 `phsp` 文件），产生侧需要一趟
+> `phsp_truth` 扫描；误差矩阵是解析传播（只含耦合方向）。实现细节的版本变更见 `CHANGELOG.md`。
 
 #### 10.4.1 `weight_best.root` 里多了什么
 
@@ -763,7 +756,7 @@ python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
 |---|---|---|---|
 | `interference_rec` | `TMatrixD` n×n | `P_ij / W_rec` | **重建侧**：`phsp` 样本（带效率 MC）。`P_ii = Σ_e w·\|A_i\|²`，`P_ij = Σ_e w·2Re(A_iA_j*)` |
 | `interference_gen` | `TMatrixD` n×n | `T_ij / W_gen` | **产生侧**：`phsp_truth` 样本（无效率）。元素定义同上 |
-| `interference_rec_err` | `TMatrixD` n×n | σ | 参数误差传播 `σ(F_ij) = √(J H⁻¹ Jᵀ)`（线性化；**不含 MC 统计误差**；v0.3.23+ 只含**耦合**方向，θ 方向暂未传播） |
+| `interference_rec_err` | `TMatrixD` n×n | σ | 参数误差传播 `σ(F_ij) = √(J H⁻¹ Jᵀ)`（线性化；**不含 MC 统计误差**；只含**耦合**方向，θ 方向暂未传播） |
 | `interference_gen_err` | `TMatrixD` n×n | σ | 同上，truth 侧 |
 | `integrals` | `TTree`（1 entry） | – | `N_rec` / `W_rec` / `N_gen` / `W_gen`（`Double_t`）、`npartials`（`Int_t`） |
 | `legends` | `TTree` | – | 分波 LaTeX 标签；长度 = `npartials` 时 `read_interference.py` 拿它当行标签 |
@@ -781,12 +774,11 @@ python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
 | `interference_gen` | config 没有 `phsp_truth`，或设了 `CTPWA_WR_NO_INTEGRALS=1` |
 | `interference_*_err` | 耦合自由块的 Hessian 非正定 / 没有自由耦合方向 / 参数不是 float64（legacy complex 精度）/ `CTPWA_WR_NO_ERR=1`。C++ 端会在生成 ROOT 时的 stderr/stdout 打一行原因 |
 
-> `CTPWA_WR_NO_INTEGRALS=1` 跳过的是矩阵中心值这一步（**v0.3.23+：重建侧 0 趟**，直接收缩常驻 `B̄`；
-> 产生侧仍是 **1 趟 `phsp_truth` 全样本扫描**，大样本上这是最贵的部分）。跳过时矩阵与 `integrals`
+> `CTPWA_WR_NO_INTEGRALS=1` 跳过矩阵中心值这一步（重建侧 0 趟，直接收缩常驻 `B̄`；
+> 产生侧 1 趟 `phsp_truth` 全样本扫描，大样本上这是最贵的部分）。跳过时矩阵与 `integrals`
 > 都不写，直方图照写。
 > `save_weight_file` 会先把拟合缓存里的 Hessian 递给 `writeResult`，所以正常情况下误差矩阵不需要额外算 Hessian。
-> 误差矩阵的额外成本（v0.3.23+）：重建侧 0 趟（`B̄` 代数）、产生侧复用同一趟扫描的 ± 方向 ——
-> 与耦合数无关，不再是老版本的 `4·n_free` 趟。
+> 误差矩阵的额外成本：重建侧 0 趟（`B̄` 代数）、产生侧复用同一趟扫描的 ± 方向，与耦合数无关。
 
 #### 10.4.2 矩阵口径与三个「份额」的区别
 
@@ -801,16 +793,15 @@ W    = Σ_i M_ii + Σ_{i<j} M_ij = Σ_e w·|Σ_i A_i|²
 |---|---|---|---|
 | 文献 fit fraction `F_i` | `M_ii` | `diag(interference_gen)` | `ΣF + ΣI = 1`，**推荐对外报告这个** |
 | 干涉项 `I_ij` | `M_ij` | 上三角 | 可正可负；强干涉时单对可达 ±0.1 量级 |
-| 非相干份额 `FF_i` | `F_i / ΣF` | `diag / Σdiag` | `ΣFF = 1` 但把干涉**摊回**各波（旧 `getFitFractions` 口径，已被标为待删） |
+| 非相干份额 `FF_i` | `F_i / ΣF` | `diag / Σdiag` | `ΣFF = 1` 但把干涉**摊回**各波（`getFitFractions` 口径，已被标为待删） |
 | 平均效率 `ε̄` | `W_rec / W_gen` | `integrals` | 只在 rec/gen 两样本同源产生时有意义 |
 | 每波效率 `ε_i` | `(P_ii/N_rec) / (T_ii/N_gen)` | 两张矩阵 + `integrals` | 相对值（cut 后样本分布 ∝ `εdΦ/∫ε`） |
 | 分支比 `BF_i` | `BF_total × F_i` | `--bf-total` | `ΣBF_i ≠ BF_total`，差额正是干涉项 |
 | 原始积分 `P_ij` / `T_ij` | `M_ij × W` | 矩阵乘回 `integrals` 的 `W` | 想自己做归一化（换分母、按 run 合并）时用 |
 
-> **旧的 `interference` 已经没有了。** 0.3.21 及以前由 `computeResults` 顺手累加（`T` 归一），
-> 0.3.22 把这趟逐事例原子操作删掉，改由 `computeFileBatchIntegrals` 算两张。旧脚本读
-> `["interference"]` 会 `KeyError`，换成 `interference_gen`（产生侧）或 `interference_rec`
-> （重建侧，带效率）；`plot.py` 里那个跳过 `"interference"` 目录的名单是历史残留，无影响。
+> 对象名是 `interference_rec`（重建侧，带效率）与 `interference_gen`（产生侧），**没有**单个
+> `interference` 矩阵——读旧名字会 `KeyError`。`plot.py` 里跳过 `"interference"` 目录的名单是
+> 历史残留，无影响。
 
 #### 10.4.3 `read_interference.py` 用法与参数
 
@@ -846,7 +837,7 @@ python3 read_interference.py results/weight_best.root --bf-total 3.7e-4 --csv ff
 |---|---|
 | `== interference_rec/gen ==  W=… N=…` | 本侧样本的相干总额 `W = Σw|ΣA|²` 与 `N = Σw`（来自 `integrals`；把矩阵元素乘回 `W` 就是原始积分） |
 | `Σ_i F_i = …` / `Σ_{i<j} I_ij = …` / `闭合 (ΣF+ΣI) = …` | 对角和、干涉项之和、闭合自检。前两者相加**必须 = 1**；不等（如 0.99998）说明矩阵读错或被截断。`ΣF` 远大于 1 表示各波强相消（360° 相位差），不是错误 |
-| `非相干份额 F_i/ΣF = [...]` | `diag/Σdiag`（旧 `getFitFractions` 口径，`Σ=1`）。`fit.py` 不打印它，只在来源行提示"与 `F_i` 相差 `1/ΣF`" |
+| `非相干份额 F_i/ΣF = [...]` | `diag/Σdiag`（`getFitFractions` 口径，`Σ=1`）。`fit.py` 不打印它，只在来源行提示"与 `F_i` 相差 `1/ΣF`" |
 | 逐波表 `# / 分波 / F_i / σF_i` | 文献口径 fit fraction 与误差；`σF_i = -` 表示 ROOT 里没有 `interference_*_err`（见 §10.4.1 的写入条件）。**`fit.py` 末尾打印的就是这张表**（同一份 `weight_best.root`，逐位一致） |
 | `矩阵 (行= i, 列= j ...)` | 对角 = `F_i`、上三角 = `I_ij`（对称，两边都填）。看"谁和谁相消"就看或或这里最负/最正的元素 |
 | `误差矩阵 σ` | 仅当 ROOT 里有 `interference_*_err` 时打印 |
@@ -866,7 +857,7 @@ python3 read_interference.py results/weight_best.root --bf-total 3.7e-4 --csv ff
 | 行标签是 `wave0/wave1…` | `legends` 长度与 `npartials` 对不上（config 的 `tex` 展开规则见教程 §4.0） | 正常；按下标对 `getFitFractions` 的返回顺序 / `h_<分波名>` 直方图（**不是** `parameters.txt` 的 SL 耦合） |
 | `--bf-total` 的 `ΣBF_i ≠ BF_total` | 差额 = 干涉项 `ΣI`（同一张表里有） | 物理上正常；要"非相干"合计就用 `ΣF` |
 | 读的是 rec 还是 gen？ | rec 带效率（`phsp`），gen 是产生侧（`phsp_truth`） | 报 fit fraction / 与文献比 → gen；与数据、效率相关 → rec |
-| 跑得很慢 / 占显存 | 矩阵本身很小；贵的是 `phsp_truth` 那一趟全样本扫描（重建侧 0.3.23+ 已不读文件） | 大规模扫描可临时 `CTPWA_WR_NO_INTEGRALS=1`；要计时加 `CTPWA_VERBOSE=1`（v0.3.23+ 默认不再打印 `[writeResult] … ms`，只打 `phsp_truth 积分矩阵: … ms`） |
+| 跑得很慢 / 占显存 | 矩阵本身很小；贵的是 `phsp_truth` 那一趟全样本扫描（重建侧已不读文件） | 大规模扫描可临时 `CTPWA_WR_NO_INTEGRALS=1`；要计时加 `CTPWA_VERBOSE=1`（只打 `phsp_truth 积分矩阵: … ms`） |
 
 ---
 
@@ -931,7 +922,7 @@ d = 1 − T/D              （d = 0 无干涉；d → 1 完全抵消）
 
 ```python
 import uproot, numpy as np
-m = uproot.open("weight_best.root")["interference_gen"]   # 0.3.22+；旧版叫 "interference"
+m = uproot.open("weight_best.root")["interference_gen"]   # 产生侧（重建侧用 interference_rec）
 M = np.asarray(m.member("fElements"), dtype=float).reshape(
     m.member("fNrows"), m.member("fNcols"))
 D, T = float(np.trace(M)), float(M.sum())     # T ≡ 1（已按相干总额归一）
@@ -939,12 +930,11 @@ d = 1.0 - T / D                               # 等价于 1 − 1/ΣF
 # 自检：T == 1（ΣF + ΣI = 1，见 §10.4）
 ```
 
-> 该矩阵口径（0.3.22 起）：`M_ii = Σw|A_i|²/W`、`M_ij = Σw·2Re(A_iA_j*)/W`，
+> 该矩阵口径：`M_ii = Σw|A_i|²/W`、`M_ij = Σw·2Re(A_iA_j*)/W`，
 > `W = Σ_i M_ii + Σ_{i<j} M_ij`，因此 `Σ_i M_ii + Σ_{i<j} M_ij = 1`。
 > ⚠ 这与 `getFitFractions` 内部用的 `scattering` 矩阵（**对角含因子 2**）**不是**同一套，别混用。
-> 另外 0.3.21 及以前那个 `interference` 矩阵（`T` 归一、对角 `∫|A_i|²/T`）在 0.3.22 **已不再写**；
-> 旧脚本读 `["interference"]` 会 KeyError，改成 `interference_gen`（产生侧）或 `interference_rec`
-> （重建侧，带效率）即可，定义相同、只是按样本拆开。
+> 没有单个 `interference` 对象；按样本用 `interference_gen`（产生侧）或 `interference_rec`
+> （重建侧，带效率），两者的定义相同。
 
 #### Step 2：反解“需要的伙伴幅度” `a`
 
@@ -993,10 +983,10 @@ d = 2a / (1 + a²)        ⇒        a(d) = (1 − √(1 − d²)) / d
    再用多起点 best-of-N 交叉检查；
 5. 无论开不开，`--amp-max` 都要确认大于该分析真实的最大 `|A|`。
 
-### 11.5 默认值变更与复现
+### 11.5 复现旧结果（`--amp-lambda`）
 
-> **2026-11-12 起 `--amp-lambda` 默认 `0`（原 `1e-4`）。**
-> 复现旧结果（用 `1e-4` 跑出来的）需显式 `--amp-lambda 1e-4` 或 `FIT_AMP_LAMBDA=1e-4`。
-> 因为 `λ` 只影响落点，两者 NLL 差异通常远小于多起点的散布；但若要与历史逐位对齐，请显式指定。
+> 当前默认 `--amp-lambda 0`（关闭）。要复现历史上用 `1e-4` 跑出的结果，显式加
+> `--amp-lambda 1e-4` 或 `FIT_AMP_LAMBDA=1e-4`；`λ` 只影响落点，两者 NLL 差异通常远小于
+> 多起点的散布，但若要与历史逐位对齐，请显式指定。
 
 ---
