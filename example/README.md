@@ -287,7 +287,7 @@ python fit.py --optimizer projected --runs 5
 | `--optimizer` | 优化器：`reparam`/`projected`/`lbfgs` | `reparam` | `FIT_OPTIMIZER` | — |
 | `--opt-verbose` | 每轮打印 projected 的 `pg/active/ΔNLL` | False | `FIT_OPT_VERBOSE=1` | projected |
 | `--ff-only` | 只算拟合分数：跳过拟合与 polish，用最佳参数（`--warm-start` 或 `<output-dir>/best_params.pt`） | False | `FIT_FF_ONLY=1` | — |
-| `--cal-ff` | 是否计算拟合分数 FF（`True`/`False` 带值；默认开） | `True` | — | — |
+| `--cal-ff` | 是否输出拟合分数（`True`/`False` 带值；默认开）。**从 `weight_best.root` 的干涉矩阵读**（相干分母 `F_i`，与 ROOT 一致）；读不到矩阵时回退旧的 `getFitFractions`（非相干分母 `Σ=1`） | `True` | — | — |
 | `--cal-eff` | 是否计算分波效率（默认关；大 `phsp`/`phsp_truth` 上可能 C++ 崩溃，建议配小样本 config + `--ff-only`） | `False` | — | — |
 
 ### 误差估计（Hessian 非正定回退）
@@ -434,18 +434,21 @@ FIT_OPT_LEGACY_SIGN  FIT_OPT_POLISH_STEPS
    **用 `reparam` 时**参数误差默认由 `--err-mode auto` **按有效秩截断传播**
    （保留 `λ>τλmax` 方向，`σ²_m=Σ E[m,i]²/λ_i`，被冻结组合单独列出）；`--no-errors-truncate`
    退回旧的伪逆口径；`projected`/`lbfgs` 默认 `strict`（非正定不给误差）。
-   **拟合分数/效率不再以真 PD 为门控**：非正定时用与 `--err-mode` 一致的回退曲率传播误差
+   **拟合分数**现在直接读 `weight_best.root` 的干涉矩阵（相干分母，与 ROOT 逐位一致）：
+   中心值恒有；`σ` 需要 C++ 写出 `interference_*_err`（耦合自由块正定）。
+   **效率**仍走旧路径，不以真 PD 为门控：非正定时用与 `--err-mode` 一致的回退曲率传播误差
    （中心值恒输出）。
 4. `--lr` 只对 `reparam`/`lbfgs` 有意义；`projected` 不用 `lr`，其停机由
    `--tol-grad`（gtol）控制。
 5. 若在集群提交作业，注意 `fit.py` 会读 cwd 的 `config.yml` 并需要 GPU；建议
    一个方案一个目录（或配合 `--output-dir` 隔离结果）。
-6. **拟合分数默认计算，分波效率默认关闭**：`--cal-ff True`（默认）算 FF；效率需显式
-   `--cal-eff True`。二者在过大 `phsp`/`phsp_truth` 上可能触发 C++ `computeBFKernel`
-   illegal memory access / glibc abort（本机实测：拟合期显存已近满，约 3.5M 事件即可崩）——
-   该崩溃致命、`try/except` 无法捕获。因此 `fit.py` **先写核心摘要**再算 FF/效率，并在
-   计算前打印提示。要算效率时建议：**减小 `phsp` 与 `phsp_truth` 样本量**后用
-   `--ff-only --cal-eff True` 跳过拟合、直接以 `best_params.pt` 重算（两个样本都要减，
+6. **拟合分数默认输出，分波效率默认关闭**：`--cal-ff True`（默认）**从 `weight_best.root`
+   读** FF（`writeResult` 已算好，不再额外扫 `phsp_truth`）；效率需显式 `--cal-eff True`，
+   它仍要扫 `phsp`/`phsp_truth`。`writeResult` 的 truth 一趟与效率计算在过大样本上可能触发
+   C++ `computeBFKernel` illegal memory access / glibc abort（本机实测：拟合期显存已近满，
+   约 3.5M 事件即可崩）——该崩溃致命、`try/except` 无法捕获。因此 `fit.py` **先写核心摘要**
+   再算 FF/效率，并在计算前打印提示。要算效率时建议：**减小 `phsp` 与 `phsp_truth` 样本量**
+   后用 `--ff-only --cal-eff True` 跳过拟合、直接以 `best_params.pt` 重算（两个样本都要减，
    效率同时用到它们）。
 7. **`--warm-start auto` / `FIT_WARM` 现在按 `--output-dir` 找 `best_params.pt`**
    （旧版恒指向 `results/`，在非默认 `--output-dir` 下会找错）。
@@ -901,8 +904,8 @@ $ python3 read_interference.py results/weight_best.root --sample gen
 | `Σ_i F_i = 2.129` | 对角和。本例 **远大于 1** = 各波之间强烈相消（360° 相位差），不是错误 |
 | `Σ_{i<j} I_ij = -1.129` | 干涉项之和，本例为负（相消）；与上一行相加必须 = 1 |
 | `闭合 (ΣF+ΣI) = 1.000000` | 自检。不等于 1（比如 0.99998）说明矩阵被截断/读错 |
-| `非相干份额` | `diag/Σdiag`；与 `fit.py` 末尾打印的 `fit fractions (Σ=1)` 应该一致（本例 0.0609 ↔ 0.060864，0.2405 ↔ 0.240524） |
-| 逐波表 `F_i` / `σF_i` | 文献口径 fit fraction；`σF_i = -` 表示没有误差矩阵（本例 Hessian 非正定，§10.4.5） |
+| `非相干份额` | `diag/Σdiag`；`fit.py` 末尾会**另起一行**打这个（旧口径 `Σ=1`），便于与历史结果对照（本例 0.0609 ↔ 0.060864，0.2405 ↔ 0.240524） |
+| 逐波表 `F_i` / `σF_i` | 文献口径 fit fraction；`σF_i = -` 表示没有误差矩阵（本例 Hessian 非正定，§10.4.5）。**`fit.py` 末尾打印的 `fit fractions` 块就是这张表**（同一份 `weight_best.root`，逐位一致） |
 | 矩阵 | 对角 = `F_i`，上三角 = `I_ij`。本例 `I(10,4) = -0.228`、`I(10,5) = -0.178` 是最大的两对相消，`F_10 = 0.512` 也因此被抬得最高 |
 | 效率块 | `ε̄ = W_rec/W_gen`；逐波 `ε_i` 只在两样本同源产生时可解释 |
 | `--bf-total` 块 | `BF_i = BF_total × F_i`；合计大于 `BF_total` 同样是因为干涉项为负 |

@@ -39,8 +39,14 @@
   - 去掉 `[writeResult]` / `[phsp] events:` 等进度打印，计时只在 `CTPWA_VERBOSE=1` 时输出。
 - **本 fork 的 `setup.py` 改用 `-std=c++20`**（上游仍 `-std=c++17`；torch ≥ 2.13 的头文件要求），
   三处（CUDA `cxx` / `nvcc` / CPU）同步。
+- `example/fit.py`：**拟合分数改为从 `weight_best.root` 读**（`interference_gen` 对角 = 文献口径
+  `F_i`，相干分母 `ΣF+ΣI=1`，与 ROOT 逐位一致），并另打一行旧口径的非相干份额 `F_i/ΣF`；
+  `σ` 取 `interference_*_err` 对角（缺该矩阵时只给中心值并警告）。读不到矩阵或没装 `uproot`
+  时回退旧的 `getFitFractions` 并明确标注口径。默认路径不再扫 `phsp_truth`（省一趟中心积分 +
+  `2·2n` 趟扰动积分）。
 - `example/README.md`：§1 补最低版本（0.3.22 / 0.3.24）与 C++20 编译说明；§10.4 同步实现变化
-  （成本、误差只含耦合、0.3.23 维度 bug、计时开关），标题去掉版本号。
+  （成本、误差只含耦合、0.3.23 维度 bug、计时开关），标题去掉版本号；§4/§7/§10.4.4 说明
+  `fit.py` 打印的 FF 现在就是 ROOT 里的 `F_i`。
 
 ### Changed（fork `wwdws1/ctpwa`：PR #32，章节归位）
 

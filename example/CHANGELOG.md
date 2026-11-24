@@ -26,6 +26,20 @@
 - **`setup.py`：`-std=c++17` → `-std=c++20`**（CUDA `cxx` / `nvcc` / CPU 三处）。这是本 fork 第一处
   与上游不同的**非 `example/`** 改动——上游仍是 C++17，而 torch ≥ 2.13 的 C++ 头文件要求 C++20。
 
+### `example/fit.py`
+
+- **拟合分数输出改用 ROOT 里的相干口径**（与 `weight_best.root` 逐位一致）：
+  - 默认从 `<output-dir>/weight_best.root` 读 `interference_gen`（产生侧）对角 → `F_i`，
+    与 `read_interference.py` 的逐波表完全相同；`ΣF + ΣI = 1` 同时打印做闭合自检。
+  - `σ` 取 `interference_gen_err` 对角（v0.3.23+ 只含耦合方向；Hessian 非正定时 C++ 不写，
+    此时打一行警告、只给中心值）。
+  - 另打一行**旧口径**的非相干份额 `F_i/ΣF`（`Σ=1`），便于与历史结果对照。
+  - 读不到矩阵 / 没装 `uproot` → 回退旧的 `getFitFractions`（非相干分母），并在日志里
+    明确标注口径，不会把两种数混在一起。
+  - 默认路径不再调 `getFitFractions`：省掉 `phsp_truth` 的一趟中心积分 + `2·2n` 趟扰动积分
+    （本 config：82 个扰动方向 × 2）。
+  - `optimization_summary.txt` 的 FF 段落带上口径说明（`ff_note`），无 σ 时写"± (无误差)"。
+
 ### `example/README.md`
 
 - §1：最低版本补 `≥ 0.3.22`（ROOT 里的干涉矩阵 + `read_interference.py`）与 `≥ 0.3.24`
