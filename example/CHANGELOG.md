@@ -11,6 +11,16 @@
 
 ---
 
+## 2026-11-25
+
+### `example/README.md`
+
+- §10.4.4 由「输出长什么样（真实例子）」改为**通用**的「输出块怎么读」：删掉来自具体分析
+  的示例输出（样本量、分波名、`F_i`/`I_ij` 数值、`BF_i` 等），只保留各输出块的含义表；
+- §10.4.1 里"本 config 的 `Number of partial waves: 17 (SL amplitudes: 42)`"改成通用写法
+  （`N` / `M`，只说明"矩阵维度是分波数、不等于 SL 振幅数"）。
+- 结论不变：`fit.py` 打印的 `fit fractions` 就是 `read_interference.py` 里那张逐波表。
+
 ## 2026-11-24
 
 ### 上游同步（库；`example/` 上游未改动，merge 无冲突）
