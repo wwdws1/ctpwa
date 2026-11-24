@@ -241,7 +241,8 @@ def make_cuda_extension():
         ],
         extra_compile_args={
             "cxx": [
-                "-fPIC", "-std=c++17",
+                # torch >= 2.13 的头文件要求 C++20（本 fork 默认用新 torch 编译）
+                "-fPIC", "-std=c++20",
                 "-D_GLIBCXX_USE_CXX11_ABI=1",
                 "-DCTPWA_BACKEND_CUDA",
                 "-DCTPWA_MODULE_CUDA",
@@ -250,7 +251,7 @@ def make_cuda_extension():
             "nvcc": [
                 "-rdc=true",
                 "--expt-relaxed-constexpr",
-                "-std=c++17",
+                "-std=c++20",
                 "--extended-lambda",
                 "-DCTPWA_BACKEND_CUDA",
                 "-DCTPWA_MODULE_CUDA",
@@ -297,7 +298,8 @@ def make_cpu_extension():
             "torch", "torch_cpu", "torch_python", "c10",
         ],
         extra_compile_args=[
-            "-fPIC", "-std=c++17", "-O3", "-fopenmp",
+            # torch >= 2.13 的头文件要求 C++20
+            "-fPIC", "-std=c++20", "-O3", "-fopenmp",
             f"-D_GLIBCXX_USE_CXX11_ABI={torch_abi}",
             "-DCTPWA_BACKEND_CPU",
             "-DCTPWA_MODULE_CPU",
