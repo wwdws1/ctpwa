@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 import torch
 
-from conftest import make_params
+from conftest import make_params, fit_fraction_matrix, matrix_errors
 
 import ctpwa
 
@@ -40,7 +40,7 @@ def test_matrix_invariants(make_analysis):
     ana = make_analysis("eff2", reuse=False)
     cpl = _coupling(ana, seed=7)
     for sample in ("phsp", "truth"):
-        M = ana.getFitFractionMatrix(cpl, sample=sample).cpu().numpy()
+        M = fit_fraction_matrix(ana, cpl, sample=sample).cpu().numpy()
         F = _norm(M)
         assert abs(np.trace(F) + np.triu(F, 1).sum() - 1.0) < 1e-12
         d = np.diag(F)
@@ -57,11 +57,11 @@ def test_matrix_gauge_invariance(make_analysis):
     """整体模长/相位是规范自由度：份额不能变。"""
     ana = make_analysis("eff2", reuse=False)
     c0 = _coupling(ana, seed=9)
-    ref = {s: _norm(ana.getFitFractionMatrix(c1, sample=s).cpu().numpy())
+    ref = {s: _norm(fit_fraction_matrix(ana, c1, sample=s).cpu().numpy())
            for s in ("phsp", "truth") for c1 in [c0]}
     c1 = _coupling(ana, seed=9, scale=2.5, phase=0.7)
     for s in ("phsp", "truth"):
-        F = _norm(ana.getFitFractionMatrix(c1, sample=s).cpu().numpy())
+        F = _norm(fit_fraction_matrix(ana, c1, sample=s).cpu().numpy())
         assert np.allclose(F, ref[s], rtol=1e-10, atol=1e-12), (s, F, ref[s])
 
 
@@ -69,8 +69,8 @@ def test_rec_equals_gen_for_identical_samples(make_analysis):
     """eff2 的 phsp 与 phsp_truth 是同一文件 → 两张表必须逐元素相等。"""
     ana = make_analysis("eff2", reuse=False)
     cpl = _coupling(ana, seed=11)
-    R = _norm(ana.getFitFractionMatrix(cpl, sample="phsp").cpu().numpy())
-    G = _norm(ana.getFitFractionMatrix(cpl, sample="truth").cpu().numpy())
+    R = _norm(fit_fraction_matrix(ana, cpl, sample="phsp").cpu().numpy())
+    G = _norm(fit_fraction_matrix(ana, cpl, sample="truth").cpu().numpy())
     np.testing.assert_allclose(R, G, rtol=1e-10, atol=1e-12)
 
 
@@ -105,7 +105,7 @@ def test_error_by_toy_monte_carlo(make_analysis):
     """把协方差缩到线性区，用 toy 抽参数：经验 std 应等于线性化 σ。"""
     ana = make_analysis("eff2", reuse=False)
     n, nθ = ana.getNVector(), ana.getNFreeTheta()
-    free = [j for j in range(2 * n) if j not in (0, n)] + [2 * n + i for i in range(nθ)]
+    free = [j for j in range(2 * n) if j not in (0, n)]   # θ 暂不传播
     nf = len(free)
     rng = np.random.default_rng(0)
     A = rng.normal(size=(nf, nf))
@@ -119,20 +119,20 @@ def test_error_by_toy_monte_carlo(make_analysis):
         p0[2 * n:] = ana.getFreeResParams()[0].double().to(DEV)
 
     # 每个参数只抖 0.1%（θ 的宽度只有几 MeV，绝对值不能统一取）→ 线性化成立
-    scale = np.array([max(abs(float(p0[g])), 1e-3) for g in free]) * 1e-3
+    scale = np.array([max(abs(float(p0[g])), 1e-3) for g in free]) * 1e-2
     cov = base * np.outer(scale, scale)
     H = np.eye(2 * n + nθ)
     H[np.ix_(free, free)] = np.linalg.inv(cov)
     H_t = torch.tensor(H, dtype=torch.float64).to(DEV)
 
-    err_rec, err_gen = ana.getFitFractionMatrixErrors(p0, H_t)
+    err_rec, err_gen = matrix_errors(ana, p0, H_t)
     assert err_rec.numel() > 0
 
     def F_of(pu):
         if nθ:
             ana.reCalcAmp(pu[2 * n:].contiguous())
         c = torch.complex(pu[:n], pu[n:2 * n]).contiguous().to(DEV)
-        return _norm(ana.getFitFractionMatrix(c, sample="truth").cpu().numpy())
+        return _norm(fit_fraction_matrix(ana, c, sample="truth").cpu().numpy())
 
     ntoy = 60
     samples = []

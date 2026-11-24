@@ -1,7 +1,8 @@
 # CHANGELOG（`example/`）
 
 本文件记录对上游 `BHXiang/ctpwa` 的改动中、**`example/` 目录内**各文件的内容变化
-（PR #1–#26）。其它目录随上游维护，不在本表。
+（PR #1–#26）。其它目录通常随上游维护，不在本表；
+唯一例外是 `setup.py` 的 C++20 改动（见 2026-11-24，本 fork 与上游的第一处非 `example/` 分歧）。
 **组织方式：先按合并进 `main` 的日期（`##`）分组，日期内再按文件（`###`）分组**；
 不涉及 `example/` 的上游同步提交也按日期归入各日期的「上游同步」小节。
 “PR #n”指 `wwdws1/ctpwa` 的合并请求。
@@ -9,6 +10,63 @@
 > 只列**行为/接口/文档**变化；纯格式（ruff-format/空白）只在首次记录。
 
 ---
+
+## 2026-11-25
+
+### `example/README.md`
+
+- §10.4.4 由「输出长什么样（真实例子）」改为**通用**的「输出块怎么读」：删掉来自具体分析
+  的示例输出（样本量、分波名、`F_i`/`I_ij` 数值、`BF_i` 等），只保留各输出块的含义表；
+- §10.4.1 里"本 config 的 `Number of partial waves: 17 (SL amplitudes: 42)`"改成通用写法
+  （`N` / `M`，只说明"矩阵维度是分波数、不等于 SL 振幅数"）。
+- 结论不变：`fit.py` 打印的 `fit fractions` 就是 `read_interference.py` 里那张逐波表。
+- **README 只留"当前行为 + 用法"**，把"改了什么/以前怎样"统一放到本文件（`CHANGELOG.md`）：
+  - §10.4 开头删掉 v0.3.23/v0.3.24 的实现沿革块，改为一句现状（重建侧 `B̄` 收缩、产生侧一趟
+    `phsp_truth`、误差只含耦合）；
+  - §1 路径口径、§7.3 正定判据、§7.7 warm-start、§9 GPU 策略、§11.5 标题里的"PR #/日期/旧版"表述全部去掉；
+  - §8 标题去掉"（上游 `bc70a79` 并入）"，§11.5 改名"复现旧结果（`--amp-lambda`）"（只留操作步骤）；
+  - §6/§10.4/§11.3 里"0.3.22 起取代旧的 `interference`"改为当前事实："没有 `interference` 对象，
+    用 `interference_rec` / `interference_gen`"。
+
+## 2026-11-24
+
+### 上游同步（库；`example/` 上游未改动，merge 无冲突）
+
+- （PR #33）并入上游 `cf4a23c → 8929669`（**v0.3.23 + v0.3.24**）：
+  - v0.3.23：`writeResult` 的重建侧矩阵改用常驻 `B̄ = Σ(w/W)A A^H` 收缩（不读 `phsp`、不重算振幅；
+    1M 事例 47.4 s → 24.3 s）；误差矩阵改**解析**传播（rec 由 `B̄` 代数、gen 复用一趟扫描的 ± 方向，
+    成本与耦合数无关；200k/2 耦合 40 s → 1.9 s）；修 `reCalcAmp(θ)` 后 `B̄` 不重建；
+    去掉 `[writeResult]`/`[phsp]` 进度打印，计时只在 `CTPWA_VERBOSE=1` 输出。
+  - v0.3.24：修 0.3.23 的矩阵维度 bug（按逐 SL 振幅 → 按 `nSLvectors_` 合并 LS）；删除
+    `getFitFractionMatrix` / `getFitFractionMatrixErrors` 公共 API（`tests/conftest.py` 改为
+    "写 ROOT 再读回"复现）。已知限制：`interference_*_err` 只含耦合方向，θ 方向待解析 `dF` 路线。
+- **`setup.py`：`-std=c++17` → `-std=c++20`**（CUDA `cxx` / `nvcc` / CPU 三处）。这是本 fork 第一处
+  与上游不同的**非 `example/`** 改动——上游仍是 C++17，而 torch ≥ 2.13 的 C++ 头文件要求 C++20。
+
+### `example/fit.py`
+
+- **拟合分数输出改用 ROOT 里的相干口径**（与 `weight_best.root` 逐位一致）：
+  - 默认从 `<output-dir>/weight_best.root` 读 `interference_gen`（产生侧）对角 → `F_i`，
+    与 `read_interference.py` 的逐波表完全相同；`ΣF + ΣI = 1` 同时打印做闭合自检。
+  - `σ` 取 `interference_gen_err` 对角（v0.3.23+ 只含耦合方向；Hessian 非正定时 C++ 不写，
+    此时打一行警告、只给中心值）。
+  - **不再计算/打印旧口径**：删掉 `compute_fit_fractions()`（非相干分母 `Σ=1`），
+    日志只在来源行提示一句"旧日志里的 fit fractions 已停用，两者相差 `1/ΣF`"。
+  - 读不到矩阵 / 没装 `uproot` → 只提示"不输出拟合分数"（**不再回退**旧的
+    `getFitFractions`；对应地，"FF 失败 → 跳过效率"那条分支也一并删掉）。
+  - 默认路径不再调 `getFitFractions`：省掉 `phsp_truth` 的一趟中心积分 + `2·2n` 趟扰动积分
+    （本 config：82 个扰动方向 × 2）。
+  - `optimization_summary.txt` 的 FF 段落带上口径说明（`ff_note`），无 σ 时写"± (无误差)"。
+
+### `example/README.md`
+
+- §1：最低版本补 `≥ 0.3.22`（ROOT 里的干涉矩阵 + `read_interference.py`）与 `≥ 0.3.24`
+  （矩阵按分波合并 LS）；"本机当前"改为 0.3.24；新增"从源码编译用 C++20"一条。
+- §10.4：标题去掉「（上游 v0.3.22）」；引言补 v0.3.23/0.3.24 的实现变化与维度 bug
+  （"读到 0.3.23 生成的 ROOT 时矩阵会偏大"）；`*_err` 说明改为**只含耦合方向、θ 暂不传播**；
+  "缺 `*_err`" 的原因改为"耦合自由块 Hessian 非正定"；扫描成本改为
+  "rec 0 趟（常驻 `B̄`）+ gen 1 趟"，并说明误差矩阵成本与耦合数无关；
+  计时段说明改为 `CTPWA_VERBOSE=1`（默认不再打印 `[writeResult] … ms`）。
 
 ## 2026-11-23
 

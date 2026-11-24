@@ -2402,40 +2402,6 @@ class UnifiedPWAOptimizer:
         return params[2 * self.n_coupling_free :]
 
     # --------------------------------------------------------
-    def compute_fit_fractions(self, params=None):
-        """拟合分数 (fit fractions): FF_i = ∫|A_i|² / Σ_j ∫|A_j|²。
-        只用 phsp_truth（无效率 MC）→ 与效率/归一化无关，跨实验可比。
-        配了 phsp_truth_weights 时改为 Σw|A_i|²（带模型产生的 truth 样本
-        用 w∝1/|M_gen|² 重加权即可当平坦 PHSP MC）。
-        误差传播用拟合同源的统一 Hessian（缓存命中直接复用）。"""
-        if params is None:
-            if self.best_params is None:
-                log.warning("没有优化结果!")
-                return None, None
-            params = self.best_params
-
-        coupling = self.extract_coupling_complex(params)
-        # 传拟合同源的全量 Hessian → FF 误差的正定性判定与拟合完全一致
-        # （旧版内部用独立的 computeCouplingHessian, 近平坦方向
-        #  min_eig~1e-5 时正定判定翻脸 → 误差被跳过变全 0）。
-        hessian_full = self._get_hessian_cached(params)
-        # 非正定 → 按 err_mode 构造 PSD 化曲率再传给 C++（否则 C++ 静默把误差置 0）
-        curv, info = self._propagation_curvature(params)
-        if curv is None:
-            log.warning(f"[ff] 拟合分数误差不传播（{info.get('mode')}）；仅输出中心值")
-            curv = hessian_full
-        # getFitFractions 在配置无 phsp_truth 时天然返回空张量 [0,2]
-        # （早期拟合不带 mctruth）→ 这里自然跳过, 不抛异常、不触碰相关 kernel
-        ff_result = self.analysis.getFitFractions(coupling, curv)
-        if ff_result is None or ff_result.numel() == 0:
-            log.warning(
-                "跳过拟合分数: 配置没有 phsp_truth (无效率相空间 MC), "
-                "需要时再加入并重跑"
-            )
-            return None, None
-        return ff_result[:, 0], ff_result[:, 1]
-
-    # --------------------------------------------------------
     def compute_efficiency(self, params=None):
         """分波效率: ε_i = (Σ_{phsp}w|A_i|²/Σw) / (Σ_{phsp_truth}w|A_i|²/Σw)。
         phsp(如 cut 后 MC)=带效率样本, phsp_truth=无效率 MC truth,
@@ -2943,6 +2909,7 @@ class UnifiedPWAOptimizer:
         output_dir="results",
         ff_requested=True,
         eff_requested=False,
+        ff_note="",
     ):
         if not self.all_results:
             log.warning("没有结果!")
@@ -3026,10 +2993,17 @@ class UnifiedPWAOptimizer:
 
             if fit_values is not None:
                 f.write("=" * 100 + "\n")
-                f.write("最佳拟合分数 (fit fractions, 无效率/MC无关):\n")
+                f.write(
+                    "最佳拟合分数 (fit fractions"
+                    + (f", {ff_note}" if ff_note else "")
+                    + "):\n"
+                )
                 f.write("=" * 100 + "\n")
                 for i in range(len(fit_values)):
-                    f.write(f"{i:2d}: {fit_values[i]:.6e} ± {fit_errors[i]:.6e}\n")
+                    if fit_errors is not None:
+                        f.write(f"{i:2d}: {fit_values[i]:.6e} ± {fit_errors[i]:.6e}\n")
+                    else:
+                        f.write(f"{i:2d}: {fit_values[i]:.6e} ± (无误差)\n")
             elif not ff_requested:
                 f.write("最佳拟合分数: 未计算（--cal-ff False）\n")
             else:
@@ -3105,6 +3079,87 @@ def _str2bool(v: str) -> bool:
     if s in ("0", "false", "f", "no", "n"):
         return False
     raise argparse.ArgumentTypeError(f"期望 True/False，收到: {v!r}")
+
+
+def _read_root_matrix(f, name):
+    """读 ROOT 里的 `TMatrixD`（`fElements` 是行主序展平数组）。"""
+    obj = f[name]
+    nrow = int(obj.member("fNrows"))
+    ncol = int(obj.member("fNcols"))
+    flat = np.asarray(obj.member("fElements"), dtype=float)
+    return flat.reshape(nrow, ncol)
+
+
+def _read_ff_from_root(root_path):
+    """从 `weight_best.root` 读**文献口径**（相干分母）的 fit fraction。
+
+    `writeResult` 写出的 `interference_gen`（产生侧）/ `interference_rec`（重建侧）按本样本
+    相干总额 W 归一：对角 = `F_i`、上三角 = `I_ij`、`ΣF + ΣI = 1`。这里只取对角与误差矩阵
+    的对角（`interference_*_err`，v0.3.23+ 仅含耦合方向；Hessian 非正定时不写）。
+
+    返回 dict（找不到时返回 None，由调用方决定回退旧口径）：
+      labels : list[str] | None
+      F      : list[float]
+      sigma  : list[float] | None
+      sum_F, sum_I : float
+      sample : "gen" | "rec"
+      W, N   : float | None
+    """
+    try:
+        import uproot
+    except ImportError:
+        log.warning(
+            "未安装 uproot → 无法从 weight_best.root 读干涉矩阵（pip install uproot）"
+        )
+        return None
+    if not os.path.exists(root_path):
+        return None
+    try:
+        with uproot.open(root_path) as f:
+            keys = {k.split(";")[0] for k in f.keys()}
+            sample = next(
+                (x for x in ("gen", "rec") if f"interference_{x}" in keys), None
+            )
+            if sample is None:
+                return None
+            M = _read_root_matrix(f, f"interference_{sample}")
+            E = (
+                _read_root_matrix(f, f"interference_{sample}_err")
+                if f"interference_{sample}_err" in keys
+                else None
+            )
+            labels = None
+            try:
+                leg = [str(x) for x in f["legends"]["legend"].array(library="np")[0]]
+                if len(leg) == M.shape[0]:
+                    labels = leg
+            except Exception:  # noqa: BLE001 - 没有 legends 就用 wave<i>
+                labels = None
+            meta = {}
+            if "integrals" in keys:
+                t = f["integrals"].arrays(library="np")
+                meta = {
+                    k: (int(v[0]) if k == "npartials" else float(v[0]))
+                    for k, v in t.items()
+                }
+    except Exception as e:  # noqa: BLE001 - ROOT 读失败不应把主流程弄挂
+        log.warning(f"读 {root_path} 的干涉矩阵失败: {e}")
+        return None
+
+    n = M.shape[0]
+    F = [float(M[i, i]) for i in range(n)]
+    sum_F = float(sum(F))
+    sum_I = float(M[np.triu_indices(n, 1)].sum()) if n > 1 else 0.0
+    return {
+        "labels": labels,
+        "F": F,
+        "sigma": [float(E[i, i]) for i in range(n)] if E is not None else None,
+        "sum_F": sum_F,
+        "sum_I": sum_I,
+        "sample": sample,
+        "W": meta.get(f"W_{sample}"),
+        "N": meta.get(f"N_{sample}"),
+    }
 
 
 def _apply_determinism(seed=42):
@@ -4337,7 +4392,6 @@ def main():
     # 默认只算 FF（--cal-ff True）；效率需显式 --cal-eff True（默认关）。
     ff_values = ff_errors = None
     eff_values = eff_errors = None
-    ff_error = None
 
     if cfg["cal_ff"] or cfg["cal_eff"]:
         if not best_res.get("is_positive_definite", False):
@@ -4356,34 +4410,64 @@ def main():
             [n for n, on in (("FF", cfg["cal_ff"]), ("效率", cfg["cal_eff"])) if on]
         )
         log.warning(
-            f"即将计算 {_what}；若因 phsp/phsp_truth 过大而失败/崩溃，"
-            "请减小其样本量后重跑（可加 --ff-only 跳过拟合直接重算）。"
+            f"即将输出 {_what}：FF 直接读 weight_best.root 的干涉矩阵（writeResult 已算好，"
+            "不再额外扫 phsp_truth）；效率仍需扫 phsp/phsp_truth，过大时可能失败/崩溃"
+            "（可加 --ff-only 跳过拟合直接重算）。"
         )
     else:
         log.info("跳过 FF/效率计算（--cal-ff False 且 --cal-eff False）。")
 
+    ff_note = ""
     if cfg["cal_ff"]:
-        try:
-            ff_values, ff_errors = optimizer.compute_fit_fractions(
-                best_res["final_params"]
+        ff_info = _read_ff_from_root(best_weight_file)
+        if ff_info is not None:
+            # 文献口径：F_i = diag(interference_gen)，ΣF + ΣI = 1（与 ROOT 里完全一致）
+            F, sig = ff_info["F"], ff_info["sigma"]
+            labels = ff_info["labels"] or [f"wave{i}" for i in range(len(F))]
+            side = (
+                "产生侧 phsp_truth"
+                if ff_info["sample"] == "gen"
+                else "重建侧 phsp（无 phsp_truth，退回 rec）"
             )
-            if ff_values is not None:
-                print(f"\n{'=' * 80}")
-                print("最佳结果的拟合分数 (fit fractions, Σ=1, 无效率/MC无关):")
-                print(f"{'=' * 80}")
-                for i in range(len(ff_values)):
-                    print(f"{i:2d}: {ff_values[i]:.6f} ± {ff_errors[i]:.6f}")
-        except Exception as e:
-            ff_error = e
-            log.exception(f"计算拟合分数失败: {e}")
+            print(f"\n{'=' * 80}")
+            print(f"最佳结果的拟合分数 (fit fractions, 相干分母 ΣF+ΣI=1, {side}):")
+            print(f"{'=' * 80}")
+            for i, fi in enumerate(F):
+                if sig is None:
+                    print(f"{i:2d}: {fi:.6f}              {labels[i][:40]}")
+                else:
+                    print(f"{i:2d}: {fi:.6f} ± {sig[i]:.6f}   {labels[i][:40]}")
+            print(
+                f"ΣF = {ff_info['sum_F']:.6f}, ΣI = {ff_info['sum_I']:+.6f}, "
+                f"闭合 (ΣF+ΣI) = {ff_info['sum_F'] + ff_info['sum_I']:.6f}"
+            )
+            print(
+                "来源: weight_best.root 的 interference_%s；旧日志里的 fit fractions"
+                "（非相干分母 Σ=1）已停用，两者相差 1/ΣF。" % ff_info["sample"]
+            )
+            if sig is None:
+                log.warning(
+                    "ROOT 里没有 interference_*_err（耦合自由块 Hessian 非正定，或设了 "
+                    "CTPWA_WR_NO_ERR）→ 只给中心值"
+                )
+            ff_values, ff_errors = F, sig
+            ff_note = "相干分母，来自 weight_best.root"
+        else:
+            # 不再回退旧的 getFitFractions（非相干口径已停用）：只提示缺什么
+            log.warning(
+                "weight_best.root 里没有 interference_gen/rec 矩阵（或未安装 uproot）"
+                "→ 不输出拟合分数；旧的非相干口径已停用，不再回退计算"
+            )
+            print(
+                "\n（未输出拟合分数：weight_best.root 里没有干涉矩阵；"
+                "见 README §10.4 / read_interference.py）"
+            )
 
     # ---- 分波效率 ----
-    # 默认关闭；仅 --cal-eff True 时计算。若 FF 已抛异常（CUDA 上下文可能已损坏），
-    # 跳过效率：它同样依赖 phsp/phsp_truth，再试只会再崩一次、并可能把进程拖死。
+    # 默认关闭；仅 --cal-eff True 时计算（它仍要扫 phsp/phsp_truth，且带 MC 统计误差，
+    # 这些都不在 weight_best.root 里，故不能像 FF 那样改读 ROOT）。
     if not cfg["cal_eff"]:
         log.info("未计算分波效率（--cal-eff 默认 False；加 --cal-eff True 开启）。")
-    elif ff_error is not None:
-        log.warning("FF 计算已失败（CUDA 上下文可能已损坏）→ 跳过效率计算。")
     else:
         try:
             eff_values, eff_errors = optimizer.compute_efficiency(
@@ -4412,6 +4496,7 @@ def main():
                 output_dir=write_dir,
                 ff_requested=cfg["cal_ff"],
                 eff_requested=cfg["cal_eff"],
+                ff_note=ff_note,
             )
         except Exception as e:
             log.exception(f"写带 FF/效率的摘要失败（核心摘要已在盘上）: {e}")

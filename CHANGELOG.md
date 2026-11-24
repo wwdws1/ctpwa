@@ -27,6 +27,29 @@
   `compute_param_errors` + `_err_fields` 重算）。
 - `example/gen_phsp_mc.py`：文件头/`--help` 的 `phsp_truth` 对比改为中性表述。
 
+### Changed（fork `wwdws1/ctpwa`：同步 v0.3.24 + C++20）
+
+- 并入上游 `cf4a23c → 8929669`（**v0.3.23 + v0.3.24**，`example/` 上游未动）：
+  - 重建侧干涉矩阵改用常驻 `B̄` 收缩（不再读 `phsp` 文件），`writeResult` 1M 事例 47.4 s → 24.3 s；
+  - 误差矩阵改解析传播（只含**耦合**方向；1 趟而非 `4·n_free` 趟，200k/2 耦合 40 s → 1.9 s）；
+  - 修 θ 变了 `B̄` 不重建（`rebuildPhspGram()`）；
+  - 修 0.3.23 引入的矩阵维度 bug（按 SL 振幅拆行 → 按分波合并 LS）；
+  - 删 `getFitFractionMatrix` / `getFitFractionMatrixErrors` 公共 API（矩阵与误差统一走
+    `writeResult` 写出的 ROOT 对象）；
+  - 去掉 `[writeResult]` / `[phsp] events:` 等进度打印，计时只在 `CTPWA_VERBOSE=1` 时输出。
+- **本 fork 的 `setup.py` 改用 `-std=c++20`**（上游仍 `-std=c++17`；torch ≥ 2.13 的头文件要求），
+  三处（CUDA `cxx` / `nvcc` / CPU）同步。
+- `example/fit.py`：**拟合分数改为从 `weight_best.root` 读**（`interference_gen` 对角 = 文献口径
+  `F_i`，相干分母 `ΣF+ΣI=1`，与 ROOT 逐位一致）。旧的非相干口径不再计算、也不打印数值，
+  只在来源行提示"旧日志里的 fit fractions 已停用（相差 1/ΣF）"；
+  `σ` 取 `interference_*_err` 对角（缺该矩阵时只给中心值并警告）。读不到矩阵或没装 `uproot`
+  时只提示"没有矩阵、不输出"（不再回退旧的 `getFitFractions`）。默认路径不扫 `phsp_truth`（省一趟中心积分 +
+  `2·2n` 趟扰动积分）。
+- `example/README.md`：§1 补最低版本（0.3.22 / 0.3.24）与 C++20 编译说明；§10.4 同步实现变化
+  （成本、误差只含耦合、0.3.23 维度 bug、计时开关），标题去掉版本号；§4/§7 说明
+  `fit.py` 打印的 FF 现在就是 ROOT 里的 `F_i`；§10.4.4 改为**通用**的"输出块怎么读"
+  （不再放任何来自内部具体分析的示例数值/分波名），§10.4.1 的分波数也改成通用写法。
+
 ### Changed（fork `wwdws1/ctpwa`：PR #32，章节归位）
 
 - `example/README.md`：把「读取 `weight_best.root` 里的干涉矩阵」从独立的 §12 移进 **§10.4**
@@ -34,6 +57,64 @@
   子节编号改为 10.4.1–10.4.5；§6 / §10.1 / §11.3 的交叉引用同步改为 §10.4；§10 引言由
   "三个脚本"改为"四个脚本"。
 
+
+## [v0.3.24] - 2026-11-24
+
+### Fixed
+
+- **干涉矩阵维度错了**：常驻 `B̄` 的收缩原来按"逐 SL 振幅"做，导致同一分波的多个
+  L/S 组合各占一行。现在按 `nSLvectors_` **合并 LS**（与
+  `ComputeResults.cu::computeModWithInterference` 的口径一致：分波 = 链 × 共振态组合，
+  内部 LS 相干求和）：
+  `ls_filter` 4×4 → **1×1**、`eff2` 2×2、`with_trans` 6×6。
+
+### Removed
+
+- **`getFitFractionMatrix` / `getFitFractionMatrixErrors` 公共 API 删除**。矩阵与
+  误差统一由 `writeResult` 写进 `weight_best.root`（`interference_rec/gen`、
+  `interference_*_err`、`integrals`）。C++ 侧改为内部函数
+  `matrixForSample()` / `computeMatrixErrors()`。
+- 测试同步迁移：`tests/conftest.py` 提供 `fit_fraction_matrix()` /
+  `matrix_errors()`，通过"写一次 ROOT 再读回"复现原 API 的返回值，
+  5 个测试文件共 30 余处调用全部改为读 ROOT。
+
+### Known limitation
+
+- `interference_*_err` 目前**只含耦合方向**的参数误差。θ 方向的有限差分在
+  `M ~ 1e4`、宽度 4.5 MeV 时被舍入噪声主导（实测与参考差 300 倍），必须走
+  逐事例 `d_dF` 的解析路线（表已在 `reComputeAmps` 里生成，待接进扫描）。
+
+## [v0.3.23] - 2026-11-23
+
+### Changed（性能）
+
+- **重建侧干涉矩阵改用常驻 `B̄`**：`writeResult` 与
+  `getFitFractionMatrix("phsp")` 不再读 phsp 文件、不再重算振幅，而是
+  `M_ij = 2Re(v_i v_j* B̄_ij)`（`B̄ = Σ_e (w_e/W_total) A_e A_e^H`，NLL 的 phsp
+  分母，本来就在显存里）。1M 事例下 `writeResult` 47.4 s → 24.3 s，剩下的
+  24 s 全是 `phsp_truth` 那一趟（truth 没有常驻表，省不掉）。
+  文件路径已删除（`getFitFractionMatrix("phsp")` 现在走常驻 Gram）。
+
+- **误差矩阵改为解析传播（耦合方向）**：`getFitFractionMatrixErrors` 不再对
+  每个自由方向跑两趟全样本扫描（`4·n_free` 趟），改成
+  - 重建侧：`B̄` 收缩（0 趟）；
+  - 产生侧：一趟 `computeFileBatchIntegrals`，通过已有的
+    `ev_perturbed_p/m` 通道复用同一批振幅算出所有方向的导数；
+  - `Cov = H[coupling, coupling]⁻¹`，自由块只取耦合。
+  200k 事例（2 个自由耦合）实测 40.05 s → 1.89 s（**21×**）；趟数从
+  `4·n_free` 降到 `1`，与耦合数无关。
+  **θ 方向暂不传播**（等 `Hm = Σ w(∂_θA A^H + A ∂_θA^H)` 接进同一趟）。
+
+### Fixed
+
+- **θ 变了 `B̄` 不重建**：重建逻辑从 `getHessian` 抽成 `rebuildPhspGram()`，
+  `reCalcAmp(θ)`、`writeResult(θ)` 与 `getHessian` 都调用它。此前只有
+  `getHessian` 会刷新，`reCalcAmp` 之后份额/矩阵会拿到旧 θ 的 `B̄`。
+
+### Changed（日志）
+
+- 去掉 `[writeResult] ...`、`[phsp] events: ...` 这类带方括号的进度打印；
+  计时行只在 `CTPWA_VERBOSE=1` 时输出，事件数只在真正读文件时打印。
 
 ## [v0.3.22] - 2026-11-22
 
