@@ -287,7 +287,7 @@ python fit.py --optimizer projected --runs 5
 | `--optimizer` | 优化器：`reparam`/`projected`/`lbfgs` | `reparam` | `FIT_OPTIMIZER` | — |
 | `--opt-verbose` | 每轮打印 projected 的 `pg/active/ΔNLL` | False | `FIT_OPT_VERBOSE=1` | projected |
 | `--ff-only` | 只算拟合分数：跳过拟合与 polish，用最佳参数（`--warm-start` 或 `<output-dir>/best_params.pt`） | False | `FIT_FF_ONLY=1` | — |
-| `--cal-ff` | 是否输出拟合分数（`True`/`False` 带值；默认开）。**从 `weight_best.root` 的干涉矩阵读**（相干分母 `F_i`，与 ROOT 一致）；读不到矩阵时回退旧的 `getFitFractions`（非相干分母 `Σ=1`） | `True` | — | — |
+| `--cal-ff` | 是否输出拟合分数（`True`/`False` 带值；默认开）。**从 `weight_best.root` 的干涉矩阵读**（相干分母 `F_i`，与 ROOT 一致）；读不到矩阵时**只提示、不输出**（旧的非相干口径已停用） | `True` | — | — |
 | `--cal-eff` | 是否计算分波效率（默认关；大 `phsp`/`phsp_truth` 上可能 C++ 崩溃，建议配小样本 config + `--ff-only`） | `False` | — | — |
 
 ### 误差估计（Hessian 非正定回退）
@@ -904,7 +904,7 @@ $ python3 read_interference.py results/weight_best.root --sample gen
 | `Σ_i F_i = 2.129` | 对角和。本例 **远大于 1** = 各波之间强烈相消（360° 相位差），不是错误 |
 | `Σ_{i<j} I_ij = -1.129` | 干涉项之和，本例为负（相消）；与上一行相加必须 = 1 |
 | `闭合 (ΣF+ΣI) = 1.000000` | 自检。不等于 1（比如 0.99998）说明矩阵被截断/读错 |
-| `非相干份额` | `diag/Σdiag`；`fit.py` 末尾会**另起一行**打这个（旧口径 `Σ=1`），便于与历史结果对照（本例 0.0609 ↔ 0.060864，0.2405 ↔ 0.240524） |
+| `非相干份额` | `diag/Σdiag`；`fit.py` **不再**打印这个数（旧口径已停用），只在来源行提示"两者相差 `1/ΣF`"；需要时用本脚本看（本例 0.0609 ↔ 0.060864） |
 | 逐波表 `F_i` / `σF_i` | 文献口径 fit fraction；`σF_i = -` 表示没有误差矩阵（本例 Hessian 非正定，§10.4.5）。**`fit.py` 末尾打印的 `fit fractions` 块就是这张表**（同一份 `weight_best.root`，逐位一致） |
 | 矩阵 | 对角 = `F_i`，上三角 = `I_ij`。本例 `I(10,4) = -0.228`、`I(10,5) = -0.178` 是最大的两对相消，`F_10 = 0.512` 也因此被抬得最高 |
 | 效率块 | `ε̄ = W_rec/W_gen`；逐波 `ε_i` 只在两样本同源产生时可解释 |

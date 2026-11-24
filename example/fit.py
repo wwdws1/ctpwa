@@ -2402,44 +2402,6 @@ class UnifiedPWAOptimizer:
         return params[2 * self.n_coupling_free :]
 
     # --------------------------------------------------------
-    def compute_fit_fractions(self, params=None):
-        """**旧口径（非相干分母）**拟合分数: FF_i = ∫|A_i|² / Σ_j ∫|A_j|²。
-
-        ⚠ 现在只在 `weight_best.root` 里读不到干涉矩阵时作为回退（见 `_read_ff_from_root`）：
-        它恒有 `Σ FF = 1`，与文献/ROOT 的相干分母 `F_i`（`ΣF + ΣI = 1`）差 `1/ΣF` 倍。
-        旧说明如下。
-        只用 phsp_truth（无效率 MC）→ 与效率/归一化无关，跨实验可比。
-        配了 phsp_truth_weights 时改为 Σw|A_i|²（带模型产生的 truth 样本
-        用 w∝1/|M_gen|² 重加权即可当平坦 PHSP MC）。
-        误差传播用拟合同源的统一 Hessian（缓存命中直接复用）。"""
-        if params is None:
-            if self.best_params is None:
-                log.warning("没有优化结果!")
-                return None, None
-            params = self.best_params
-
-        coupling = self.extract_coupling_complex(params)
-        # 传拟合同源的全量 Hessian → FF 误差的正定性判定与拟合完全一致
-        # （旧版内部用独立的 computeCouplingHessian, 近平坦方向
-        #  min_eig~1e-5 时正定判定翻脸 → 误差被跳过变全 0）。
-        hessian_full = self._get_hessian_cached(params)
-        # 非正定 → 按 err_mode 构造 PSD 化曲率再传给 C++（否则 C++ 静默把误差置 0）
-        curv, info = self._propagation_curvature(params)
-        if curv is None:
-            log.warning(f"[ff] 拟合分数误差不传播（{info.get('mode')}）；仅输出中心值")
-            curv = hessian_full
-        # getFitFractions 在配置无 phsp_truth 时天然返回空张量 [0,2]
-        # （早期拟合不带 mctruth）→ 这里自然跳过, 不抛异常、不触碰相关 kernel
-        ff_result = self.analysis.getFitFractions(coupling, curv)
-        if ff_result is None or ff_result.numel() == 0:
-            log.warning(
-                "跳过拟合分数: 配置没有 phsp_truth (无效率相空间 MC), "
-                "需要时再加入并重跑"
-            )
-            return None, None
-        return ff_result[:, 0], ff_result[:, 1]
-
-    # --------------------------------------------------------
     def compute_efficiency(self, params=None):
         """分波效率: ε_i = (Σ_{phsp}w|A_i|²/Σw) / (Σ_{phsp_truth}w|A_i|²/Σw)。
         phsp(如 cut 后 MC)=带效率样本, phsp_truth=无效率 MC truth,
@@ -3140,7 +3102,6 @@ def _read_ff_from_root(root_path):
       F      : list[float]
       sigma  : list[float] | None
       sum_F, sum_I : float
-      noncoh : list[float] | None      # F_i/ΣF（旧 getFitFractions 口径，Σ=1）
       sample : "gen" | "rec"
       W, N   : float | None
     """
@@ -3195,7 +3156,6 @@ def _read_ff_from_root(root_path):
         "sigma": [float(E[i, i]) for i in range(n)] if E is not None else None,
         "sum_F": sum_F,
         "sum_I": sum_I,
-        "noncoh": [x / sum_F for x in F] if sum_F else None,
         "sample": sample,
         "W": meta.get(f"W_{sample}"),
         "N": meta.get(f"N_{sample}"),
@@ -4432,7 +4392,6 @@ def main():
     # 默认只算 FF（--cal-ff True）；效率需显式 --cal-eff True（默认关）。
     ff_values = ff_errors = None
     eff_values = eff_errors = None
-    ff_error = None
 
     if cfg["cal_ff"] or cfg["cal_eff"]:
         if not best_res.get("is_positive_definite", False):
@@ -4482,14 +4441,9 @@ def main():
                 f"ΣF = {ff_info['sum_F']:.6f}, ΣI = {ff_info['sum_I']:+.6f}, "
                 f"闭合 (ΣF+ΣI) = {ff_info['sum_F'] + ff_info['sum_I']:.6f}"
             )
-            if ff_info["noncoh"]:
-                print(
-                    "非相干份额 F_i/ΣF（旧 getFitFractions 口径，Σ=1）: "
-                    + ", ".join(f"{x:.4f}" for x in ff_info["noncoh"])
-                )
             print(
-                "来源: weight_best.root 的 interference_%s / read_interference.py"
-                % ff_info["sample"]
+                "来源: weight_best.root 的 interference_%s；旧日志里的 fit fractions"
+                "（非相干分母 Σ=1）已停用，两者相差 1/ΣF。" % ff_info["sample"]
             )
             if sig is None:
                 log.warning(
@@ -4499,35 +4453,21 @@ def main():
             ff_values, ff_errors = F, sig
             ff_note = "相干分母，来自 weight_best.root"
         else:
-            # 回退：旧的 getFitFractions（非相干分母 Σ=1；要再扫一趟 phsp_truth）
+            # 不再回退旧的 getFitFractions（非相干口径已停用）：只提示缺什么
             log.warning(
-                "weight_best.root 里没有可用的干涉矩阵 → 回退到旧的 getFitFractions"
-                "（非相干分母 Σ=1，与 ROOT 的 F_i 不同）"
+                "weight_best.root 里没有 interference_gen/rec 矩阵（或未安装 uproot）"
+                "→ 不输出拟合分数；旧的非相干口径已停用，不再回退计算"
             )
-            try:
-                ff_values, ff_errors = optimizer.compute_fit_fractions(
-                    best_res["final_params"]
-                )
-                if ff_values is not None:
-                    print(f"\n{'=' * 80}")
-                    print(
-                        "最佳结果的非相干份额 (F_i/ΣF, 旧 getFitFractions 口径, Σ=1):"
-                    )
-                    print(f"{'=' * 80}")
-                    for i in range(len(ff_values)):
-                        print(f"{i:2d}: {ff_values[i]:.6f} ± {ff_errors[i]:.6f}")
-                    ff_note = "非相干分母（旧口径，σ 与 ROOT 不同）"
-            except Exception as e:
-                ff_error = e
-                log.exception(f"计算拟合分数失败: {e}")
+            print(
+                "\n（未输出拟合分数：weight_best.root 里没有干涉矩阵；"
+                "见 README §10.4 / read_interference.py）"
+            )
 
     # ---- 分波效率 ----
-    # 默认关闭；仅 --cal-eff True 时计算。若 FF 已抛异常（CUDA 上下文可能已损坏），
-    # 跳过效率：它同样依赖 phsp/phsp_truth，再试只会再崩一次、并可能把进程拖死。
+    # 默认关闭；仅 --cal-eff True 时计算（它仍要扫 phsp/phsp_truth，且带 MC 统计误差，
+    # 这些都不在 weight_best.root 里，故不能像 FF 那样改读 ROOT）。
     if not cfg["cal_eff"]:
         log.info("未计算分波效率（--cal-eff 默认 False；加 --cal-eff True 开启）。")
-    elif ff_error is not None:
-        log.warning("FF 计算已失败（CUDA 上下文可能已损坏）→ 跳过效率计算。")
     else:
         try:
             eff_values, eff_errors = optimizer.compute_efficiency(

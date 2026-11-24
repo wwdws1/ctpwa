@@ -33,9 +33,10 @@
     与 `read_interference.py` 的逐波表完全相同；`ΣF + ΣI = 1` 同时打印做闭合自检。
   - `σ` 取 `interference_gen_err` 对角（v0.3.23+ 只含耦合方向；Hessian 非正定时 C++ 不写，
     此时打一行警告、只给中心值）。
-  - 另打一行**旧口径**的非相干份额 `F_i/ΣF`（`Σ=1`），便于与历史结果对照。
-  - 读不到矩阵 / 没装 `uproot` → 回退旧的 `getFitFractions`（非相干分母），并在日志里
-    明确标注口径，不会把两种数混在一起。
+  - **不再计算/打印旧口径**：删掉 `compute_fit_fractions()`（非相干分母 `Σ=1`），
+    日志只在来源行提示一句"旧日志里的 fit fractions 已停用，两者相差 `1/ΣF`"。
+  - 读不到矩阵 / 没装 `uproot` → 只提示"不输出拟合分数"（**不再回退**旧的
+    `getFitFractions`；对应地，"FF 失败 → 跳过效率"那条分支也一并删掉）。
   - 默认路径不再调 `getFitFractions`：省掉 `phsp_truth` 的一趟中心积分 + `2·2n` 趟扰动积分
     （本 config：82 个扰动方向 × 2）。
   - `optimization_summary.txt` 的 FF 段落带上口径说明（`ff_note`），无 σ 时写"± (无误差)"。
