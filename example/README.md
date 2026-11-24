@@ -46,7 +46,7 @@ Hessian / 参数误差 → 保存结果与摘要。
   - [10.1 `plot.py` 使用说明](#101-plotpy-使用说明)
   - [10.2 `gen_phsp_mc.py`：平坦相空间（P1，**不需要 GPU**）](#102-gen_phsp_mcpy平坦相空间p1不需要-gpu)
   - [10.3 `gen_toy_mc.py`：振幅加权 toy → pseudo-data（P2/P3，**需要 backend**）](#103-gen_toy_mcpy振幅加权-toy--pseudo-datap2p3需要-backend)
-  - [10.4 `read_interference.py`：读取 `weight_best.root` 里的干涉矩阵（上游 v0.3.22）](#104-read_interferencepy读取-weight_bestroot-里的干涉矩阵上游-v0322)
+  - [10.4 `read_interference.py`：读取 `weight_best.root` 里的干涉矩阵](#104-read_interferencepy读取-weight_bestroot-里的干涉矩阵)
 - [11. 干涉与幅度控制三参数](#11-干涉与幅度控制三参数)
   - [11.1 问题：干涉简并方向](#111-问题干涉简并方向)
   - [11.2 三个参数的分工](#112-三个参数的分工)
@@ -72,8 +72,13 @@ python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-3  # 可选�
 - 需要 **ctpwa 包**与 **NVIDIA GPU**（默认）。本版本要求的 ctpwa 最低版本：
   - `≥ 0.3.10`：`ctpwa.analysis(config, fit_mode)`（`--fit-mode`）；
   - `≥ 0.3.15`：新门面 `import ctpwa`（单 wheel 双后端）+ `build_info()`/`backend()`；
-  - `≥ 0.3.17`：`ctpwa.diagnostics`（可行子空间 PD 判据，见 §7/§8）。
-  本机当前：**0.3.18**。
+  - `≥ 0.3.17`：`ctpwa.diagnostics`（可行子空间 PD 判据，见 §7/§8）；
+  - `≥ 0.3.22`：`writeResult` 往 `weight_best.root` 写 `interference_rec`/`interference_gen`/
+    `*_err`/`integrals`，配 `read_interference.py`（§10.4）；
+  - `≥ 0.3.24`：干涉矩阵按分波**合并 LS**（0.3.23 会按 SL 振幅拆行、维度偏大）。
+  本机当前：**0.3.24**（本地编译版）。
+- **从源码编译**：本 fork 的 `setup.py` 用 `-std=c++20`（上游是 `-std=c++17`），因为
+  torch ≥ 2.13 的 C++ 头文件已需要 C++20。
 - **CPU 回退（`--cpu`）**：`fit.py` **默认要求 GPU**（检测不到可用 CUDA 就直接退出）；
   如确需在 CPU 上跑（慢 20–60 倍，仅适合小样本/调试），加 `--cpu` 强制 CPU 后端——
   它会在 `import ctpwa` **之前**把 `CTPWA_DEVICE` 置为 `cpu`（覆盖已有 env 并提示）。
@@ -736,11 +741,18 @@ python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
 > ⚠ `fit.py` **默认要求 CUDA**（检测不到可用 GPU 直接退出）；确需 CPU 时加 `--cpu`
 > （或 `CTPWA_DEVICE=cpu`），见 §1 / §9。
 
-### 10.4 `read_interference.py`：读取 `weight_best.root` 里的干涉矩阵（上游 v0.3.22）
+### 10.4 `read_interference.py`：读取 `weight_best.root` 里的干涉矩阵
 
 0.3.21 及以前 `weight_best.root` 里只有一个 `interference` 矩阵，分母是"对角和 `D`"，只能看形状；
 **0.3.22 起** `writeResult` 改写成两张**按本样本相干总额 `W` 归一**的对称矩阵，外加参数误差矩阵和
 `integrals` 树，并配了脚本 `read_interference.py` 直接打表。本节讲这些对象是什么、口径怎么算、怎么读。
+
+> **口径没变，实现变了两轮（用户看到的东西只有"更快"和"误差只含耦合"）**：
+> v0.3.23 起重建侧矩阵直接由常驻 `B̄ = Σ_e (w_e/W)A_e A_e^H`（NLL 的 `phsp` 分母，本来就在显存里）
+> 收缩得到，**不再读 `phsp` 文件**（1M 事例 `writeResult` 47.4 s → 24.3 s）；误差矩阵改为解析传播。
+> v0.3.24 又修了一个维度 bug：0.3.23 按"逐 SL 振幅"收缩，同一分波的多条 L/S 会各占一行
+> （例如 4×4 / 2×2 / 6×6），0.3.24 起按 `nSLvectors_` **合并 LS**，维度 = 分波数。
+> 所以**读到 0.3.23 生成的 ROOT 时矩阵会偏大**，重跑即可（口径与元素定义没变）。
 
 #### 10.4.1 `weight_best.root` 里多了什么
 
@@ -748,7 +760,7 @@ python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
 |---|---|---|---|
 | `interference_rec` | `TMatrixD` n×n | `P_ij / W_rec` | **重建侧**：`phsp` 样本（带效率 MC）。`P_ii = Σ_e w·\|A_i\|²`，`P_ij = Σ_e w·2Re(A_iA_j*)` |
 | `interference_gen` | `TMatrixD` n×n | `T_ij / W_gen` | **产生侧**：`phsp_truth` 样本（无效率）。元素定义同上 |
-| `interference_rec_err` | `TMatrixD` n×n | σ | 参数误差传播 `σ(F_ij) = √(J H⁻¹ Jᵀ)`（线性化；**不含 MC 统计误差**） |
+| `interference_rec_err` | `TMatrixD` n×n | σ | 参数误差传播 `σ(F_ij) = √(J H⁻¹ Jᵀ)`（线性化；**不含 MC 统计误差**；v0.3.23+ 只含**耦合**方向，θ 方向暂未传播） |
 | `interference_gen_err` | `TMatrixD` n×n | σ | 同上，truth 侧 |
 | `integrals` | `TTree`（1 entry） | – | `N_rec` / `W_rec` / `N_gen` / `W_gen`（`Double_t`）、`npartials`（`Int_t`） |
 | `legends` | `TTree` | – | 分波 LaTeX 标签；长度 = `npartials` 时 `read_interference.py` 拿它当行标签 |
@@ -764,11 +776,14 @@ SL 振幅耦合的下标；两者不能按下标一一对应。
 |---|---|
 | `interference_rec` | config 没有 `phsp`，或设了 `CTPWA_WR_NO_INTEGRALS=1` |
 | `interference_gen` | config 没有 `phsp_truth`，或设了 `CTPWA_WR_NO_INTEGRALS=1` |
-| `interference_*_err` | Hessian 非正定 / 没有自由方向 / 参数不是 float64（legacy complex 精度）/ `CTPWA_WR_NO_ERR=1`。C++ 端会在生成 ROOT 时的 stdout 打一行原因 |
+| `interference_*_err` | 耦合自由块的 Hessian 非正定 / 没有自由耦合方向 / 参数不是 float64（legacy complex 精度）/ `CTPWA_WR_NO_ERR=1`。C++ 端会在生成 ROOT 时的 stderr/stdout 打一行原因 |
 
-> `CTPWA_WR_NO_INTEGRALS=1` 跳过的是**两趟全样本积分**（每侧一遍），大样本上这是 `writeResult`
-> 里最贵的一步；跳过时矩阵与 `integrals` 都不写，直方图照写。
+> `CTPWA_WR_NO_INTEGRALS=1` 跳过的是矩阵中心值这一步（**v0.3.23+：重建侧 0 趟**，直接收缩常驻 `B̄`；
+> 产生侧仍是 **1 趟 `phsp_truth` 全样本扫描**，大样本上这是最贵的部分）。跳过时矩阵与 `integrals`
+> 都不写，直方图照写。
 > `save_weight_file` 会先把拟合缓存里的 Hessian 递给 `writeResult`，所以正常情况下误差矩阵不需要额外算 Hessian。
+> 误差矩阵的额外成本（v0.3.23+）：重建侧 0 趟（`B̄` 代数）、产生侧复用同一趟扫描的 ± 方向 ——
+> 与耦合数无关，不再是老版本的 `4·n_free` 趟。
 
 #### 10.4.2 矩阵口径与三个「份额」的区别
 
@@ -823,7 +838,8 @@ python3 read_interference.py results/weight_best.root --bf-total 3.7e-4 --csv ff
 #### 10.4.4 输出长什么样（真实例子）
 
 下面是 `test/test26/` 的真实产物：1/10 样本（30,591 数据事例 / 474,986 `phsp` / 500,000 `phsp_truth`）、
-`--runs 4 --niter 500 --seed 42`、ctpwa 0.3.22 编译版。先看产生侧（对外报 FF 用这侧）：
+`--runs 4 --niter 500 --seed 42`、ctpwa **0.3.22** 编译版实测（0.3.24 口径相同，只是更快；误差矩阵仍可能因
+Hessian 非正定而不写）。先看产生侧（对外报 FF 用这侧）：
 
 ```bash
 $ python3 read_interference.py results/weight_best.root --sample gen
@@ -900,11 +916,11 @@ $ python3 read_interference.py results/weight_best.root --sample gen
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | `... 里没有 interference_rec/gen`（脚本返回 1） | `CTPWA_WR_NO_INTEGRALS=1`；或 config 没有 `phsp` / `phsp_truth` | 去掉该环境变量；补样本 |
-| 有矩阵但没 `*_err` | Hessian 非正定 / 无自由方向 / 参数非 float64 / `CTPWA_WR_NO_ERR=1` | 看生成 ROOT 时 stdout 那行原因；`fit.py` 的 `--err-mode` 只管它自己的误差，不影响这里 |
+| 有矩阵但没 `*_err` | 耦合自由块 Hessian 非正定 / 无自由方向 / 参数非 float64 / `CTPWA_WR_NO_ERR=1`（θ 方向本来就不传播） | 看生成 ROOT 时 stdout 那行原因；`fit.py` 的 `--err-mode` 只管它自己的误差，不影响这里 |
 | 行标签是 `wave0/wave1…` | `legends` 长度与 `npartials` 对不上（config 的 `tex` 展开规则见教程 §4.0） | 正常；按下标对 `getFitFractions` 的返回顺序 / `h_<分波名>` 直方图（**不是** `parameters.txt` 的 SL 耦合） |
 | `--bf-total` 的 `ΣBF_i ≠ BF_total` | 差额 = 干涉项 `ΣI`（同一张表里有） | 物理上正常；要"非相干"合计就用 `ΣF` |
 | 读的是 rec 还是 gen？ | rec 带效率（`phsp`），gen 是产生侧（`phsp_truth`） | 报 fit fraction / 与文献比 → gen；与数据、效率相关 → rec |
-| 跑得很慢 / 占显存 | 矩阵本身很小；贵的是 `fit.py` 里那两趟全样本积分 | 大规模扫描可临时 `CTPWA_WR_NO_INTEGRALS=1`；日志有 `[writeResult] phsp 原始积分矩阵完成: ... ms` |
+| 跑得很慢 / 占显存 | 矩阵本身很小；贵的是 `phsp_truth` 那一趟全样本扫描（重建侧 0.3.23+ 已不读文件） | 大规模扫描可临时 `CTPWA_WR_NO_INTEGRALS=1`；要计时加 `CTPWA_VERBOSE=1`（v0.3.23+ 默认不再打印 `[writeResult] … ms`，只打 `phsp_truth 积分矩阵: … ms`） |
 
 ---
 

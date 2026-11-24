@@ -27,6 +27,21 @@
   `compute_param_errors` + `_err_fields` 重算）。
 - `example/gen_phsp_mc.py`：文件头/`--help` 的 `phsp_truth` 对比改为中性表述。
 
+### Changed（fork `wwdws1/ctpwa`：同步 v0.3.24 + C++20）
+
+- 并入上游 `cf4a23c → 8929669`（**v0.3.23 + v0.3.24**，`example/` 上游未动）：
+  - 重建侧干涉矩阵改用常驻 `B̄` 收缩（不再读 `phsp` 文件），`writeResult` 1M 事例 47.4 s → 24.3 s；
+  - 误差矩阵改解析传播（只含**耦合**方向；1 趟而非 `4·n_free` 趟，200k/2 耦合 40 s → 1.9 s）；
+  - 修 θ 变了 `B̄` 不重建（`rebuildPhspGram()`）；
+  - 修 0.3.23 引入的矩阵维度 bug（按 SL 振幅拆行 → 按分波合并 LS）；
+  - 删 `getFitFractionMatrix` / `getFitFractionMatrixErrors` 公共 API（矩阵与误差统一走
+    `writeResult` 写出的 ROOT 对象）；
+  - 去掉 `[writeResult]` / `[phsp] events:` 等进度打印，计时只在 `CTPWA_VERBOSE=1` 时输出。
+- **本 fork 的 `setup.py` 改用 `-std=c++20`**（上游仍 `-std=c++17`；torch ≥ 2.13 的头文件要求），
+  三处（CUDA `cxx` / `nvcc` / CPU）同步。
+- `example/README.md`：§1 补最低版本（0.3.22 / 0.3.24）与 C++20 编译说明；§10.4 同步实现变化
+  （成本、误差只含耦合、0.3.23 维度 bug、计时开关），标题去掉版本号。
+
 ### Changed（fork `wwdws1/ctpwa`：PR #32，章节归位）
 
 - `example/README.md`：把「读取 `weight_best.root` 里的干涉矩阵」从独立的 §12 移进 **§10.4**
