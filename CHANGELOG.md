@@ -35,6 +35,64 @@
   "三个脚本"改为"四个脚本"。
 
 
+## [v0.3.24] - 2026-11-24
+
+### Fixed
+
+- **干涉矩阵维度错了**：常驻 `B̄` 的收缩原来按"逐 SL 振幅"做，导致同一分波的多个
+  L/S 组合各占一行。现在按 `nSLvectors_` **合并 LS**（与
+  `ComputeResults.cu::computeModWithInterference` 的口径一致：分波 = 链 × 共振态组合，
+  内部 LS 相干求和）：
+  `ls_filter` 4×4 → **1×1**、`eff2` 2×2、`with_trans` 6×6。
+
+### Removed
+
+- **`getFitFractionMatrix` / `getFitFractionMatrixErrors` 公共 API 删除**。矩阵与
+  误差统一由 `writeResult` 写进 `weight_best.root`（`interference_rec/gen`、
+  `interference_*_err`、`integrals`）。C++ 侧改为内部函数
+  `matrixForSample()` / `computeMatrixErrors()`。
+- 测试同步迁移：`tests/conftest.py` 提供 `fit_fraction_matrix()` /
+  `matrix_errors()`，通过"写一次 ROOT 再读回"复现原 API 的返回值，
+  5 个测试文件共 30 余处调用全部改为读 ROOT。
+
+### Known limitation
+
+- `interference_*_err` 目前**只含耦合方向**的参数误差。θ 方向的有限差分在
+  `M ~ 1e4`、宽度 4.5 MeV 时被舍入噪声主导（实测与参考差 300 倍），必须走
+  逐事例 `d_dF` 的解析路线（表已在 `reComputeAmps` 里生成，待接进扫描）。
+
+## [v0.3.23] - 2026-11-23
+
+### Changed（性能）
+
+- **重建侧干涉矩阵改用常驻 `B̄`**：`writeResult` 与
+  `getFitFractionMatrix("phsp")` 不再读 phsp 文件、不再重算振幅，而是
+  `M_ij = 2Re(v_i v_j* B̄_ij)`（`B̄ = Σ_e (w_e/W_total) A_e A_e^H`，NLL 的 phsp
+  分母，本来就在显存里）。1M 事例下 `writeResult` 47.4 s → 24.3 s，剩下的
+  24 s 全是 `phsp_truth` 那一趟（truth 没有常驻表，省不掉）。
+  文件路径已删除（`getFitFractionMatrix("phsp")` 现在走常驻 Gram）。
+
+- **误差矩阵改为解析传播（耦合方向）**：`getFitFractionMatrixErrors` 不再对
+  每个自由方向跑两趟全样本扫描（`4·n_free` 趟），改成
+  - 重建侧：`B̄` 收缩（0 趟）；
+  - 产生侧：一趟 `computeFileBatchIntegrals`，通过已有的
+    `ev_perturbed_p/m` 通道复用同一批振幅算出所有方向的导数；
+  - `Cov = H[coupling, coupling]⁻¹`，自由块只取耦合。
+  200k 事例（2 个自由耦合）实测 40.05 s → 1.89 s（**21×**）；趟数从
+  `4·n_free` 降到 `1`，与耦合数无关。
+  **θ 方向暂不传播**（等 `Hm = Σ w(∂_θA A^H + A ∂_θA^H)` 接进同一趟）。
+
+### Fixed
+
+- **θ 变了 `B̄` 不重建**：重建逻辑从 `getHessian` 抽成 `rebuildPhspGram()`，
+  `reCalcAmp(θ)`、`writeResult(θ)` 与 `getHessian` 都调用它。此前只有
+  `getHessian` 会刷新，`reCalcAmp` 之后份额/矩阵会拿到旧 θ 的 `B̄`。
+
+### Changed（日志）
+
+- 去掉 `[writeResult] ...`、`[phsp] events: ...` 这类带方括号的进度打印；
+  计时行只在 `CTPWA_VERBOSE=1` 时输出，事件数只在真正读文件时打印。
+
 ## [v0.3.22] - 2026-11-22
 
 ### Deprecated / 待删（只是标记，行为不变）
