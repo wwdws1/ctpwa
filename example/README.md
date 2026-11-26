@@ -7,7 +7,7 @@ Hessian / 参数误差 → 保存结果与摘要。
 `--fit-mode`，§9 讲后端选择，§11 讲干涉与幅度控制三参数。**不属于 `fit.py` 用法的脚本**——
 画图 `plot.py`、两个 MC 生成脚本（`gen_phsp_mc.py` / `gen_toy_mc.py`）和读干涉矩阵的
 `read_interference.py`——统一放在 **§10「其它脚本」**（§10.1–§10.4）。
-各文件的变更历史见 [`CHANGELOG.md`](CHANGELOG.md)。
+各文件的变更历史见 git 提交记录。
 
 ---
 
@@ -752,7 +752,7 @@ python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
 `read_interference.py` 直接把它们打成表。本节讲这些对象是什么、口径怎么算、怎么读。
 
 > 重建侧直接由常驻 `B̄ = Σ_e (w_e/W)A_e A_e^H` 收缩得到（不读 `phsp` 文件），产生侧需要一趟
-> `phsp_truth` 扫描；误差矩阵是解析传播（只含耦合方向）。实现细节的版本变更见 `CHANGELOG.md`。
+> `phsp_truth` 扫描；误差矩阵是解析传播（只含耦合方向）。实现细节的版本变更见 git 提交记录。
 
 #### 10.4.1 `weight_best.root` 里多了什么
 

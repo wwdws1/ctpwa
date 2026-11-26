@@ -1,3 +1,5 @@
-# 本地维护文件（并行 fork，不上传；仅本目录内）
+# 本地私有文件（只保留在本机，不进版本库）
 AGENT.md
 tests/
+CHANGELOG.md
+.pre-commit-config.yaml
