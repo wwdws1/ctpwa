@@ -77,10 +77,12 @@ python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-3  # 可选�
     `*_err`/`integrals`，配 `read_interference.py`（§10.4）；
   - `≥ 0.3.24`：干涉矩阵按分波**合并 LS**（维度 = 分波数）；
   - `≥ 0.3.25`：多 LS 分波（`nSL > npart`）时 `interference_rec_err` 不再是 0；
-  - `≥ 0.3.26`：Hessian 病态时 `writeResult` 不会被 `eigvalsh` 异常中断。
-  本机当前：**0.3.24**（本地编译版；合并 0.3.26 后待重编）。
-- **从源码编译**：本 fork 的 `setup.py` 用 `-std=c++20`（上游是 `-std=c++17`），因为
-  torch ≥ 2.13 的 C++ 头文件已需要 C++20。
+  - `≥ 0.3.26`：Hessian 病态时 `writeResult` 不被 `eigvalsh` 异常中断；耦合误差按**完整自由
+    Hessian** 的耦合块（θ 边际化）；流式 `phsp` 的 Gram 归一化修正。
+  本机当前：**0.3.24**（本地编译版；本次同步后需重编到 0.3.26）。
+- **从源码编译**：`setup.py` 与上游一致（`-std=c++17` + 可选的 `CTPWA_GLIBCXX_ASSERTIONS=1`）。
+  ⚠ 若用 torch ≥ 2.13 编译，其 C++ 头文件需要 C++20——此时需**在本机编译目录**临时把三处
+  `-std=c++17` 改成 `-std=c++20`（不要提交）。
 - **CPU 回退（`--cpu`）**：`fit.py` **默认要求 GPU**（检测不到可用 CUDA 就直接退出）；
   如确需在 CPU 上跑（慢 20–60 倍，仅适合小样本/调试），加 `--cpu` 强制 CPU 后端——
   它会在 `import ctpwa` **之前**把 `CTPWA_DEVICE` 置为 `cpu`（覆盖已有 env 并提示）。

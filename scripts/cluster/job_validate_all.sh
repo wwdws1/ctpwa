@@ -18,8 +18,8 @@
 set -uo pipefail
 
 CTPWA_ROOT=/hpcfs/bes/gpupwa/bhxiang/pwatest/ctpwa
-PY=/besfs10/groups/jpsi/jpsigroup/user/bhxiang/miniconda3/envs/test2/bin/python3
-export LD_LIBRARY_PATH=/besfs10/groups/jpsi/jpsigroup/user/bhxiang/miniconda3/envs/test2/lib:/besfs10/groups/jpsi/jpsigroup/user/bhxiang/miniconda3/envs/test2/lib/python3.12/site-packages/torch/lib:/usr/local/cuda-12.9/lib64:/usr/local/cuda-13.2/lib64:/usr/lib64/root:/besfs10/groups/jpsi/jpsigroup/user/bhxiang/miniconda3/lib
+PY=/besfs10/groups/jpsi/jpsigroup/user/bhxiang/miniconda3/envs/ctpwa/bin/python3
+export LD_LIBRARY_PATH=/besfs10/groups/jpsi/jpsigroup/user/bhxiang/miniconda3/envs/ctpwa/lib:/besfs10/groups/jpsi/jpsigroup/user/bhxiang/miniconda3/envs/ctpwa/lib/python3.12/site-packages/torch/lib:/usr/local/cuda-12.9/lib64:/usr/local/cuda-13.2/lib64:/usr/lib64/root:/besfs10/groups/jpsi/jpsigroup/user/bhxiang/miniconda3/lib
 export PYTHONPATH="$CTPWA_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 # probe 脚本在 repo scripts/cluster/；cd tests 后须显式指回。
@@ -27,9 +27,21 @@ export PYTHONPATH="$CTPWA_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 # 副本，不能 dirname $0——一律从硬编码 CTPWA_ROOT 推导。
 HERE="$CTPWA_ROOT/scripts/cluster"
 
-cd "$CTPWA_ROOT/tests"
 echo "=== 开始: $(date) ==="
-echo "--- .so: $(ls -l --time-style=+%F\ %T $CTPWA_ROOT/ctpwa.so | awk '{print $6, $7}')"
+# git pull 只更新源码，不会更新已加载的二进制；统一作业必须先重编，
+# 避免拿几个月前的 _cuda.so 验证新修复。
+cd "$CTPWA_ROOT"
+echo "===== 0) 构建 CUDA 后端 ====="
+CTPWA_BACKEND=cuda MAX_JOBS=4 "$PY" setup.py build_ext --inplace
+BUILD_RC=$?
+if [ $BUILD_RC -ne 0 ]; then
+  echo "!!! CUDA 构建失败 (rc=$BUILD_RC)"
+  exit $BUILD_RC
+fi
+
+cd "$CTPWA_ROOT/tests"
+echo "--- package _cuda.so: $(ls -l --time-style=+%F\ %T $CTPWA_ROOT/ctpwa/_cuda.so | awk '{print $6, $7}')"
+$PY -c 'import ctpwa; print("--- loaded backend:", ctpwa.__file__, ctpwa.build_info())'
 nvidia-smi --query-gpu=index,name --format=csv
 
 echo; echo "===== 1) 全量 pytest ====="
@@ -87,7 +99,7 @@ fi
 
 # NLL/梯度一致并不能发现派生量错误：加权 Gram、truth 分批、空 GPU 分片、
 # writeResult 的 N/W/矩阵/误差都要单独做 1卡 vs N卡断言。
-echo; echo "===== 5.5) 多卡派生量（加权 rec/gen + err、streaming、n_batch<n_gpus）====="
+echo; echo "===== 5.5) 多卡派生量（加权 rec/gen + err、streaming、n_batch<n_gpus、内部 Hessian）====="
 $PY "$HERE/multigpu_results.py" 2>&1
 MGR_RC=$?
 if [ $MGR_RC -ne 0 ]; then
@@ -95,5 +107,10 @@ if [ $MGR_RC -ne 0 ]; then
   exit $MGR_RC
 fi
 echo "多卡派生量一致性 ✓"
+
+# 两段都跑完后仍要保留 MGP 的失败状态，不能被派生量通过所掩盖。
+if [ $MGP_RC -ne 0 ]; then
+  exit $MGP_RC
+fi
 
 echo "=== 结束: $(date) ==="

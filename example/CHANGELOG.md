@@ -11,6 +11,28 @@
 
 ---
 
+## 2026-11-26
+
+### 上游同步（v0.3.26 正式版，`212a939`）
+
+- 先 `git revert eeb3bb7` 恢复此前撤回的 v0.3.25/26 内容，再并入 `5f6a41e → 212a939`：
+  - v0.3.25：`B̄` 维度按 `n_amplitudes_`（修 `nSL > npart` 时 `interference_rec_err` 全 0）；
+  - v0.3.26（正式版补充）：耦合误差改用**完整自由 Hessian** 的耦合块（θ 边际化）并检查完整
+    自由块正定；流式 `phsp` 的 double Gram 按 `w/Σw` 归一（`W_rec` 不再放大、非均匀权重不再退化
+    为无权）；原生 `CTPWA_COMPLEX=float` 的上转/精度修复；多 GPU 主设备统一 `cuda:0`、副卡缓冲
+    在所属设备释放、`analysis` 析构释放资源并恢复 current device；空样本/异常路径的 RAII 清理。
+- `setup.py`：**恢复为上游版本**（`-std=c++17` + `*_GLIBCXX_ASSERT_FLAGS`，版本 `0.3.26`）。
+  fork 不再保留 `-std=c++20` 分歧；torch ≥ 2.13 需要 C++20 时，在**本机编译目录**临时 patch。
+
+### `example/README.md`
+
+- §1：`≥ 0.3.26` 补"完整自由 Hessian 的耦合块 / 流式 Gram 归一化"；"从源码编译"改为
+  "与上游一致（c++17）；torch ≥ 2.13 时本地临时改 c++20（不提交）"。
+
+### `example/read_interference.py`
+
+- 取上游 v0.3.26 新版（`per_wave_efficiency()`：逐波效率必须把矩阵对角乘回 `W`），再 ruff-format。
+
 ## 2026-11-25
 
 ### 上游同步（v0.3.25 + v0.3.26，PR #34）
