@@ -106,7 +106,7 @@ python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-3  # 可选�
 - 建议用 `python -u`（无缓冲）以便实时看日志。
 - ⚠ **不要在仓库根目录 `import ctpwa`**：仓库根自带上游的 `ctpwa/` 门面包（源码目录，
   没有 `_cuda.so`/`_cpu.so`），在 `python -m pytest`/`python -c`（cwd 进 `sys.path`）时会
-  **遮蔽**已安装的 wheel → 报“没有可用的 ctpwa 后端”。**不在仓库根跑**的目录（如 `test14/`）不受影响。
+  **遮蔽**已安装的 wheel → 报“没有可用的 ctpwa 后端”。**不在仓库根跑**的作业目录不受影响。
 
 ---
 
@@ -565,7 +565,7 @@ python -u fit.py --config config.yml --cpu --runs 1 --niter 100   # 小样本/�
   8→complex64）选，探测不到再用 `DeviceManager().compiledPrecision()` / params 精度兜底。
 - ⚠ 仓库根有上游自带的 `ctpwa/` 门面**源码**目录（没有 `.so`），在 `python -m pytest` /
   `python -c`（cwd 进 `sys.path`）时会**遮蔽**已安装的 wheel → 报“没有可用的 ctpwa 后端”。
-  跑在各自作业目录（如 `test14/`）不受影响。
+  跑在各自作业目录不受影响。
 - 本仓库本地单测 `example/tests` 自己往 `sys.modules` 放 stub，并按**文件路径**加载真实的
   `ctpwa.diagnostics`（纯 torch，CPU 可跑），因此不受上面这条影响。
 
