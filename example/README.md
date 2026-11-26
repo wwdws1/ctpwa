@@ -75,8 +75,10 @@ python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-3  # 可选�
   - `≥ 0.3.17`：`ctpwa.diagnostics`（可行子空间 PD 判据，见 §7/§8）；
   - `≥ 0.3.22`：`writeResult` 往 `weight_best.root` 写 `interference_rec`/`interference_gen`/
     `*_err`/`integrals`，配 `read_interference.py`（§10.4）；
-  - `≥ 0.3.24`：干涉矩阵按分波**合并 LS**（维度 = 分波数）。
-  本机当前：**0.3.24**（本地编译版）。
+  - `≥ 0.3.24`：干涉矩阵按分波**合并 LS**（维度 = 分波数）；
+  - `≥ 0.3.25`：多 LS 分波（`nSL > npart`）时 `interference_rec_err` 不再是 0；
+  - `≥ 0.3.26`：Hessian 病态时 `writeResult` 不会被 `eigvalsh` 异常中断。
+  本机当前：**0.3.24**（本地编译版；合并 0.3.26 后待重编）。
 - **从源码编译**：本 fork 的 `setup.py` 用 `-std=c++20`（上游是 `-std=c++17`），因为
   torch ≥ 2.13 的 C++ 头文件已需要 C++20。
 - **CPU 回退（`--cpu`）**：`fit.py` **默认要求 GPU**（检测不到可用 CUDA 就直接退出）；
@@ -795,7 +797,7 @@ W    = Σ_i M_ii + Σ_{i<j} M_ij = Σ_e w·|Σ_i A_i|²
 | 干涉项 `I_ij` | `M_ij` | 上三角 | 可正可负；强干涉时单对可达 ±0.1 量级 |
 | 非相干份额 `FF_i` | `F_i / ΣF` | `diag / Σdiag` | `ΣFF = 1` 但把干涉**摊回**各波（`getFitFractions` 口径，已被标为待删） |
 | 平均效率 `ε̄` | `W_rec / W_gen` | `integrals` | 只在 rec/gen 两样本同源产生时有意义 |
-| 每波效率 `ε_i` | `(P_ii/N_rec) / (T_ii/N_gen)` | 两张矩阵 + `integrals` | 相对值（cut 后样本分布 ∝ `εdΦ/∫ε`） |
+| 每波效率 `ε_i` | `(P_ii/N_rec) / (T_ii/N_gen)`，其中 `P_ii = diag_rec × W_rec`、`T_ii = diag_gen × W_gen` | 两张矩阵 + `integrals` | 相对值（cut 后样本分布 ∝ `εdΦ/∫ε`）；矩阵里存的是归一化值，**必须乘回 W** 才是原始积分 |
 | 分支比 `BF_i` | `BF_total × F_i` | `--bf-total` | `ΣBF_i ≠ BF_total`，差额正是干涉项 |
 | 原始积分 `P_ij` / `T_ij` | `M_ij × W` | 矩阵乘回 `integrals` 的 `W` | 想自己做归一化（换分母、按 run 合并）时用 |
 
@@ -826,8 +828,7 @@ python3 read_interference.py results/weight_best.root --bf-total 3.7e-4 --csv ff
 输出块顺序：每侧一块（`== interference_xxx ==` 标题 + 闭合检验 + 逐波 `F_i ± σ` 表 + 全矩阵 +
 误差矩阵）→ 效率块（`both` 且两样本都在时）→ 分支比块（给了 `--bf-total` 才有）→ CSV 提示。
 
-依赖 `uproot`（`pip install uproot`）。本机 `envs/ctpwa` 里没装，`dev-pytorch` / `dev-tf-pwa` 里有；
-它只读 ROOT，和拟合本身用哪个环境无关。
+依赖 `uproot`（`pip install uproot`；`envs/ctpwa` 已装）。它只读 ROOT，和拟合本身用哪个环境无关。
 
 #### 10.4.4 输出块怎么读
 
@@ -841,7 +842,7 @@ python3 read_interference.py results/weight_best.root --bf-total 3.7e-4 --csv ff
 | 逐波表 `# / 分波 / F_i / σF_i` | 文献口径 fit fraction 与误差；`σF_i = -` 表示 ROOT 里没有 `interference_*_err`（见 §10.4.1 的写入条件）。**`fit.py` 末尾打印的就是这张表**（同一份 `weight_best.root`，逐位一致） |
 | `矩阵 (行= i, 列= j ...)` | 对角 = `F_i`、上三角 = `I_ij`（对称，两边都填）。看"谁和谁相消"就看或或这里最负/最正的元素 |
 | `误差矩阵 σ` | 仅当 ROOT 里有 `interference_*_err` 时打印 |
-| `== 效率（由两张表直接得到）==` | `ε̄ = W_rec/W_gen` 与逐波 `ε_i = (P_ii/N_rec)/(T_ii/N_gen)`；只在两样本同源产生时可解释（相对效率，`ε_i^abs/ε_all`） |
+| `== 效率（由两张表直接得到）==` | `ε̄ = W_rec/W_gen` 与逐波 `ε_i = (P_ii/N_rec)/(T_ii/N_gen)`（`P_ii`/`T_ii` = 表里的对角乘回 `W`）；只在两样本同源产生时可解释（相对效率，`ε_i^abs/ε_all`） |
 | `== 分支比（BF_total = …）==` | 给了 `--bf-total` 才有：`BF_i = BF_total × F_i`；`ΣBF_i ≠ BF_total` 的差额正是干涉项 |
 | `已写 xxx.csv` | 给了 `--csv` 才有：两张矩阵的全部元素 + 对角误差，**两行**（表头 + 一行数据） |
 

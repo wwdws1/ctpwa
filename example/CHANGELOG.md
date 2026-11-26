@@ -13,6 +13,30 @@
 
 ## 2026-11-25
 
+### 上游同步（v0.3.25 + v0.3.26，PR #34）
+
+- 并入 `8929669 → 5f6a41e`：
+  - **v0.3.25 修我们报的 [BHXiang/ctpwa#5](https://github.com/BHXiang/ctpwa/issues/5)**：
+    `computeMatrixErrors` 里 `B̄` 的维度原来按 `npartials` 取，`nSL > npart` 时越界读到 0，
+    导致 `interference_rec_err` 整张为 0；改用 `n_amplitudes_`。
+  - **v0.3.26**：`eigvalsh` 异常不再打断 `writeResult`；测试构建开 `-D_GLIBCXX_ASSERTIONS`；
+    新增 `test_error_matrix_with_multi_ls_partials` 等回归。
+- `setup.py`：并入上游的 `*_GLIBCXX_ASSERT_FLAGS`（CUDA `cxx` / CPU），保留 fork 的 `-std=c++20`，
+  版本号随上游 `0.3.26`。
+
+### `example/read_interference.py`
+
+- 取上游新版：新增 `per_wave_efficiency()`，修**逐波效率**口径——矩阵元素是 `P_ii/W_rec`、
+  `T_ii/W_gen`，必须先乘回 `W` 才是原始积分（旧公式漏了 `W_rec/W_gen` 因子）；
+  并加一行说明。取后按本仓库约定 ruff-format。
+
+### `example/README.md`
+
+- §1：最低版本补 `≥ 0.3.25`（多 LS 分波下 `interference_rec_err` 正常）与 `≥ 0.3.26`
+  （Hessian 病态时 `writeResult` 不被中断）；
+- §10.4.2 / §10.4.4：每波效率明确 `P_ii = diag_rec × W_rec`、`T_ii = diag_gen × W_gen`（要乘回 `W`）；
+- §10.4.3：`uproot` 依赖说明改为"`envs/ctpwa` 已装"。
+
 ### `example/README.md`
 
 - §10.4.4 由「输出长什么样（真实例子）」改为**通用**的「输出块怎么读」：删掉来自具体分析

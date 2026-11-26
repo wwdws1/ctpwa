@@ -58,6 +58,52 @@
   "三个脚本"改为"四个脚本"。
 
 
+### Changed（fork `wwdws1/ctpwa`：同步 v0.3.26）
+
+- 并入上游 `8929669 → 5f6a41e`（**v0.3.25 + v0.3.26**）：
+  - v0.3.25 修 `computeMatrixErrors` 里 `B̄` 维度的越界（`nSL > npart` 时 `interference_rec_err`
+    整张为 0）——即本 fork 报的 [BHXiang/ctpwa#5](https://github.com/BHXiang/ctpwa/issues/5)；
+  - v0.3.26：`eigvalsh` 抛异常时不再打断 `writeResult`（按非正定跳过误差矩阵）；
+    测试构建开 `-D_GLIBCXX_ASSERTIONS`（`CTPWA_GLIBCXX_ASSERTIONS=1`，发布构建默认关）；
+  - `example/read_interference.py` 修**逐波效率**公式：矩阵存的是 `P/W`，要先乘回 `W` 才是原始积分；
+  - 新增回归：`test_free_phsp_matrix` / `test_write_result_robustness` /
+    `test_read_interference_example` / `test_native_float` 等。
+- `setup.py`：保留 fork 的 `-std=c++20`，并入上游的 `*_GLIBCXX_ASSERT_FLAGS`（CUDA `cxx` / CPU
+  两处）与版本号 `0.3.26`。
+- `example/README.md`：§1 最低版本补 0.3.25/0.3.26；§10.4 明确"逐波效率要乘回 `W`"；
+  `uproot` 依赖现状（`envs/ctpwa` 已装）。
+- `example/read_interference.py`：取上游新版（含 `per_wave_efficiency`），再 ruff-format。
+
+## [v0.3.26] - 2026-11-25
+
+### Fixed
+
+- **`writeResult` 在 Hessian 病态时被 `eigvalsh` 抛异常打断**：`computeMatrixErrors`
+  的正定判据直接调 `torch::linalg_eigvalsh`，病态输入会抛 `LinAlgError`
+  （实测 `ls_filter` 类配置在随机参数点取 Hessian 就能触发）。现在捕获异常，
+  按"非正定"处理并跳过误差矩阵，不让整个写文件崩掉。
+
+### Added
+
+- **测试构建默认打开 `-D_GLIBCXX_ASSERTIONS`**（`scripts/run_tests.sh` 已设置
+  `CTPWA_GLIBCXX_ASSERTIONS=1`）：`std::vector::operator[]` 越界会直接 abort，
+  而不是静默读相邻内存。v0.3.25 那个 `B̄` 越界正是靠"没崩"漏过测试的。
+  发布构建默认关闭（`setup.py` 里由环境变量控制，无额外开销）。
+- 新增回归 `test_error_matrix_with_multi_ls_partials`：多 LS 分波（`ls_filter`，
+  4 LS → 1 行）带 Hessian 写 ROOT 不崩，且误差矩阵维度 = `npartials`。
+
+## [v0.3.25] - 2026-11-25
+
+### Fixed
+
+- **`writeResult` 在"分波内含多个 LS 组合"的配置上崩溃**（`std::vector` 越界）。
+  `computeMatrixErrors` 里把常驻 `B̄` 按 `npartials × npartials` 拷贝，但 `B̄` 实际是
+  `n_amplitudes_ × n_amplitudes_`；当 `n_amplitudes_ > npartials`（同一分波有多个
+  L/S，例如 5 体分析 `P2_etap3pi`：`npartials=13`、`n_amplitudes_=20`）时索引越界。
+  改用 `n_amplitudes_` 做 `B̄` 的维度，矩阵维度仍是 `npartials`。
+  回归：`tests/test_matrix_errors.py::test_error_matrix_with_multi_ls_partials`
+  （`ls_filter`：4 个 LS 合成 1 行，误差矩阵必须是 1×1）。
+
 ## [v0.3.24] - 2026-11-24
 
 ### Fixed
