@@ -11,7 +11,53 @@
 
 ---
 
+## 2026-11-26
+
+### 上游同步（v0.3.26 正式版，`212a939`）
+
+- 先 `git revert eeb3bb7` 恢复此前撤回的 v0.3.25/26 内容，再并入 `5f6a41e → 212a939`：
+  - v0.3.25：`B̄` 维度按 `n_amplitudes_`（修 `nSL > npart` 时 `interference_rec_err` 全 0）；
+  - v0.3.26（正式版补充）：耦合误差改用**完整自由 Hessian** 的耦合块（θ 边际化）并检查完整
+    自由块正定；流式 `phsp` 的 double Gram 按 `w/Σw` 归一（`W_rec` 不再放大、非均匀权重不再退化
+    为无权）；原生 `CTPWA_COMPLEX=float` 的上转/精度修复；多 GPU 主设备统一 `cuda:0`、副卡缓冲
+    在所属设备释放、`analysis` 析构释放资源并恢复 current device；空样本/异常路径的 RAII 清理。
+- `setup.py`：**恢复为上游版本**（`-std=c++17` + `*_GLIBCXX_ASSERT_FLAGS`，版本 `0.3.26`）。
+  fork 不再保留 `-std=c++20` 分歧；torch ≥ 2.13 需要 C++20 时，在**本机编译目录**临时 patch。
+
+### `example/README.md`
+
+- §1：`≥ 0.3.26` 补"完整自由 Hessian 的耦合块 / 流式 Gram 归一化"；"从源码编译"改为
+  "与上游一致（c++17）；torch ≥ 2.13 时本地临时改 c++20（不提交）"。
+
+### `example/read_interference.py`
+
+- 取上游 v0.3.26 新版（`per_wave_efficiency()`：逐波效率必须把矩阵对角乘回 `W`），再 ruff-format。
+
 ## 2026-11-25
+
+### 上游同步（v0.3.25 + v0.3.26，PR #34）
+
+- 并入 `8929669 → 5f6a41e`：
+  - **v0.3.25 修我们报的 [BHXiang/ctpwa#5](https://github.com/BHXiang/ctpwa/issues/5)**：
+    `computeMatrixErrors` 里 `B̄` 的维度原来按 `npartials` 取，`nSL > npart` 时越界读到 0，
+    导致 `interference_rec_err` 整张为 0；改用 `n_amplitudes_`。
+  - **v0.3.26**：`eigvalsh` 异常不再打断 `writeResult`；测试构建开 `-D_GLIBCXX_ASSERTIONS`；
+    新增 `test_error_matrix_with_multi_ls_partials` 等回归。
+- `setup.py`：并入上游的 `*_GLIBCXX_ASSERT_FLAGS`（CUDA `cxx` / CPU），保留 fork 的 `-std=c++20`，
+  版本号随上游 `0.3.26`。
+
+### `example/read_interference.py`
+
+- 取上游新版：新增 `per_wave_efficiency()`，修**逐波效率**口径——矩阵元素是 `P_ii/W_rec`、
+  `T_ii/W_gen`，必须先乘回 `W` 才是原始积分（旧公式漏了 `W_rec/W_gen` 因子）；
+  并加一行说明。取后按本仓库约定 ruff-format。
+
+### `example/README.md`
+
+- §1：最低版本补 `≥ 0.3.25`（多 LS 分波下 `interference_rec_err` 正常）与 `≥ 0.3.26`
+  （Hessian 病态时 `writeResult` 不被中断）；
+- §10.4.2 / §10.4.4：每波效率明确 `P_ii = diag_rec × W_rec`、`T_ii = diag_gen × W_gen`（要乘回 `W`）；
+- §10.4.3：`uproot` 依赖说明改为"`envs/ctpwa` 已装"。
 
 ### `example/README.md`
 

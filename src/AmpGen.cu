@@ -805,7 +805,18 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
         size_t slamp_bytes = (size_t)nSigma * slamp_row * sizeof(thrust::complex<double>);
         {
             size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
+            const cudaError_t mem_err = cudaMemGetInfo(&free_b, &total_b);
+            if (mem_err != cudaSuccess) {
+                // free_b 在调用失败时仍是初始值 0；不能把此前的 CUDA 错误
+                // 误报成"实际显存只剩 0 MiB"。保留真正的错误原因。
+                std::cerr << "ERROR: cudaMemGetInfo 在 GPU " << i << " 上失败: "
+                          << cudaGetErrorString(mem_err)
+                          << "（这不是显存为 0；请检查此前的 kernel/指针错误）"
+                          << std::endl;
+                throw std::runtime_error(
+                    std::string("cudaMemGetInfo failed on GPU ") + std::to_string(i)
+                    + ": " + cudaGetErrorString(mem_err));
+            }
             if (slamp_bytes > free_b) {
                 std::cerr << "ERROR: 显存不足——GPU " << i << " 的 slamp 表需要 "
                           << slamp_bytes / 1e6 << " MiB，仅剩 " << free_b / 1e6
@@ -4157,10 +4168,10 @@ void AmpCalc::computeUnifiedHessian(
             // kernel 零改动、数值与 double 逐位一致。double 模式直接用原 A。
             const ctComplex* d_amp_c;
             ctComplex* d_amp_dbl = nullptr;
-            if (float_out_) {
+            if (float_out_ && !ctIsFloatComplex) {
                 const float2* srcF = reinterpret_cast<const float2*>(d_amp)
                     + (size_t)evt_off_c * nPol * n_amp_total;
-                cudaMalloc(&d_amp_dbl, (size_t)nch * nPol * n_amp_total * sizeof(ctComplex));
+                cudaMalloc(&d_amp_dbl, (size_t)nch * nPol * n_amp_total * sizeof(cuDoubleComplex));
                 int gUp = (int)(((size_t)nch * nPol * n_amp_total + 255) / 256);
                 CTPWA_LAUNCH(castF2ToDouble2Kernel, gUp, 256, 0, 
                     srcF, reinterpret_cast<cuDoubleComplex*>(d_amp_dbl),
